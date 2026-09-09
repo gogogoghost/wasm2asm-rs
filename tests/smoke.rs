@@ -1,9 +1,11 @@
 use std::process::Command;
-use wasm2asm::{CompileOptions, Lowerings, compile};
+use wasm2asm::{CompileOptions, Lowerings, OutputFormat, compile};
 
 fn run_with_options(wat_source: &str, invocation: &str, options: &CompileOptions) -> String {
     let wasm = wat::parse_str(wat_source).unwrap();
-    let js = String::from_utf8(compile(&wasm, options).unwrap()).unwrap();
+    let mut options = options.clone();
+    options.output_format = OutputFormat::Bare;
+    let js = String::from_utf8(compile(&wasm, &options).unwrap()).unwrap();
     let script = format!("{js};let x={invocation};process.stdout.write(String(x));");
     let output = Command::new("node").args(["-e", &script]).output().unwrap();
     let stderr = String::from_utf8_lossy(&output.stderr);
@@ -169,4 +171,65 @@ fn mutable_i64_global_exposes_low_high_facade() {
         ),
         "2,1,2,7,-2,7"
     );
+}
+
+#[test]
+fn default_es_module_output_imports_directly() {
+    let wasm = wat::parse_str(
+        "(module (func (export \"add\") (param i32 i32) (result i32) local.get 0 local.get 1 i32.add))",
+    )
+    .unwrap();
+    let js = String::from_utf8(compile(&wasm, &CompileOptions::default()).unwrap()).unwrap();
+    assert!(js.contains("export default instantiate"));
+    let script = format!("{js}\nlet m=instantiate({{}});if(m.add(20,22)!==42)throw Error('esm');");
+    let output = Command::new("node")
+        .args(["--input-type=module", "-e", &script])
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "ES module failed: {stderr}");
+    assert!(
+        !stderr.contains("Invalid asm.js"),
+        "V8 rejected ES module core: {stderr}"
+    );
+}
+
+#[test]
+fn umd_output_supports_browser_global_and_commonjs() {
+    let wasm = wat::parse_str(
+        "(module (func (export \"add\") (param i32 i32) (result i32) local.get 0 local.get 1 i32.add))",
+    )
+    .unwrap();
+    let options = CompileOptions {
+        output_format: OutputFormat::Umd,
+        global_name: "LegacyAdder".into(),
+        ..CompileOptions::default()
+    };
+    let js = String::from_utf8(compile(&wasm, &options).unwrap()).unwrap();
+    let script = format!(
+        "var source={};var self={{}};new Function('module','self',source)(undefined,self);var browser=self.LegacyAdder.instantiate({{}});if(browser.add(20,22)!==42)throw Error('umd global');var module={{exports:{{}}}};new Function('module','self',source)(module,{{}});var commonjs=module.exports.instantiate({{}});if(commonjs.add(19,23)!==42)throw Error('umd commonjs');",
+        js_string_for_test(&js)
+    );
+    let output = Command::new("node").args(["-e", &script]).output().unwrap();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(output.status.success(), "UMD output failed: {stderr}");
+    assert!(
+        !stderr.contains("Invalid asm.js"),
+        "V8 rejected UMD core: {stderr}"
+    );
+}
+
+fn js_string_for_test(value: &str) -> String {
+    let mut out = String::from("\"");
+    for byte in value.bytes() {
+        match byte {
+            b'\\' => out.push_str("\\\\"),
+            b'\"' => out.push_str("\\\""),
+            b'\n' => out.push_str("\\n"),
+            b'\r' => out.push_str("\\r"),
+            byte => out.push(byte as char),
+        }
+    }
+    out.push('\"');
+    out
 }

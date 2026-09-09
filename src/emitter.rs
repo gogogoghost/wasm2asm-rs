@@ -1,13 +1,14 @@
 use crate::diagnostics::{CompileError, ErrorKind};
 use crate::ir::*;
-use crate::options::CompileOptions;
+use crate::options::{CompileOptions, OutputFormat};
 use std::collections::BTreeSet;
 use std::fmt::Write as _;
 
 pub fn emit(module: &Module, options: &CompileOptions) -> Result<Vec<u8>, CompileError> {
     validate_boundaries(module)?;
     let mut cx = ModuleCx::new(module, options)?;
-    let javascript = cx.emit_module()?;
+    let bare = cx.emit_module()?;
+    let javascript = format_output(bare, options)?;
     if options.limits.max_js_bytes != 0 && javascript.len() > options.limits.max_js_bytes {
         return Err(CompileError::limit(
             "generated JavaScript bytes",
@@ -16,6 +17,32 @@ pub fn emit(module: &Module, options: &CompileOptions) -> Result<Vec<u8>, Compil
         ));
     }
     Ok(javascript.into_bytes())
+}
+
+fn format_output(mut bare: String, options: &CompileOptions) -> Result<String, CompileError> {
+    match options.output_format {
+        OutputFormat::Bare => {
+            bare.push('\n');
+            Ok(bare)
+        }
+        OutputFormat::EsModule => {
+            bare.push_str("\nexport { instantiate };\nexport default instantiate;\n");
+            Ok(bare)
+        }
+        OutputFormat::Umd => {
+            if options.global_name.is_empty() {
+                return Err(CompileError::new(
+                    ErrorKind::InvalidInput,
+                    "wasm2asm: --global-name must not be empty for UMD output",
+                ));
+            }
+            Ok(format!(
+                "(function(root,factory){{if(typeof module=='object'&&module.exports){{module.exports=factory();}}else{{root[{}]=factory();}}}})(typeof self!='undefined'?self:this,function(){{{}return{{instantiate:instantiate,'default':instantiate}};}});\n",
+                js_string(&options.global_name),
+                bare
+            ))
+        }
+    }
 }
 
 fn validate_boundaries(module: &Module) -> Result<(), CompileError> {
@@ -341,7 +368,7 @@ impl<'a> ModuleCx<'a> {
         out.push_str(RUNTIME_HELPERS);
         out.push_str("f.X=X;f.ct=ct;f.pc=pc;f.tr=tr;f.ne=ne;f.mn=mn;f.mx=mx;f.cs=cs;f.rf=rf;f.ri=ri;f.rd=rd;f.wr=wr;f.Y=Y;f.y=y;f.W=W;f.GH=function(){return hi|0};f.AA=AA;f.LI=LI;f.LF=LF;f.SI=SI;f.SF=SF;f.VL=VL;f.VS=VS;f.MS=MS;f.DD=DD;f.ED=ED;f.TS=TS;f.RS=RS;f.IG=IG;f.G=G;f.AB=AB;f.AC=AC;f.K=K;f.N=N;f.O=O;f.P=P;f.Q=Q;f.R=R;f.L=L;");
         self.emit_outer_initializers(out)?;
-        out.push_str("var x=asmModule(this,f);");
+        out.push_str("var x=asmModule({Math:M},f);");
         if self.module.start.is_some() {
             out.push_str("x.$start();delete x.$start;");
         }

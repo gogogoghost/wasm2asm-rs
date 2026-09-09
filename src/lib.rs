@@ -6,7 +6,7 @@ mod options;
 mod parser;
 
 pub use diagnostics::{CompileError, ErrorKind};
-pub use options::{CompileOptions, Lowerings, ResourceLimits};
+pub use options::{CompileOptions, Lowerings, OutputFormat, ResourceLimits};
 
 pub fn inspect(input: &[u8], options: &CompileOptions) -> Result<String, CompileError> {
     let mut inspection_options = options.clone();

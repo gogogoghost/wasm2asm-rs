@@ -1,5 +1,22 @@
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum OutputFormatArg {
+    Esm,
+    Umd,
+    Bare,
+}
+
+impl From<OutputFormatArg> for wasm2asm::OutputFormat {
+    fn from(value: OutputFormatArg) -> Self {
+        match value {
+            OutputFormatArg::Esm => Self::EsModule,
+            OutputFormatArg::Umd => Self::Umd,
+            OutputFormatArg::Bare => Self::Bare,
+        }
+    }
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -14,6 +31,14 @@ pub struct Cli {
     /// Output JavaScript file, or - for stdout.
     #[arg(short = 'o', long = "output", default_value = "-")]
     pub output: PathBuf,
+
+    /// Integration format: esm for bundlers, umd for script/CommonJS, bare for embedding.
+    #[arg(long = "format", value_enum, default_value = "esm")]
+    pub format: OutputFormatArg,
+
+    /// Browser global used by --format=umd.
+    #[arg(long, default_value = "Wasm2AsmModule")]
+    pub global_name: String,
 
     /// Enable one high-cost lowering. Repeatable: simd, references, all.
     #[arg(long = "enable-lowering", value_name = "FEATURE")]

@@ -9,6 +9,14 @@ bitflags! {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OutputFormat {
+    #[default]
+    EsModule,
+    Umd,
+    Bare,
+}
+
 #[derive(Debug, Clone)]
 pub struct ResourceLimits {
     pub max_input_bytes: usize,
@@ -44,6 +52,8 @@ impl Default for ResourceLimits {
 pub struct CompileOptions {
     pub lowerings: Lowerings,
     pub preserve_traps: bool,
+    pub output_format: OutputFormat,
+    pub global_name: String,
     pub limits: ResourceLimits,
 }
 
@@ -52,6 +62,8 @@ impl Default for CompileOptions {
         Self {
             lowerings: Lowerings::empty(),
             preserve_traps: true,
+            output_format: OutputFormat::EsModule,
+            global_name: "Wasm2AsmModule".into(),
             limits: ResourceLimits::default(),
         }
     }
