@@ -1,22 +1,43 @@
 # wasm2asm-rs
 
-独立的 WebAssembly 到严格 asm.js 转换器。生成文件包含 asm.js 核心和完整实例化胶水，运行时不再需要原始 `.wasm` 文件，适合在现代项目中作为旧浏览器 fallback。
+A standalone WebAssembly-to-asm.js ahead-of-time converter written in Rust.
 
-## 构建
+`wasm2asm` produces a strictly validated asm.js core together with the JavaScript glue required to instantiate the module. The generated file is self-contained and does not require the original `.wasm` file at runtime, making it suitable as a fallback for legacy browsers and constrained JavaScript environments without WebAssembly support.
+
+## Features
+
+- Standalone Rust implementation with no Binaryen dependency
+- Strict asm.js-compatible code generation
+- ES module, UMD/CommonJS, and bare output formats
+- Complete import, export, memory, table, global, data-segment, and start-function glue
+- Scalar Wasm operations and the JavaScript i64 low/high ABI
+- Multiple results, bulk memory, mutable globals, and internal function tables
+- Bounded memory64, table64, and multiple-memory lowering
+- Optional SIMD and typed function-reference lowering
+- Configurable resource limits
+- Controlled diagnostics for unsupported WebAssembly features
+
+## Build
 
 ```bash
 cargo build --release
 ```
 
-可执行文件位于 `target/release/wasm2asm`。
+The executable is written to:
 
-## 生成产物
+```text
+target/release/wasm2asm
+```
 
-默认生成 ES Module，适合 Vite、Rollup、webpack 等现代构建工具：
+## Quick start
+
+The default output format is an ES module suitable for Vite, Rollup, webpack, and other modern build systems:
 
 ```bash
 wasm2asm input.wasm -o input.asm.mjs
 ```
+
+Import and instantiate the generated module:
 
 ```js
 import instantiate from "./input.asm.mjs";
@@ -30,15 +51,32 @@ const exports = instantiate({
 console.log(exports.main());
 ```
 
-产物导出同一个工厂的 named export 和 default export：
+The factory is available as both a default and named export:
 
 ```js
 import instantiate, { instantiate as createInstance } from "./input.asm.mjs";
 ```
 
-## 直接用于旧浏览器
+## Output formats
 
-UMD 格式同时支持浏览器全局变量和 CommonJS：
+### ES module
+
+ES module output is the default:
+
+```bash
+wasm2asm input.wasm --format=esm -o input.asm.mjs
+```
+
+It exports:
+
+```js
+export { instantiate };
+export default instantiate;
+```
+
+### UMD and CommonJS
+
+Use UMD output for direct browser scripts or CommonJS projects:
 
 ```bash
 wasm2asm input.wasm \
@@ -47,7 +85,7 @@ wasm2asm input.wasm \
   -o input.asm.js
 ```
 
-浏览器：
+Browser usage:
 
 ```html
 <script src="input.asm.js"></script>
@@ -57,18 +95,26 @@ wasm2asm input.wasm \
 </script>
 ```
 
-CommonJS：
+CommonJS usage:
 
 ```js
 const { instantiate } = require("./input.asm.js");
 const exports = instantiate({ env: {} });
 ```
 
-`--format=bare` 输出未包装的 `asmModule` 和 `instantiate`，用于自定义打包或 validator 测试。
+The default browser global name is `Wasm2AsmModule` and can be changed with `--global-name`.
 
-## Wasm fallback
+### Bare output
 
-现代项目可以保留原生 Wasm，同时把 asm.js 作为兼容路径：
+Bare output exposes unwrapped `asmModule` and `instantiate` declarations for custom packaging or validator testing:
+
+```bash
+wasm2asm input.wasm --format=bare -o input.asm.js
+```
+
+## Native WebAssembly fallback
+
+A modern application can keep native WebAssembly as its primary implementation and use the generated asm.js module only when WebAssembly is unavailable:
 
 ```js
 import instantiateAsm from "./app.asm.mjs";
@@ -79,13 +125,14 @@ export async function loadApp(imports) {
     const result = await WebAssembly.instantiateStreaming(response, imports);
     return result.instance.exports;
   }
+
   return instantiateAsm(imports);
 }
 ```
 
-生成的 `asmModule` 已针对严格 validator 排版。若构建工具会重写函数体，应将产物作为静态资源复制，或排除在二次压缩和语法变换之外；产物本身已经是紧凑格式。
+For browsers that cannot load ES modules, generate UMD output and include it as a regular script instead.
 
-## 转换选项
+## Command-line options
 
 ```text
 --format=esm|umd|bare
@@ -97,19 +144,63 @@ export async function loadApp(imports) {
 --max-*=VALUE
 ```
 
-SIMD 和 typed function references 属于高开销转换，默认关闭。`--fast` 会放宽部分 WebAssembly trap 语义，不建议用于需要精确兼容的构建。
+Run the following command for the complete option list:
 
-## 兼容范围
+```bash
+wasm2asm --help
+```
 
-支持标量 Wasm、i64 low/high ABI、multivalue exports、mutable globals、bulk memory、内部函数表、memory64、table64、多内存，以及可选的 SIMD 和 typed function-reference lowering。
+SIMD and typed function references are high-cost lowerings and are disabled by default.
 
-threads/shared memory、Wasm GC、Wasm exceptions、递归或间接 tail calls，以及无法通过 asm.js host ABI 表达的边界类型会返回明确诊断，不会生成伪装成合法 asm.js 的降级文件。
+`--fast` disables parts of WebAssembly trap preservation. Do not use it when exact WebAssembly failure semantics are required.
 
-## 验证
+## Compatibility
+
+The supported profile includes:
+
+- i32, i64, f32, and f64 scalar operations
+- the JavaScript i64 low/high ABI
+- multiple-value exports
+- mutable scalar and i64 globals
+- active and passive data segments
+- bulk-memory operations
+- internal nullable function tables and indirect-call signature checks
+- bounded memory64 and table64 lowering
+- multiple memories
+- optional fixed-width SIMD scalarization
+- optional typed function-reference lowering
+
+Features without a valid strict asm.js representation are rejected with a diagnostic instead of producing invalid JavaScript. These include:
+
+- threads, atomics, and shared memory
+- Wasm GC
+- Wasm exceptions
+- recursive or indirect tail calls
+- imported multivalue callbacks
+- imported or exported tables
+- v128 or function references crossing the JavaScript host boundary
+- unsupported proposal instructions
+
+## Build-system integration
+
+The generated `asmModule` function is deliberately formatted for strict asm.js validators. Do not allow a JavaScript optimizer, transpiler, or minifier to rewrite its function body. If a build tool modifies generated code, copy the output as a static asset or exclude it from further syntax transformations. The generated output is already compact.
+
+## Release binaries
+
+Pushing a tag in `MAJOR.MINOR.PATCH` form, such as `0.0.1`, creates a GitHub Release containing:
+
+```text
+wasm2asm-0.0.1-linux-x64.tar.gz
+wasm2asm-0.0.1-linux-arm64.tar.gz
+```
+
+Tags must not use a `v` prefix.
+
+## Verification
 
 ```bash
 cargo test
 cargo clippy --all-targets -- -D warnings
 ```
 
-回归测试会执行生成的 ESM、UMD、CommonJS 和 bare 产物，并检查 V8 是否接受其中的严格 asm.js 核心。
+The integration tests execute generated ES module, UMD, CommonJS, and bare outputs. The generated asm.js core is also checked against V8's strict asm.js handling.
