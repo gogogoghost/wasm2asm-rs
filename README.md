@@ -185,22 +185,3 @@ Features without a valid strict asm.js representation are rejected with a diagno
 
 The generated `asmModule` function is deliberately formatted for strict asm.js validators. Do not allow a JavaScript optimizer, transpiler, or minifier to rewrite its function body. If a build tool modifies generated code, copy the output as a static asset or exclude it from further syntax transformations. The generated output is already compact.
 
-## Release binaries
-
-Pushing a tag in `MAJOR.MINOR.PATCH` form, such as `0.0.1`, creates a GitHub Release containing:
-
-```text
-wasm2asm-0.0.1-linux-x64.tar.gz
-wasm2asm-0.0.1-linux-arm64.tar.gz
-```
-
-Tags must not use a `v` prefix.
-
-## Verification
-
-```bash
-cargo test
-cargo clippy --all-targets -- -D warnings
-```
-
-The integration tests execute generated ES module, UMD, CommonJS, and bare outputs. The generated asm.js core is also checked against V8's strict asm.js handling.
