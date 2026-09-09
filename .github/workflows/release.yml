@@ -1,0 +1,104 @@
+name: Release Linux binaries
+
+on:
+  push:
+    tags:
+      - "[0-9]*.[0-9]*.[0-9]*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  validate-tag:
+    name: Validate release tag
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Require MAJOR.MINOR.PATCH tag
+        shell: bash
+        run: |
+          if [[ ! "$GITHUB_REF_NAME" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must use MAJOR.MINOR.PATCH without a prefix, for example 0.0.1." >&2
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.asset_arch }}
+    needs: validate-tag
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            asset_arch: linux-x64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            asset_arch: linux-arm64
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        shell: bash
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup target add "${{ matrix.target }}" --toolchain stable
+
+      - name: Build release binary
+        shell: bash
+        run: cargo +stable build --locked --release --target "${{ matrix.target }}"
+
+      - name: Smoke test binary
+        shell: bash
+        run: "target/${{ matrix.target }}/release/wasm2asm --version"
+
+      - name: Package binary
+        shell: bash
+        run: |
+          mkdir -p package dist
+          install -m 755 "target/${{ matrix.target }}/release/wasm2asm" package/wasm2asm
+          tar -C package -czf "dist/wasm2asm-${GITHUB_REF_NAME}-${{ matrix.asset_arch }}.tar.gz" wasm2asm
+
+      - name: Upload packaged binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: wasm2asm-${{ matrix.asset_arch }}
+          path: dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Download packaged binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: wasm2asm-linux-*
+          path: dist
+          merge-multiple: true
+
+      - name: Create or update release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/*.tar.gz \
+              --repo "$GITHUB_REPOSITORY" \
+              --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/*.tar.gz \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "wasm2asm $GITHUB_REF_NAME" \
+              --generate-notes
+          fi
