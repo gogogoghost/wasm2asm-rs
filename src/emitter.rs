@@ -1,0 +1,3042 @@
+use crate::diagnostics::{CompileError, ErrorKind};
+use crate::ir::*;
+use crate::options::CompileOptions;
+use std::collections::BTreeSet;
+use std::fmt::Write as _;
+
+pub fn emit(module: &Module, options: &CompileOptions) -> Result<Vec<u8>, CompileError> {
+    validate_boundaries(module)?;
+    let mut cx = ModuleCx::new(module, options)?;
+    let javascript = cx.emit_module()?;
+    if options.limits.max_js_bytes != 0 && javascript.len() > options.limits.max_js_bytes {
+        return Err(CompileError::limit(
+            "generated JavaScript bytes",
+            javascript.len(),
+            options.limits.max_js_bytes,
+        ));
+    }
+    Ok(javascript.into_bytes())
+}
+
+fn validate_boundaries(module: &Module) -> Result<(), CompileError> {
+    for export in &module.exports {
+        match export.kind {
+            ExportKind::Table => {
+                return Err(CompileError::unsupported(
+                    "exported tables",
+                    None,
+                    "JavaScript table mutation cannot carry canonical WebAssembly signatures",
+                ));
+            }
+            ExportKind::Tag => {
+                return Err(CompileError::unsupported(
+                    "exported exception tags",
+                    None,
+                    "exception tags are module-private",
+                ));
+            }
+            ExportKind::Func => {
+                let ty = module
+                    .function_type_indices
+                    .get(export.index as usize)
+                    .and_then(|i| module.types.get(*i as usize))
+                    .ok_or_else(|| {
+                        CompileError::new(
+                            ErrorKind::Internal,
+                            "wasm2asm: invalid exported function type",
+                        )
+                    })?;
+                if ty.params.contains(&ValType::V128) || ty.results.contains(&ValType::V128) {
+                    return Err(CompileError::unsupported(
+                        "SIMD host boundary",
+                        None,
+                        "the asm.js host ABI has no v128 representation",
+                    ));
+                }
+                if ty
+                    .params
+                    .iter()
+                    .chain(&ty.results)
+                    .any(|t| matches!(t, ValType::FuncRef(_)))
+                {
+                    return Err(CompileError::unsupported(
+                        "function-reference host boundary",
+                        None,
+                        "the asm.js host ABI has no stable function-reference representation",
+                    ));
+                }
+            }
+            ExportKind::Global => {
+                let ty = module
+                    .global_types
+                    .get(export.index as usize)
+                    .ok_or_else(|| {
+                        CompileError::new(ErrorKind::Internal, "wasm2asm: invalid exported global")
+                    })?
+                    .ty;
+                if matches!(ty, ValType::V128 | ValType::FuncRef(_)) {
+                    return Err(CompileError::unsupported(
+                        "global host boundary",
+                        None,
+                        "v128 and reference globals cannot cross the JavaScript boundary",
+                    ));
+                }
+            }
+            ExportKind::Memory => {}
+        }
+    }
+    for import in &module.imports {
+        match import.kind {
+            ImportKind::Func(type_index) => {
+                let ty = &module.types[type_index as usize];
+                if ty.results.len() > 1 {
+                    return Err(CompileError::unsupported(
+                        "imported multivalue function",
+                        None,
+                        "strict asm.js FFI exposes one return value; split the callback into scalar imports",
+                    ));
+                }
+                if ty
+                    .params
+                    .iter()
+                    .chain(&ty.results)
+                    .any(|ty| matches!(ty, ValType::V128 | ValType::FuncRef(_)))
+                {
+                    return Err(CompileError::unsupported(
+                        "function import host boundary",
+                        None,
+                        "v128 and function references cannot cross the asm.js FFI boundary",
+                    ));
+                }
+            }
+            ImportKind::Global(ty) if matches!(ty.ty, ValType::V128 | ValType::FuncRef(_)) => {
+                return Err(CompileError::unsupported(
+                    "global import host boundary",
+                    None,
+                    "v128 and reference globals cannot cross the JavaScript boundary",
+                ));
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+struct ModuleCx<'a> {
+    module: &'a Module,
+    options: &'a CompileOptions,
+    function_names: Vec<String>,
+    import_function_names: Vec<String>,
+    global_names: Vec<Value>,
+    return_slots: Vec<Value>,
+    max_return_slots: usize,
+    indirect_types: BTreeSet<u32>,
+}
+
+impl<'a> ModuleCx<'a> {
+    fn new(module: &'a Module, options: &'a CompileOptions) -> Result<Self, CompileError> {
+        let mut function_names = Vec::with_capacity(module.function_type_indices.len());
+        for index in 0..module.function_type_indices.len() {
+            function_names.push(js_ident(index, true));
+        }
+        let import_function_names =
+            function_names[..module.imported_function_count as usize].to_vec();
+        let mut global_names = Vec::with_capacity(module.global_types.len());
+        for (index, ty) in module.global_types.iter().enumerate() {
+            global_names.push(named_value(ty.ty, &format!("$g{}", short_index(index))));
+        }
+        let max_return_slots = module
+            .types
+            .iter()
+            .map(|ty| return_slot_types(&ty.results).len())
+            .max()
+            .unwrap_or(0);
+        let return_slots = (0..max_return_slots)
+            .map(|index| Value::I32(format!("q{}", short_index(index))))
+            .collect();
+        let mut indirect_types = BTreeSet::new();
+        for function in &module.functions {
+            for instruction in &function.body {
+                match instruction.op {
+                    Op::CallIndirect { type_index, .. }
+                    | Op::ReturnCallIndirect { type_index, .. }
+                    | Op::CallRef(type_index) => {
+                        indirect_types.insert(type_index);
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(Self {
+            module,
+            options,
+            function_names,
+            import_function_names,
+            global_names,
+            return_slots,
+            max_return_slots,
+            indirect_types,
+        })
+    }
+
+    fn emit_module(&mut self) -> Result<String, CompileError> {
+        let mut out = String::new();
+        self.emit_core(&mut out)?;
+        self.emit_wrapper_prefix(&mut out)?;
+        self.emit_wrapper_suffix(&mut out)?;
+        Ok(out)
+    }
+
+    fn emit_wrapper_prefix(&self, out: &mut String) -> Result<(), CompileError> {
+        out.push_str("function instantiate(i){i=i||{};");
+        out.push_str("var f={},r={a:[],s:[],m:[],p:[],d:[],e:[],t:[],u:[],z:[]},b,j,k,q=[],n=0,M=Math,F=M.fround,U=M.imul,C=M.clz32,B,V,H,hi=0,a=r.a,s=r.s,m=r.m,p=r.p,T=r.t,S=r.u,E=r.e,D=r.d,Z=r.z;");
+
+        let mut function_import = 0usize;
+        let mut memory_import = 0usize;
+        let mut global_import = 0usize;
+        for import in &self.module.imports {
+            let access = format!(
+                "(i[{}]||{{}})[{}]",
+                js_string(&import.module),
+                js_string(&import.name)
+            );
+            match import.kind {
+                ImportKind::Func(_) => {
+                    let name = &self.import_function_names[function_import];
+                    write!(out, "f.{name}={access};if(typeof f.{name}!='function')throw TypeError('wasm2asm: import is not a function');").unwrap();
+                    function_import += 1;
+                }
+                ImportKind::Memory(_) => {
+                    write!(out, "r.i{memory_import}={access};").unwrap();
+                    memory_import += 1;
+                }
+                ImportKind::Global(ty) => {
+                    let suffix = short_index(global_import);
+                    if ty.ty == ValType::I64 {
+                        write!(out, "j={access};if(!j||typeof j!='object')throw TypeError('wasm2asm: i64 global import requires low/high');f.g{suffix}=j.low|0;f.h{suffix}=j.high|0;").unwrap();
+                    } else {
+                        write!(
+                            out,
+                            "j={access};f.g{suffix}=j&&typeof j=='object'&&'value'in j?j.value:j;"
+                        )
+                        .unwrap();
+                    }
+                    global_import += 1;
+                }
+                ImportKind::Table(_) => {
+                    return Err(CompileError::unsupported(
+                        "imported tables",
+                        None,
+                        "host tables do not expose WebAssembly signatures",
+                    ));
+                }
+                ImportKind::Tag(_) => {
+                    return Err(CompileError::unsupported(
+                        "imported exception tags",
+                        None,
+                        "exception lowering requires module-private tags",
+                    ));
+                }
+            }
+        }
+        if self.module.function_type_indices[..self.module.imported_function_count as usize]
+            .iter()
+            .any(|index| self.module.types[*index as usize].results.first() == Some(&ValType::I64))
+        {
+            out.push_str("f.h=((i.env||{}).getTempRet0)||function(){return 0};");
+        }
+
+        let mut base = 0u64;
+        for (index, memory) in self.module.memories.iter().enumerate() {
+            let page = 1u64 << memory.page_size_log2;
+            let size = memory.initial.checked_mul(page).ok_or_else(|| {
+                CompileError::limit(
+                    "initial memory bytes",
+                    u64::MAX,
+                    self.options.limits.max_memory_pages.saturating_mul(65536),
+                )
+            })?;
+            let max = memory
+                .maximum
+                .and_then(|v| v.checked_mul(page))
+                .unwrap_or(-1i64 as u64);
+            write!(
+                out,
+                "r.a[{index}]={base};r.s[{index}]={size};r.m[{index}]={};r.p[{index}]={page};",
+                if max == u64::MAX {
+                    "-1".into()
+                } else {
+                    max.to_string()
+                }
+            )
+            .unwrap();
+            base = base
+                .checked_add(size)
+                .ok_or_else(|| CompileError::limit("combined memory bytes", u64::MAX, u32::MAX))?;
+        }
+        if base > u32::MAX as u64 {
+            return Err(CompileError::unsupported(
+                "combined memories",
+                None,
+                "initial memories exceed the 32-bit asm.js heap",
+            ));
+        }
+        if self.module.imported_memory_count == 1 && self.module.memories.len() == 1 {
+            out.push_str("b=r.i0&&r.i0.buffer?r.i0.buffer:null;");
+            write!(out, "if(!b||b.byteLength<{})throw RangeError('wasm2asm: imported memory is too small');", base).unwrap();
+            out.push_str("r.b=b;");
+        } else if !self.module.memories.is_empty() {
+            write!(out, "b=new ArrayBuffer({base});r.b=b;").unwrap();
+            for index in 0..self.module.imported_memory_count as usize {
+                write!(out, "j=r.i{index};if(!j||!j.buffer)throw TypeError('wasm2asm: memory import is invalid');new Uint8Array(b,r.a[{index}],r.s[{index}]).set(new Uint8Array(j.buffer,0,Math.min(j.buffer.byteLength,r.s[{index}])));").unwrap();
+            }
+        } else {
+            out.push_str("r.b=new ArrayBuffer(0);");
+        }
+
+        for (index, segment) in self.module.data.iter().enumerate() {
+            write!(out, "r.d[{index}]=[").unwrap();
+            for (position, byte) in segment.bytes.iter().enumerate() {
+                if position != 0 {
+                    out.push(',');
+                }
+                write!(out, "{byte}").unwrap();
+            }
+            out.push_str("];r.d[");
+            write!(out, "{index}").unwrap();
+            out.push_str("].x=0;");
+        }
+        for (index, element) in self.module.elements.iter().enumerate() {
+            write!(out, "r.e[{index}]=[").unwrap();
+            for (position, item) in element.items.iter().enumerate() {
+                if position != 0 {
+                    out.push(',');
+                }
+                write!(out, "{}", item.map(|v| v + 1).unwrap_or(0)).unwrap();
+            }
+            out.push_str("];r.e[");
+            write!(out, "{index}").unwrap();
+            out.push_str("].x=0;");
+        }
+        if let Some(table) = self.module.tables.first() {
+            write!(
+                out,
+                "T.length={};S.length={};for(k=0;k<{};k++)T[k]=S[k]=0;r.l={};",
+                table.initial,
+                table.initial,
+                table.initial,
+                table
+                    .maximum
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-1".into())
+            )
+            .unwrap();
+        } else {
+            out.push_str("r.l=0;");
+        }
+        for (function_index, type_index) in self.module.function_type_indices.iter().enumerate() {
+            write!(out, "Z[{}]={type_index};", function_index + 1).unwrap();
+        }
+        out.push_str("B=r.b;V=new DataView(B);H=new Uint8Array(B);");
+        out.push_str(RUNTIME_HELPERS);
+        out.push_str("f.X=X;f.ct=ct;f.pc=pc;f.tr=tr;f.ne=ne;f.mn=mn;f.mx=mx;f.cs=cs;f.rf=rf;f.ri=ri;f.rd=rd;f.wr=wr;f.Y=Y;f.y=y;f.W=W;f.GH=function(){return hi|0};f.AA=AA;f.LI=LI;f.LF=LF;f.SI=SI;f.SF=SF;f.VL=VL;f.VS=VS;f.MS=MS;f.DD=DD;f.ED=ED;f.TS=TS;f.RS=RS;f.IG=IG;f.G=G;f.AB=AB;f.AC=AC;f.K=K;f.N=N;f.O=O;f.P=P;f.Q=Q;f.R=R;f.L=L;");
+        self.emit_outer_initializers(out)?;
+        out.push_str("var x=asmModule(this,f);");
+        if self.module.start.is_some() {
+            out.push_str("x.$start();delete x.$start;");
+        }
+        out.push_str("q=[");
+        for index in 0..self.max_return_slots {
+            if index != 0 {
+                out.push(',');
+            }
+            write!(out, "x.$q{}", short_index(index)).unwrap();
+        }
+        out.push_str("];");
+        Ok(())
+    }
+
+    fn emit_wrapper_suffix(&self, out: &mut String) -> Result<(), CompileError> {
+        for (export_position, export) in self.module.exports.iter().enumerate() {
+            match export.kind {
+                ExportKind::Func => {
+                    let ty_index = self.module.function_type_indices[export.index as usize];
+                    let ty = &self.module.types[ty_index as usize];
+                    let key = js_string(&export.name);
+                    write!(
+                        out,
+                        "j=x.e{};delete x.e{};",
+                        short_index(export_position),
+                        short_index(export_position)
+                    )
+                    .unwrap();
+                    if ty.results.len() > 1 {
+                        write!(out, "x[{key}]=(function(h){{return function(){{var a=h.apply(null,arguments),v=[").unwrap();
+                        emit_primary_export_value(out, ty.results.first().copied(), "a");
+                        let mut slot = if matches!(ty.results.first(), Some(ValType::I64)) {
+                            1
+                        } else {
+                            0
+                        };
+                        for result in ty.results.iter().skip(1) {
+                            out.push(',');
+                            match result {
+                                ValType::I64 => {
+                                    write!(out, "[q[{slot}](),q[{}]() ]", slot + 1).unwrap();
+                                    slot += 2;
+                                }
+                                _ => {
+                                    write!(out, "q[{slot}]()").unwrap();
+                                    slot += 1;
+                                }
+                            }
+                        }
+                        out.push_str("];return v}})(j);");
+                    } else {
+                        write!(out, "x[{key}]=j;").unwrap();
+                    }
+                }
+                ExportKind::Global => {
+                    let key = js_string(&export.name);
+                    let suffix = short_index(export.index as usize);
+                    if self.module.global_types[export.index as usize].ty == ValType::I64 {
+                        write!(out, "j={{}};Object.defineProperty(j,'low',{{enumerable:true,get:x.$g{suffix},").unwrap();
+                        if self.module.global_types[export.index as usize].mutable {
+                            write!(out, "set:x.$s{suffix}").unwrap();
+                        } else {
+                            out.push_str("set:function(){throw TypeError('immutable global')}");
+                        }
+                        write!(
+                            out,
+                            "}});Object.defineProperty(j,'high',{{enumerable:true,get:x.$h{suffix},"
+                        )
+                        .unwrap();
+                        if self.module.global_types[export.index as usize].mutable {
+                            write!(out, "set:x.$t{suffix}").unwrap();
+                        } else {
+                            out.push_str("set:function(){throw TypeError('immutable global')}");
+                        }
+                        write!(out, "}});x[{key}]=j;").unwrap();
+                    } else {
+                        write!(out, "j={{}};Object.defineProperty(j,'value',{{enumerable:true,get:x.$g{suffix},").unwrap();
+                        if self.module.global_types[export.index as usize].mutable {
+                            write!(out, "set:x.$s{suffix}").unwrap();
+                        } else {
+                            out.push_str("set:function(){throw TypeError('immutable global')}");
+                        }
+                        write!(out, "}});x[{key}]=j;").unwrap();
+                    }
+                }
+                ExportKind::Memory => {
+                    let key = js_string(&export.name);
+                    write!(out, "j={{grow:x.$m{}}};Object.defineProperty(j,'buffer',{{enumerable:true,get:function(){{return r.b}}}});x[{key}]=j;", short_index(export.index as usize)).unwrap();
+                }
+                ExportKind::Table | ExportKind::Tag => {}
+            }
+        }
+        if self.module.features.i64 && self.max_return_slots != 0 {
+            out.push_str("x.getTempRet0=q[0];");
+        }
+        for index in 0..self.max_return_slots {
+            write!(out, "delete x.$q{};", short_index(index)).unwrap();
+        }
+        for index in 0..self.module.global_types.len() {
+            write!(
+                out,
+                "delete x.$g{};delete x.$s{};",
+                short_index(index),
+                short_index(index)
+            )
+            .unwrap();
+            if self.module.global_types[index].ty == ValType::I64 {
+                write!(
+                    out,
+                    "delete x.$h{};delete x.$t{};",
+                    short_index(index),
+                    short_index(index)
+                )
+                .unwrap();
+            }
+        }
+        for index in 0..self.module.memories.len() {
+            write!(out, "delete x.$m{};", short_index(index)).unwrap();
+        }
+        out.push_str("return x}");
+        Ok(())
+    }
+
+    fn emit_core(&mut self, out: &mut String) -> Result<(), CompileError> {
+        out.push_str("function asmModule(stdlib,foreign){'use asm';var F=stdlib.Math.fround,U=stdlib.Math.imul,C=stdlib.Math.clz32,Ma=stdlib.Math.abs,Mc=stdlib.Math.ceil,Mf=stdlib.Math.floor,Ms=stdlib.Math.sqrt,X=foreign.X,ct=foreign.ct,pc=foreign.pc,tr=foreign.tr,ne=foreign.ne,mn=foreign.mn,mx=foreign.mx,cs=foreign.cs,rf=foreign.rf,ri=foreign.ri,rd=foreign.rd,wr=foreign.wr,Y=foreign.Y,y=foreign.y,W=foreign.W,GH=foreign.GH,AA=foreign.AA,LI=foreign.LI,LF=foreign.LF,SI=foreign.SI,SF=foreign.SF,VL=foreign.VL,VS=foreign.VS,MS=foreign.MS,DD=foreign.DD,ED=foreign.ED,TS=foreign.TS,RS=foreign.RS,IG=foreign.IG,G=foreign.G,AB=foreign.AB,AC=foreign.AC,K=foreign.K,N=foreign.N,O=foreign.O,P=foreign.P,Q=foreign.Q,R=foreign.R,L=foreign.L,");
+        if self.max_return_slots == 0 {
+            out.push_str("q0=0;");
+        } else {
+            for index in 0..self.max_return_slots {
+                if index != 0 {
+                    out.push(',');
+                }
+                write!(out, "q{}=0", short_index(index)).unwrap();
+            }
+            out.push(';');
+        }
+        self.emit_import_aliases(out);
+        self.emit_globals(out)?;
+        self.emit_dispatchers(out)?;
+        for (defined_index, function) in self.module.functions.iter().enumerate() {
+            let function_index = self.module.imported_function_count as usize + defined_index;
+            let compiler = FunctionCompiler::new(self, function_index, function)?;
+            out.push_str(&compiler.compile()?);
+        }
+        self.emit_export_object(out)?;
+        out.push('}');
+        Ok(())
+    }
+
+    fn emit_import_aliases(&self, out: &mut String) {
+        for name in &self.import_function_names {
+            write!(out, "var {name}=foreign.{name};").unwrap();
+        }
+        if self.module.function_type_indices[..self.module.imported_function_count as usize]
+            .iter()
+            .any(|index| self.module.types[*index as usize].results.first() == Some(&ValType::I64))
+        {
+            out.push_str("var gh=foreign.h;");
+        }
+    }
+
+    fn emit_globals(&self, out: &mut String) -> Result<(), CompileError> {
+        for index in 0..self.module.imported_global_count as usize {
+            let suffix = short_index(index);
+            match &self.global_names[index] {
+                Value::I64(lo, hi) => write!(
+                    out,
+                    "var {lo}=foreign.g{suffix}|0,{hi}=foreign.h{suffix}|0;"
+                )
+                .unwrap(),
+                value => emit_var_value(out, value, &format!("foreign.g{suffix}")),
+            }
+        }
+        for (defined, global) in self.module.globals.iter().enumerate() {
+            let index = self.module.imported_global_count as usize + defined;
+            let value = const_value(&global.init, &self.global_names)?;
+            emit_var_value_from_value(out, &self.global_names[index], &value);
+        }
+        Ok(())
+    }
+
+    fn emit_dispatchers(&self, out: &mut String) -> Result<(), CompileError> {
+        for &type_index in &self.indirect_types {
+            let ty = self.module.types.get(type_index as usize).ok_or_else(|| {
+                CompileError::new(ErrorKind::Internal, "wasm2asm: invalid dispatcher type")
+            })?;
+            let params = parameter_values(&ty.params, "$d");
+            let flat = flatten_names(&params);
+            write!(out, "function I{}(x", short_index(type_index as usize)).unwrap();
+            for name in &flat {
+                write!(out, ",{name}").unwrap();
+            }
+            out.push_str("){x=x|0;");
+            emit_param_coercions(out, &params);
+            write!(out, "x=IG(x|0,{type_index}|0)|0;").unwrap();
+            let call = format!(
+                "J{}(x{})",
+                short_index(type_index as usize),
+                flat.iter()
+                    .map(|name| format!(",{name}"))
+                    .collect::<String>()
+            );
+            emit_direct_js_return(out, &ty.results, &call, false);
+            out.push('}');
+
+            write!(out, "function J{}(x", short_index(type_index as usize)).unwrap();
+            for name in &flat {
+                write!(out, ",{name}").unwrap();
+            }
+            out.push_str("){x=x|0;");
+            emit_param_coercions(out, &params);
+            let imported_i64 = ty.results.first() == Some(&ValType::I64)
+                && self.module.function_type_indices
+                    [..self.module.imported_function_count as usize]
+                    .contains(&type_index);
+            if imported_i64 {
+                out.push_str("var y=0;");
+            }
+            out.push_str("if(!x)X();switch(x|0){");
+            for (function_index, function_type) in
+                self.module.function_type_indices.iter().enumerate()
+            {
+                if *function_type != type_index {
+                    continue;
+                }
+                write!(out, "case {}:", function_index + 1).unwrap();
+                let arguments = flatten_call_arguments(
+                    &params,
+                    function_index < self.module.imported_function_count as usize,
+                );
+                let call = format!(
+                    "{}({})",
+                    self.function_names[function_index],
+                    arguments.join(",")
+                );
+                if function_index < self.module.imported_function_count as usize
+                    && ty.results.first() == Some(&ValType::I64)
+                {
+                    write!(out, "y={call}|0;q0=gh()|0;return y|0;").unwrap();
+                } else {
+                    emit_direct_js_return(
+                        out,
+                        &ty.results,
+                        &call,
+                        function_index < self.module.imported_function_count as usize,
+                    );
+                }
+            }
+            out.push_str("default:X()}");
+            match ty.results.first() {
+                None => {}
+                Some(ValType::F32) => out.push_str("return F(0)"),
+                Some(ValType::F64) => out.push_str("return +0"),
+                _ => out.push_str("return 0"),
+            }
+            out.push('}');
+        }
+        Ok(())
+    }
+
+    fn emit_outer_initializers(&self, out: &mut String) -> Result<(), CompileError> {
+        for (index, segment) in self.module.data.iter().enumerate() {
+            if let DataMode::Active { memory, ref offset } = segment.mode {
+                let address = self.outer_offset(offset)?;
+                write!(
+                    out,
+                    "K({index}|0,{memory}|0,({address})|0,0,{}|0);",
+                    segment.bytes.len()
+                )
+                .unwrap();
+            }
+        }
+        for (index, segment) in self.module.elements.iter().enumerate() {
+            if let ElementMode::Active { table, ref offset } = segment.mode {
+                if table != 0 {
+                    return Err(CompileError::unsupported(
+                        "multiple tables",
+                        None,
+                        "only table zero is supported",
+                    ));
+                }
+                let address = self.outer_offset(offset)?;
+                write!(
+                    out,
+                    "L({index}|0,({address})|0,0,{}|0);",
+                    segment.items.len()
+                )
+                .unwrap();
+            }
+        }
+        Ok(())
+    }
+
+    fn outer_offset(&self, expr: &ConstExpr) -> Result<String, CompileError> {
+        match *expr {
+            ConstExpr::I32(value) => Ok(value.to_string()),
+            ConstExpr::I64(value) => {
+                let bits = value as u64;
+                Ok(if bits >> 32 == 0 {
+                    (bits as u32).to_string()
+                } else {
+                    "-1".into()
+                })
+            }
+            ConstExpr::GlobalGet(index) if index < self.module.imported_global_count => {
+                Ok(format!("f.g{}", short_index(index as usize)))
+            }
+            _ => Err(CompileError::unsupported(
+                "segment offset",
+                None,
+                "strict asm.js initialization supports integer constants and imported immutable i32 globals",
+            )),
+        }
+    }
+
+    fn emit_export_object(&self, out: &mut String) -> Result<(), CompileError> {
+        for index in 0..self.max_return_slots {
+            write!(
+                out,
+                "function $Q{}(){{return q{}|0}}",
+                short_index(index),
+                short_index(index)
+            )
+            .unwrap();
+        }
+        for (index, value) in self.global_names.iter().enumerate() {
+            let suffix = short_index(index);
+            if let Value::I64(lo, hi) = value {
+                write!(
+                    out,
+                    "function $G{suffix}(){{return {lo}|0}}function $H{suffix}(){{return {hi}|0}}"
+                )
+                .unwrap();
+                if self.module.global_types[index].mutable {
+                    write!(out, "function $S{suffix}(v){{v=v|0;{lo}=v|0}}function $T{suffix}(v){{v=v|0;{hi}=v|0}}").unwrap();
+                }
+            } else {
+                write!(out, "function $G{suffix}(){{").unwrap();
+                emit_return_value(out, value);
+                out.push('}');
+                if self.module.global_types[index].mutable {
+                    let ty = self.module.global_types[index].ty;
+                    write!(out, "function $S{suffix}(v){{v={};", coerce(ty, "v")).unwrap();
+                    emit_set_from_single_argument(out, value, "v");
+                    out.push('}');
+                }
+            }
+        }
+        for index in 0..self.module.memories.len() {
+            write!(
+                out,
+                "function $M{}(n){{n=n|0;return G({index}|0,n|0)|0}}",
+                short_index(index)
+            )
+            .unwrap();
+        }
+        out.push_str("return{");
+        let mut first = true;
+        for (export_position, export) in self.module.exports.iter().enumerate() {
+            if export.kind != ExportKind::Func {
+                continue;
+            }
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            write!(
+                out,
+                "e{}:{}",
+                short_index(export_position),
+                self.function_names[export.index as usize]
+            )
+            .unwrap();
+        }
+        if let Some(start) = self.module.start {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            write!(out, "$start:{}", self.function_names[start as usize]).unwrap();
+        }
+        for index in 0..self.max_return_slots {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            write!(out, "$q{}:$Q{}", short_index(index), short_index(index)).unwrap();
+        }
+        for index in 0..self.global_names.len() {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            let suffix = short_index(index);
+            write!(out, "$g{suffix}:$G{suffix}").unwrap();
+            if self.module.global_types[index].ty == ValType::I64 {
+                write!(out, ",$h{suffix}:$H{suffix}").unwrap();
+            }
+            if self.module.global_types[index].mutable {
+                write!(out, ",$s{suffix}:$S{suffix}").unwrap();
+                if self.module.global_types[index].ty == ValType::I64 {
+                    write!(out, ",$t{suffix}:$T{suffix}").unwrap();
+                }
+            }
+        }
+        for index in 0..self.module.memories.len() {
+            if !first {
+                out.push(',');
+            }
+            first = false;
+            write!(out, "$m{}:$M{}", short_index(index), short_index(index)).unwrap();
+        }
+        out.push_str("};");
+        Ok(())
+    }
+
+    fn function_type(&self, index: usize) -> Result<&FuncType, CompileError> {
+        let type_index = *self
+            .module
+            .function_type_indices
+            .get(index)
+            .ok_or_else(|| {
+                CompileError::new(ErrorKind::Internal, "wasm2asm: invalid function index")
+            })?;
+        self.module.types.get(type_index as usize).ok_or_else(|| {
+            CompileError::new(ErrorKind::Internal, "wasm2asm: invalid function type index")
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+enum Value {
+    I32(String),
+    I64(String, String),
+    F32(String),
+    F64(String),
+    Ref(String),
+    V128([String; 4]),
+}
+
+impl Value {
+    fn ty(&self) -> ValType {
+        match self {
+            Self::I32(_) => ValType::I32,
+            Self::I64(_, _) => ValType::I64,
+            Self::F32(_) => ValType::F32,
+            Self::F64(_) => ValType::F64,
+            Self::Ref(_) => ValType::FuncRef(None),
+            Self::V128(_) => ValType::V128,
+        }
+    }
+    fn components(&self) -> Vec<&str> {
+        match self {
+            Self::I32(a) | Self::F32(a) | Self::F64(a) | Self::Ref(a) => vec![a],
+            Self::I64(a, b) => vec![a, b],
+            Self::V128(a) => a.iter().map(String::as_str).collect(),
+        }
+    }
+    fn i32_expr(&self) -> Result<&str, CompileError> {
+        match self {
+            Self::I32(v) | Self::Ref(v) => Ok(v),
+            _ => Err(CompileError::new(
+                ErrorKind::Internal,
+                "wasm2asm: expected i32 value",
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControlKind {
+    Block,
+    Loop,
+    If,
+    Try,
+}
+
+#[derive(Debug, Clone)]
+struct Control {
+    kind: ControlKind,
+    label: String,
+    base: usize,
+    params: Vec<Value>,
+    results: Vec<ValType>,
+    result_values: Vec<Value>,
+    entry_reachable: bool,
+    end_reachable: bool,
+    then_reachable: bool,
+    seen_else: bool,
+    catches: Vec<CatchClause>,
+}
+
+struct FunctionCompiler<'a, 'm> {
+    module: &'a ModuleCx<'m>,
+    function_index: usize,
+    function: &'a Function,
+    ty: &'a FuncType,
+    locals: Vec<Value>,
+    stack: Vec<Value>,
+    controls: Vec<Control>,
+    declarations: Vec<(String, ValType)>,
+    body: String,
+    temp_index: usize,
+    label_index: usize,
+    reachable: bool,
+}
+
+impl<'a, 'm> FunctionCompiler<'a, 'm> {
+    fn new(
+        module: &'a ModuleCx<'m>,
+        function_index: usize,
+        function: &'a Function,
+    ) -> Result<Self, CompileError> {
+        let ty = module.function_type(function_index)?;
+        let mut locals = parameter_values(&ty.params, "$a");
+        let first_local = locals.len();
+        for (offset, &local) in function.locals.iter().enumerate() {
+            locals.push(named_value(
+                local,
+                &format!("$l{}", short_index(first_local + offset)),
+            ));
+        }
+        Ok(Self {
+            module,
+            function_index,
+            function,
+            ty,
+            locals,
+            stack: Vec::new(),
+            controls: Vec::new(),
+            declarations: Vec::new(),
+            body: String::new(),
+            temp_index: 0,
+            label_index: 0,
+            reachable: true,
+        })
+    }
+
+    fn compile(mut self) -> Result<String, CompileError> {
+        for instruction in &self.function.body {
+            self.emit_instruction(instruction)?;
+        }
+        let name = &self.module.function_names[self.function_index];
+        let params = &self.locals[..self.ty.params.len()];
+        let flat_params = flatten_names(params);
+        let mut out = String::new();
+        write!(out, "function {name}({}){{", flat_params.join(",")).unwrap();
+        emit_param_coercions(&mut out, params);
+        let param_components: usize = params.iter().map(|v| v.components().len()).sum();
+        let all_components = flatten_names(&self.locals);
+        let local_components = &all_components[param_components..];
+        for component in local_components {
+            let ty = component_type(&self.locals, component).unwrap_or(ValType::I32);
+            write!(out, "var {component}={};", zero_literal(ty)).unwrap();
+        }
+        for (name, ty) in &self.declarations {
+            write!(out, "var {name}={};", zero_literal(*ty)).unwrap();
+        }
+        out.push_str(&self.body);
+        if self.ty.results.is_empty() {
+            if self.reachable {
+                out.push_str("return;");
+            }
+        } else {
+            let tail = self.body.trim_end().trim_end_matches(';');
+            let final_fragment = tail
+                .rsplit([';', '{', '}'])
+                .next()
+                .unwrap_or("")
+                .trim_start();
+            if !final_fragment.starts_with("return ") {
+                match self.ty.results[0] {
+                    ValType::F32 => out.push_str("return F(0);"),
+                    ValType::F64 => out.push_str("return +0;"),
+                    _ => out.push_str("return 0;"),
+                }
+            }
+        }
+        out.push('}');
+        Ok(out)
+    }
+
+    fn emit_instruction(&mut self, instruction: &Instr) -> Result<(), CompileError> {
+        use Op::*;
+        if !self.reachable
+            && !matches!(
+                instruction.op,
+                Block(_) | Loop(_) | If(_) | TryTable { .. } | Else | End
+            )
+        {
+            return Ok(());
+        }
+        match &instruction.op {
+            Unreachable => {
+                self.body.push_str("X();");
+                self.reachable = false;
+            }
+            Nop => {}
+            Block(sig) => self.begin_control(ControlKind::Block, sig.clone(), Vec::new())?,
+            Loop(sig) => self.begin_control(ControlKind::Loop, sig.clone(), Vec::new())?,
+            If(sig) => {
+                let condition = if self.reachable {
+                    self.pop_i32()?.to_string()
+                } else {
+                    "0".into()
+                };
+                self.begin_control_with_condition(
+                    ControlKind::If,
+                    sig.clone(),
+                    condition,
+                    Vec::new(),
+                )?;
+            }
+            TryTable { sig, catches } => {
+                self.begin_control(ControlKind::Try, sig.clone(), catches.clone())?
+            }
+            Else => self.emit_else()?,
+            End => self.end_control()?,
+            Br(depth) => self.emit_br(*depth, true)?,
+            BrIf(depth) => self.emit_br_if(*depth)?,
+            BrTable { targets, default } => self.emit_br_table(targets, *default)?,
+            Return => self.emit_function_return(true)?,
+            Call(index) => self.emit_call(*index, false)?,
+            ReturnCall(index) => self.emit_call(*index, true)?,
+            CallIndirect {
+                type_index,
+                table_index,
+            } => self.emit_indirect(*type_index, *table_index, false, false)?,
+            ReturnCallIndirect {
+                type_index,
+                table_index,
+            } => self.emit_indirect(*type_index, *table_index, true, false)?,
+            CallRef(type_index) => self.emit_indirect(*type_index, 0, false, true)?,
+            Drop => {
+                self.pop()?;
+            }
+            Select(_) => self.emit_select()?,
+            LocalGet(index) => {
+                let value = self.local(*index)?.clone();
+                let snapshot = self.materialize(&value);
+                self.stack.push(snapshot);
+            }
+            LocalSet(index) => {
+                let value = self.pop()?;
+                let target = self.local(*index)?.clone();
+                self.assign(&target, &value);
+            }
+            LocalTee(index) => {
+                let value = self.pop()?;
+                let target = self.local(*index)?.clone();
+                self.assign(&target, &value);
+                let snapshot = self.materialize(&target);
+                self.stack.push(snapshot);
+            }
+            GlobalGet(index) => {
+                let value = self
+                    .module
+                    .global_names
+                    .get(*index as usize)
+                    .ok_or_else(|| self.internal("invalid global index"))?
+                    .clone();
+                let snapshot = self.materialize(&value);
+                self.stack.push(snapshot);
+            }
+            GlobalSet(index) => {
+                let value = self.pop()?;
+                let target = self
+                    .module
+                    .global_names
+                    .get(*index as usize)
+                    .ok_or_else(|| self.internal("invalid global index"))?
+                    .clone();
+                self.assign(&target, &value);
+            }
+            I32Const(value) => self.stack.push(Value::I32(value.to_string())),
+            I64Const(value) => self.stack.push(i64_const(*value)),
+            F32Const(bits) => self.stack.push(Value::F32(float32_literal(*bits))),
+            F64Const(bits) => self.stack.push(Value::F64(float64_literal(*bits))),
+            Unary(op) => self.emit_unary(*op)?,
+            Binary(op) => self.emit_binary(*op)?,
+            Load(op, memarg) => self.emit_load(*op, *memarg)?,
+            Store(op, memarg) => self.emit_store(*op, *memarg)?,
+            MemorySize(memory) => {
+                let temp = self.temp(ValType::I32);
+                write!(self.body, "{}=MS({memory}|0)|0;", temp.i32_expr()?).unwrap();
+                if self.module.module.memories[*memory as usize].memory64 {
+                    self.stack
+                        .push(Value::I64(temp.i32_expr()?.into(), "0".into()));
+                } else {
+                    self.stack.push(temp);
+                }
+            }
+            MemoryGrow(memory) => {
+                if self.module.module.memories[*memory as usize].memory64 {
+                    let (delta_lo, delta_hi) = expect_i64(self.pop()?)?;
+                    let result_lo = self.temp(ValType::I32);
+                    let result_hi = self.temp(ValType::I32);
+                    write!(self.body, "if(({delta_hi})|0){{{}=-1;{}=-1;}}else{{{}=G({memory}|0,({delta_lo})|0)|0;{}=({})>>31;}}", result_lo.i32_expr()?, result_hi.i32_expr()?, result_lo.i32_expr()?, result_hi.i32_expr()?, result_lo.i32_expr()?).unwrap();
+                    self.stack.push(Value::I64(
+                        result_lo.i32_expr()?.into(),
+                        result_hi.i32_expr()?.into(),
+                    ));
+                } else {
+                    let delta = self.pop_i32()?.to_string();
+                    let temp = self.temp(ValType::I32);
+                    write!(
+                        self.body,
+                        "{}=G({memory}|0,({delta})|0)|0;",
+                        temp.i32_expr()?
+                    )
+                    .unwrap();
+                    self.stack.push(temp);
+                }
+            }
+            MemoryCopy { dst, src } => self.emit_memory_copy(*dst, *src)?,
+            MemoryFill(memory) => self.emit_memory_fill(*memory)?,
+            MemoryInit { data, memory } => self.emit_memory_init(*data, *memory)?,
+            DataDrop(index) => self.body.push_str(&format!("DD({index}|0);")),
+            TableGet(table) => {
+                self.ensure_table_zero(*table)?;
+                let index = self.pop_table_index(*table)?;
+                let temp = self.temp(ValType::FuncRef(None));
+                write!(self.body, "{}=N(({index})|0)|0;", temp.i32_expr()?).unwrap();
+                self.stack.push(temp);
+            }
+            TableSet(table) => {
+                self.ensure_table_zero(*table)?;
+                let value = self.pop()?;
+                let index = self.pop_table_index(*table)?;
+                write!(self.body, "O(({index})|0,({})|0);", value.i32_expr()?).unwrap();
+            }
+            TableSize(table) => {
+                self.ensure_table_zero(*table)?;
+                let temp = self.temp(ValType::I32);
+                write!(self.body, "{}=TS()|0;", temp.i32_expr()?).unwrap();
+                if self.module.module.tables[*table as usize].table64 {
+                    self.stack
+                        .push(Value::I64(temp.i32_expr()?.into(), "0".into()));
+                } else {
+                    self.stack.push(temp);
+                }
+            }
+            TableGrow(table) => {
+                self.ensure_table_zero(*table)?;
+                if self.module.module.tables[*table as usize].table64 {
+                    let (delta_lo, delta_hi) = expect_i64(self.pop()?)?;
+                    let value = self.pop()?;
+                    let result_lo = self.temp(ValType::I32);
+                    let result_hi = self.temp(ValType::I32);
+                    write!(self.body, "if(({delta_hi})|0){{{}=-1;{}=-1;}}else{{{}=P(({})|0,({delta_lo})|0)|0;{}=({})>>31;}}", result_lo.i32_expr()?, result_hi.i32_expr()?, result_lo.i32_expr()?, value.i32_expr()?, result_hi.i32_expr()?, result_lo.i32_expr()?).unwrap();
+                    self.stack.push(Value::I64(
+                        result_lo.i32_expr()?.into(),
+                        result_hi.i32_expr()?.into(),
+                    ));
+                } else {
+                    let delta = self.pop_i32()?.to_string();
+                    let value = self.pop()?;
+                    let temp = self.temp(ValType::I32);
+                    write!(
+                        self.body,
+                        "{}=P(({})|0,({delta})|0)|0;",
+                        temp.i32_expr()?,
+                        value.i32_expr()?
+                    )
+                    .unwrap();
+                    self.stack.push(temp);
+                }
+            }
+            TableFill(table) => {
+                self.ensure_table_zero(*table)?;
+                let count = self.pop_table_index(*table)?;
+                let value = self.pop()?;
+                let dst = self.pop_table_index(*table)?;
+                write!(
+                    self.body,
+                    "Q(({dst})|0,({})|0,({count})|0);",
+                    value.i32_expr()?
+                )
+                .unwrap();
+            }
+            TableCopy { dst, src } => {
+                self.ensure_table_zero(*dst)?;
+                self.ensure_table_zero(*src)?;
+                let count = self.pop_table_index(*dst)?;
+                let source = self.pop_table_index(*src)?;
+                let dest = self.pop_table_index(*dst)?;
+                write!(self.body, "R(({dest})|0,({source})|0,({count})|0);").unwrap();
+            }
+            TableInit { elem, table } => {
+                self.ensure_table_zero(*table)?;
+                let count = self.pop_table_index(*table)?;
+                let source = self.pop_table_index(*table)?;
+                let dest = self.pop_table_index(*table)?;
+                write!(
+                    self.body,
+                    "L({elem}|0,({dest})|0,({source})|0,({count})|0);"
+                )
+                .unwrap();
+            }
+            ElemDrop(index) => self.body.push_str(&format!("ED({index}|0);")),
+            RefNull(_) => self.stack.push(Value::Ref("0".into())),
+            RefIsNull => {
+                let value = self.pop()?;
+                self.stack
+                    .push(Value::I32(format!("((({})|0)==0)|0", value.i32_expr()?)));
+            }
+            RefFunc(index) => self.stack.push(Value::Ref((index + 1).to_string())),
+            RefTest(type_index) => {
+                let value = self.pop()?;
+                let check = match type_index {
+                    Some(t) => format!("RS(({})|0,{t}|0)|0", value.i32_expr()?),
+                    None => format!("((({})|0)!=0)|0", value.i32_expr()?),
+                };
+                self.stack.push(Value::I32(check));
+            }
+            RefCast(type_index) => {
+                let value = self.pop()?;
+                if let Some(t) = type_index {
+                    self.body.push_str(&format!(
+                        "if((RS(({})|0,{t}|0)|0)==0)X();",
+                        value.i32_expr()?
+                    ));
+                }
+                self.stack.push(value);
+            }
+            Simd(op) => self.emit_simd(op)?,
+            Throw(tag) => self.emit_throw(*tag)?,
+            Unsupported {
+                feature,
+                instruction,
+            } => {
+                return Err(CompileError::unsupported(
+                    feature,
+                    Some(instruction_offset(instruction, instruction)),
+                    format!("instruction {instruction}"),
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    fn begin_control(
+        &mut self,
+        kind: ControlKind,
+        sig: BlockSig,
+        catches: Vec<CatchClause>,
+    ) -> Result<(), CompileError> {
+        let condition = if kind == ControlKind::Try {
+            Some("try".to_string())
+        } else {
+            None
+        };
+        self.begin_control_impl(kind, sig, condition, catches)
+    }
+
+    fn begin_control_with_condition(
+        &mut self,
+        kind: ControlKind,
+        sig: BlockSig,
+        condition: String,
+        catches: Vec<CatchClause>,
+    ) -> Result<(), CompileError> {
+        self.begin_control_impl(kind, sig, Some(condition), catches)
+    }
+
+    fn begin_control_impl(
+        &mut self,
+        kind: ControlKind,
+        sig: BlockSig,
+        condition: Option<String>,
+        catches: Vec<CatchClause>,
+    ) -> Result<(), CompileError> {
+        let params = if self.reachable {
+            self.pop_types(&sig.params)?
+        } else {
+            sig.params.iter().map(|&t| self.temp(t)).collect()
+        };
+        let base = self.stack.len();
+        let stored_params: Vec<Value> = sig.params.iter().map(|&t| self.temp(t)).collect();
+        if self.reachable {
+            for (target, value) in stored_params.iter().zip(&params) {
+                self.assign(target, value);
+            }
+        }
+        self.stack.extend(stored_params.iter().cloned());
+        let result_values = sig.results.iter().map(|&t| self.temp(t)).collect();
+        let label = format!("$b{}", short_index(self.label_index));
+        self.label_index += 1;
+        match kind {
+            ControlKind::Block => write!(self.body, "{label}:{{").unwrap(),
+            ControlKind::Loop => write!(self.body, "{label}:for(;;){{").unwrap(),
+            ControlKind::If => write!(
+                self.body,
+                "{label}:if({}){{",
+                condition.as_deref().unwrap_or("0")
+            )
+            .unwrap(),
+            ControlKind::Try => write!(self.body, "{label}:try{{").unwrap(),
+        }
+        self.controls.push(Control {
+            kind,
+            label,
+            base,
+            params: stored_params,
+            results: sig.results,
+            result_values,
+            entry_reachable: self.reachable,
+            end_reachable: false,
+            then_reachable: false,
+            seen_else: false,
+            catches,
+        });
+        Ok(())
+    }
+
+    fn emit_else(&mut self) -> Result<(), CompileError> {
+        let index = self
+            .controls
+            .len()
+            .checked_sub(1)
+            .ok_or_else(|| self.internal("else without control frame"))?;
+        if self.controls[index].kind != ControlKind::If {
+            return Err(self.internal("else outside if"));
+        }
+        if self.reachable {
+            let values = self.pop_types(&self.controls[index].results.clone())?;
+            let targets = self.controls[index].result_values.clone();
+            for (target, value) in targets.iter().zip(&values) {
+                self.assign(target, value);
+            }
+        }
+        self.controls[index].then_reachable = self.reachable;
+        self.controls[index].seen_else = true;
+        self.body.push_str("}else{");
+        let base = self.controls[index].base;
+        self.stack.truncate(base);
+        self.stack.extend(self.controls[index].params.clone());
+        self.reachable = self.controls[index].entry_reachable;
+        Ok(())
+    }
+
+    fn end_control(&mut self) -> Result<(), CompileError> {
+        if self.controls.is_empty() {
+            if self.reachable {
+                self.emit_function_return(false)?;
+            }
+            return Ok(());
+        }
+        let mut control = self.controls.pop().unwrap();
+        if self.reachable {
+            let values = self.pop_types(&control.results)?;
+            for (target, value) in control.result_values.iter().zip(&values) {
+                self.assign(target, value);
+            }
+        }
+        match control.kind {
+            ControlKind::Loop => {
+                if self.reachable {
+                    write!(self.body, "break {};", control.label).unwrap();
+                }
+                self.body.push('}');
+            }
+            ControlKind::Try => {
+                self.body.push_str("}catch(ex){");
+                for catch in &control.catches {
+                    self.emit_catch(catch)?;
+                }
+                self.body.push_str("throw ex}");
+            }
+            _ => self.body.push('}'),
+        }
+        let after = match control.kind {
+            ControlKind::If if control.seen_else => {
+                control.then_reachable || self.reachable || control.end_reachable
+            }
+            ControlKind::If => control.entry_reachable || self.reachable || control.end_reachable,
+            _ => self.reachable || control.end_reachable,
+        };
+        self.stack.truncate(control.base);
+        if after {
+            self.stack.append(&mut control.result_values);
+        }
+        self.reachable = after;
+        Ok(())
+    }
+
+    fn emit_catch(&mut self, catch: &CatchClause) -> Result<(), CompileError> {
+        let (condition, label, tag) = match *catch {
+            CatchClause::Tag { tag, label } => (format!("ex&&ex.t=={tag}"), label, Some(tag)),
+            CatchClause::All { label } => ("ex&&ex.w==1".into(), label, None),
+        };
+        write!(self.body, "if({condition}){{").unwrap();
+        let target_index = self
+            .controls
+            .len()
+            .checked_sub(1 + label as usize)
+            .ok_or_else(|| self.internal("invalid catch target"))?;
+        let branch_types = if self.controls[target_index].kind == ControlKind::Loop {
+            self.controls[target_index]
+                .params
+                .iter()
+                .map(Value::ty)
+                .collect::<Vec<_>>()
+        } else {
+            self.controls[target_index].results.clone()
+        };
+        let mut values = Vec::new();
+        if let Some(tag) = tag {
+            let type_index = *self
+                .module
+                .module
+                .tags
+                .get(tag as usize)
+                .ok_or_else(|| self.internal("invalid tag index"))?;
+            let tag_ty = self
+                .module
+                .module
+                .types
+                .get(type_index as usize)
+                .ok_or_else(|| self.internal("invalid tag type"))?;
+            let mut component = 0usize;
+            for &ty in &tag_ty.params {
+                values.push(match ty {
+                    ValType::I64 => {
+                        let v = Value::I64(
+                            format!("ex.v[{component}]|0"),
+                            format!("ex.v[{}]|0", component + 1),
+                        );
+                        component += 2;
+                        v
+                    }
+                    ValType::F32 => {
+                        let v = Value::F32(format!("F(ex.v[{component}])"));
+                        component += 1;
+                        v
+                    }
+                    ValType::F64 => {
+                        let v = Value::F64(format!("+ex.v[{component}]"));
+                        component += 1;
+                        v
+                    }
+                    ValType::I32 => {
+                        let v = Value::I32(format!("ex.v[{component}]|0"));
+                        component += 1;
+                        v
+                    }
+                    _ => {
+                        return Err(CompileError::unsupported(
+                            "exception payload",
+                            None,
+                            "only scalar numeric exception payloads are supported",
+                        ));
+                    }
+                });
+            }
+        }
+        if values.len() != branch_types.len() {
+            return Err(self.internal("exception payload does not match catch label"));
+        }
+        self.emit_branch_to_index(target_index, &values)?;
+        self.body.push('}');
+        Ok(())
+    }
+
+    fn emit_br(&mut self, depth: u32, consume: bool) -> Result<(), CompileError> {
+        let target = self.target_index(depth)?;
+        let types = self.branch_types(target);
+        let values = if consume {
+            self.pop_types(&types)?
+        } else {
+            self.peek_types(&types)?
+        };
+        self.emit_branch_to_index(target, &values)?;
+        if consume {
+            self.reachable = false;
+        }
+        Ok(())
+    }
+
+    fn emit_br_if(&mut self, depth: u32) -> Result<(), CompileError> {
+        let condition = self.pop_i32()?.to_string();
+        let target = self.target_index(depth)?;
+        let values = self.peek_types(&self.branch_types(target))?;
+        write!(self.body, "if({condition}){{").unwrap();
+        self.emit_branch_to_index(target, &values)?;
+        self.body.push('}');
+        Ok(())
+    }
+
+    fn emit_br_table(&mut self, targets: &[u32], default: u32) -> Result<(), CompileError> {
+        let selector = self.pop_i32()?.to_string();
+        let target = self.target_index(default)?;
+        let values = self.pop_types(&self.branch_types(target))?;
+        write!(self.body, "switch(({selector})|0){{").unwrap();
+        for (case, depth) in targets.iter().enumerate() {
+            let index = self.target_index(*depth)?;
+            write!(self.body, "case {case}:").unwrap();
+            self.emit_branch_to_index(index, &values)?;
+        }
+        self.body.push_str("default:");
+        self.emit_branch_to_index(target, &values)?;
+        self.body.push('}');
+        self.reachable = false;
+        Ok(())
+    }
+
+    fn emit_branch_to_index(
+        &mut self,
+        target: usize,
+        values: &[Value],
+    ) -> Result<(), CompileError> {
+        let control = self
+            .controls
+            .get(target)
+            .ok_or_else(|| self.internal("invalid branch target"))?
+            .clone();
+        let targets = if control.kind == ControlKind::Loop {
+            control.params
+        } else {
+            control.result_values
+        };
+        for (target, value) in targets.iter().zip(values) {
+            self.assign(target, value);
+        }
+        if control.kind == ControlKind::Loop {
+            write!(self.body, "continue {};", control.label).unwrap();
+        } else {
+            self.controls[target].end_reachable = true;
+            write!(self.body, "break {};", control.label).unwrap();
+        }
+        Ok(())
+    }
+
+    fn emit_function_return(&mut self, consume: bool) -> Result<(), CompileError> {
+        let results = self.ty.results.clone();
+        let values = if consume {
+            self.pop_types(&results)?
+        } else if results.is_empty() {
+            Vec::new()
+        } else {
+            self.pop_types(&results)?
+        };
+        emit_return_abi(&mut self.body, &values, &self.module.return_slots);
+        self.reachable = false;
+        Ok(())
+    }
+
+    fn emit_call(&mut self, index: u32, tail: bool) -> Result<(), CompileError> {
+        let ty = self.module.function_type(index as usize)?.clone();
+        let args = self.pop_types(&ty.params)?;
+        if tail
+            && self.module.module.features.tail_call
+            && index >= self.module.module.imported_function_count
+        {
+            write!(
+                self.body,
+                "throw{{w:2,f:{index},a:[{}]}};",
+                flatten_names(&args).join(",")
+            )
+            .unwrap();
+            self.reachable = false;
+            return Ok(());
+        }
+        let arguments =
+            flatten_call_arguments(&args, index < self.module.module.imported_function_count);
+        let call = format!(
+            "{}({})",
+            self.module.function_names[index as usize],
+            arguments.join(",")
+        );
+        self.finish_call(
+            &ty.results,
+            call,
+            tail,
+            index < self.module.module.imported_function_count,
+        )
+    }
+
+    fn emit_indirect(
+        &mut self,
+        type_index: u32,
+        table_index: u32,
+        tail: bool,
+        reference: bool,
+    ) -> Result<(), CompileError> {
+        if !reference {
+            self.ensure_table_zero(table_index)?;
+        }
+        let ty = self
+            .module
+            .module
+            .types
+            .get(type_index as usize)
+            .ok_or_else(|| self.internal("invalid indirect type"))?
+            .clone();
+        let callee = if reference {
+            self.pop_i32()?.to_string()
+        } else {
+            self.pop_table_index(table_index)?
+        };
+        let args = self.pop_types(&ty.params)?;
+        let flat = flatten_names(&args);
+        if tail && self.module.module.features.tail_call {
+            let target = self.temp(ValType::FuncRef(None));
+            if reference {
+                self.assign(&target, &Value::Ref(callee));
+            } else {
+                write!(self.body, "{}=N({callee})|0;", target.i32_expr()?).unwrap();
+            }
+            let target_name = target.i32_expr()?.to_string();
+            write!(
+                self.body,
+                "if(!{target_name}||Z[{target_name}]!={type_index})X();"
+            )
+            .unwrap();
+            if self.module.module.imported_function_count != 0 {
+                write!(
+                    self.body,
+                    "if({target_name}<={}){{",
+                    self.module.module.imported_function_count
+                )
+                .unwrap();
+                let call = if flat.is_empty() {
+                    format!("J{}({target_name})", short_index(type_index as usize))
+                } else {
+                    format!(
+                        "J{}({target_name},{})",
+                        short_index(type_index as usize),
+                        flat.join(",")
+                    )
+                };
+                self.finish_call(&ty.results, call, true, false)?;
+                self.body.push('}');
+                self.reachable = true;
+            }
+            write!(
+                self.body,
+                "throw{{w:2,f:({target_name}-1)|0,a:[{}]}};",
+                flat.join(",")
+            )
+            .unwrap();
+            self.reachable = false;
+            return Ok(());
+        }
+        let function = if reference {
+            format!("J{}", short_index(type_index as usize))
+        } else {
+            format!("I{}", short_index(type_index as usize))
+        };
+        let call = if flat.is_empty() {
+            format!("{function}({callee})")
+        } else {
+            format!("{function}({callee},{})", flat.join(","))
+        };
+        self.finish_call(&ty.results, call, tail, false)
+    }
+
+    fn finish_call(
+        &mut self,
+        results: &[ValType],
+        call: String,
+        tail: bool,
+        imported: bool,
+    ) -> Result<(), CompileError> {
+        if results.is_empty() {
+            write!(self.body, "{call};").unwrap();
+            if tail {
+                self.body.push_str("return;");
+                self.reachable = false;
+            }
+            return Ok(());
+        }
+        let primary = self.temp(match results[0] {
+            ValType::I64 | ValType::V128 => ValType::I32,
+            other => other,
+        });
+        let values = call_result_values(
+            results,
+            &call,
+            &self.module.return_slots,
+            &mut self.body,
+            primary,
+            imported,
+        )?;
+        if imported && results.first() == Some(&ValType::I64) {
+            self.body.push_str("qa=gh()|0;");
+        }
+        if tail {
+            emit_return_abi(&mut self.body, &values, &self.module.return_slots);
+            self.reachable = false;
+        } else {
+            self.stack.extend(values);
+        }
+        Ok(())
+    }
+
+    fn emit_select(&mut self) -> Result<(), CompileError> {
+        let condition = self.pop_i32()?.to_string();
+        let right = self.pop()?;
+        let left = self.pop()?;
+        if left.ty() != right.ty() {
+            return Err(self.internal("select type mismatch"));
+        }
+        let value = match (left, right) {
+            (Value::I32(a), Value::I32(b)) => Value::I32(format!("({condition}?{a}:{b})|0")),
+            (Value::Ref(a), Value::Ref(b)) => Value::Ref(format!("({condition}?{a}:{b})|0")),
+            (Value::F32(a), Value::F32(b)) => Value::F32(format!("F({condition}?{a}:{b})")),
+            (Value::F64(a), Value::F64(b)) => Value::F64(format!("+({condition}?{a}:{b})")),
+            (Value::I64(al, ah), Value::I64(bl, bh)) => Value::I64(
+                format!("({condition}?{al}:{bl})|0"),
+                format!("({condition}?{ah}:{bh})|0"),
+            ),
+            (Value::V128(a), Value::V128(b)) => Value::V128(std::array::from_fn(|i| {
+                format!("({condition}?{}:{})|0", a[i], b[i])
+            })),
+            _ => return Err(self.internal("select type mismatch")),
+        };
+        self.stack.push(value);
+        Ok(())
+    }
+
+    fn emit_unary(&mut self, op: UnaryOp) -> Result<(), CompileError> {
+        use UnaryOp::*;
+        let value = self.pop()?;
+        let result = match op {
+            I32Eqz => Value::I32(format!("((({})|0)==0)|0", value.i32_expr()?)),
+            I32Clz => Value::I32(format!("C({})|0", value.i32_expr()?)),
+            I32Ctz => Value::I32(format!("ct(({})|0)|0", value.i32_expr()?)),
+            I32Popcnt => Value::I32(format!("pc(({})|0)|0", value.i32_expr()?)),
+            I64Eqz => {
+                let (lo, hi) = expect_i64(value)?;
+                Value::I32(format!("((((({lo})|0)|(({hi})|0))|0)==0)|0"))
+            }
+            I64Clz => {
+                let (lo, hi) = expect_i64(value)?;
+                Value::I64(
+                    format!("(({hi})|0?C(({hi})|0):32+C(({lo})|0))|0"),
+                    "0".into(),
+                )
+            }
+            I64Ctz => {
+                let (lo, hi) = expect_i64(value)?;
+                Value::I64(
+                    format!("(({lo})|0?ct(({lo})|0)|0:(32+(ct(({hi})|0)|0))|0)|0"),
+                    "0".into(),
+                )
+            }
+            I64Popcnt => {
+                let (lo, hi) = expect_i64(value)?;
+                Value::I64(format!("((pc(({lo})|0)|0)+(pc(({hi})|0)|0))|0"), "0".into())
+            }
+            F32Abs => Value::F32(format!("F(Ma({}))", expect_f32(value)?)),
+            F32Neg => Value::F32(format!("F(-{})", expect_f32(value)?)),
+            F32Ceil => Value::F32(format!("F(Mc({}))", expect_f32(value)?)),
+            F32Floor => Value::F32(format!("F(Mf({}))", expect_f32(value)?)),
+            F32Trunc => Value::F32(format!("F(+tr(+({})))", expect_f32(value)?)),
+            F32Nearest => Value::F32(format!("F(+ne(+({})))", expect_f32(value)?)),
+            F32Sqrt => Value::F32(format!("F(Ms({}))", expect_f32(value)?)),
+            F64Abs => Value::F64(format!("+Ma({})", expect_f64(value)?)),
+            F64Neg => Value::F64(format!("-({})", expect_f64(value)?)),
+            F64Ceil => Value::F64(format!("+Mc({})", expect_f64(value)?)),
+            F64Floor => Value::F64(format!("+Mf({})", expect_f64(value)?)),
+            F64Trunc => Value::F64(format!("+tr(+({}))", expect_f64(value)?)),
+            F64Nearest => Value::F64(format!("+ne(+({}))", expect_f64(value)?)),
+            F64Sqrt => Value::F64(format!("+Ms({})", expect_f64(value)?)),
+            I32WrapI64 => {
+                let (lo, _) = expect_i64(value)?;
+                Value::I32(lo)
+            }
+            I32TruncF32S | I32TruncF64S => {
+                let x = expect_float(value)?;
+                self.trunc_i32(x, false, false)?
+            }
+            I32TruncF32U | I32TruncF64U => {
+                let x = expect_float(value)?;
+                self.trunc_i32(x, true, false)?
+            }
+            I64ExtendI32S => {
+                let x = value.i32_expr()?;
+                Value::I64(format!("({x})|0"), format!("({x})>>31"))
+            }
+            I64ExtendI32U => {
+                let x = value.i32_expr()?;
+                Value::I64(format!("({x})|0"), "0".into())
+            }
+            I64TruncF32S | I64TruncF64S => {
+                let x = expect_float(value)?;
+                self.trunc_i64(x, false, false)?
+            }
+            I64TruncF32U | I64TruncF64U => {
+                let x = expect_float(value)?;
+                self.trunc_i64(x, true, false)?
+            }
+            F32ConvertI32S => Value::F32(format!("F({})", value.i32_expr()?)),
+            F32ConvertI32U => Value::F32(format!("F(({})>>>0)", value.i32_expr()?)),
+            F32ConvertI64S => {
+                let (lo, hi) = expect_i64(value)?;
+                Value::F32(format!("F(({hi})*4294967296+(({lo})>>>0))"))
+            }
+            F32ConvertI64U => {
+                let (lo, hi) = expect_i64(value)?;
+                Value::F32(format!("F((({hi})>>>0)*4294967296+(({lo})>>>0))"))
+            }
+            F32DemoteF64 => Value::F32(format!("F({})", expect_f64(value)?)),
+            F64ConvertI32S => Value::F64(format!("+({})", value.i32_expr()?)),
+            F64ConvertI32U => Value::F64(format!("+(({})>>>0)", value.i32_expr()?)),
+            F64ConvertI64S => {
+                let (lo, hi) = expect_i64(value)?;
+                Value::F64(format!("+(({hi})*4294967296+(({lo})>>>0))"))
+            }
+            F64ConvertI64U => {
+                let (lo, hi) = expect_i64(value)?;
+                Value::F64(format!("+((({hi})>>>0)*4294967296+(({lo})>>>0))"))
+            }
+            F64PromoteF32 => Value::F64(format!("+({})", expect_f32(value)?)),
+            I32ReinterpretF32 => Value::I32(format!("rf(+({}))|0", expect_f32(value)?)),
+            F32ReinterpretI32 => Value::F32(format!("F(+ri(({})|0))", value.i32_expr()?)),
+            I64ReinterpretF64 => {
+                let x = expect_f64(value)?;
+                let lo = self.temp(ValType::I32);
+                let high = self.temp(ValType::I32);
+                write!(
+                    self.body,
+                    "{}=rd(+({x}))|0;{}=GH()|0;",
+                    lo.i32_expr()?,
+                    high.i32_expr()?
+                )
+                .unwrap();
+                Value::I64(lo.i32_expr()?.into(), high.i32_expr()?.into())
+            }
+            F64ReinterpretI64 => {
+                let (lo, hi) = expect_i64(value)?;
+                Value::F64(format!("+wr(({lo})|0,({hi})|0)"))
+            }
+            I32Extend8S => Value::I32(format!("(({})<<24)>>24", value.i32_expr()?)),
+            I32Extend16S => Value::I32(format!("(({})<<16)>>16", value.i32_expr()?)),
+            I64Extend8S => {
+                let x = value.i32_expr()?;
+                Value::I64(format!("(({x})<<24)>>24"), format!("((({x})<<24)>>24)>>31"))
+            }
+            I64Extend16S => {
+                let x = value.i32_expr()?;
+                Value::I64(format!("(({x})<<16)>>16"), format!("((({x})<<16)>>16)>>31"))
+            }
+            I64Extend32S => {
+                let (lo, _) = expect_i64(value)?;
+                Value::I64(lo.clone(), format!("({lo})>>31"))
+            }
+            I32TruncSatF32S | I32TruncSatF64S => {
+                let x = expect_float(value)?;
+                self.trunc_i32(x, false, true)?
+            }
+            I32TruncSatF32U | I32TruncSatF64U => {
+                let x = expect_float(value)?;
+                self.trunc_i32(x, true, true)?
+            }
+            I64TruncSatF32S | I64TruncSatF64S => {
+                let x = expect_float(value)?;
+                self.trunc_i64(x, false, true)?
+            }
+            I64TruncSatF32U | I64TruncSatF64U => {
+                let x = expect_float(value)?;
+                self.trunc_i64(x, true, true)?
+            }
+        };
+        self.stack.push(result);
+        Ok(())
+    }
+
+    fn emit_binary(&mut self, op: BinaryOp) -> Result<(), CompileError> {
+        use BinaryOp::*;
+        let right = self.pop()?;
+        let left = self.pop()?;
+        let result = match op {
+            I32Eq => cmp_i32(left, right, "==", false)?,
+            I32Ne => cmp_i32(left, right, "!=", false)?,
+            I32LtS => cmp_i32(left, right, "<", false)?,
+            I32LtU => cmp_i32(left, right, "<", true)?,
+            I32GtS => cmp_i32(left, right, ">", false)?,
+            I32GtU => cmp_i32(left, right, ">", true)?,
+            I32LeS => cmp_i32(left, right, "<=", false)?,
+            I32LeU => cmp_i32(left, right, "<=", true)?,
+            I32GeS => cmp_i32(left, right, ">=", false)?,
+            I32GeU => cmp_i32(left, right, ">=", true)?,
+            F32Eq | F64Eq => cmp_float(left, right, "==")?,
+            F32Ne | F64Ne => cmp_float(left, right, "!=")?,
+            F32Lt | F64Lt => cmp_float(left, right, "<")?,
+            F32Gt | F64Gt => cmp_float(left, right, ">")?,
+            F32Le | F64Le => cmp_float(left, right, "<=")?,
+            F32Ge | F64Ge => cmp_float(left, right, ">=")?,
+            I32Add => i32_bin(left, right, "+")?,
+            I32Sub => i32_bin(left, right, "-")?,
+            I32Mul => {
+                let (a, b) = expect_i32_pair(left, right)?;
+                Value::I32(format!("U({a},{b})|0"))
+            }
+            I32DivS | I32DivU | I32RemS | I32RemU => self.i32_divrem(left, right, op)?,
+            I32And => i32_bin(left, right, "&")?,
+            I32Or => i32_bin(left, right, "|")?,
+            I32Xor => i32_bin(left, right, "^")?,
+            I32Shl => i32_bin(left, right, "<<")?,
+            I32ShrS => i32_bin(left, right, ">>")?,
+            I32ShrU => {
+                let (a, b) = expect_i32_pair(left, right)?;
+                Value::I32(format!("(({a})>>>(({b})&31))|0"))
+            }
+            I32Rotl => {
+                let (a, b) = expect_i32_pair(left, right)?;
+                Value::I32(format!("((({a})<<(({b})&31))|(({a})>>>(32-(({b})&31))))|0"))
+            }
+            I32Rotr => {
+                let (a, b) = expect_i32_pair(left, right)?;
+                Value::I32(format!("((({a})>>>(({b})&31))|(({a})<<(32-(({b})&31))))|0"))
+            }
+            I64Eq | I64Ne | I64LtS | I64LtU | I64GtS | I64GtU | I64LeS | I64LeU | I64GeS
+            | I64GeU => i64_compare(left, right, op)?,
+            I64Add | I64Sub | I64Mul | I64DivS | I64DivU | I64RemS | I64RemU | I64And | I64Or
+            | I64Xor | I64Shl | I64ShrS | I64ShrU | I64Rotl | I64Rotr => {
+                self.i64_binary(left, right, op)?
+            }
+            F32Add => float_bin(left, right, "+", true)?,
+            F32Sub => float_bin(left, right, "-", true)?,
+            F32Mul => float_bin(left, right, "*", true)?,
+            F32Div => float_bin(left, right, "/", true)?,
+            F64Add => float_bin(left, right, "+", false)?,
+            F64Sub => float_bin(left, right, "-", false)?,
+            F64Mul => float_bin(left, right, "*", false)?,
+            F64Div => float_bin(left, right, "/", false)?,
+            F32Min => float_helper(left, right, "mn", true)?,
+            F32Max => float_helper(left, right, "mx", true)?,
+            F32Copysign => float_helper(left, right, "cs", true)?,
+            F64Min => float_helper(left, right, "mn", false)?,
+            F64Max => float_helper(left, right, "mx", false)?,
+            F64Copysign => float_helper(left, right, "cs", false)?,
+        };
+        self.stack.push(result);
+        Ok(())
+    }
+
+    fn i32_divrem(
+        &mut self,
+        left: Value,
+        right: Value,
+        op: BinaryOp,
+    ) -> Result<Value, CompileError> {
+        let (a, b) = expect_i32_pair(left, right)?;
+        if self.module.options.preserve_traps {
+            write!(self.body, "if((({b})|0)==0)X();").unwrap();
+            if matches!(op, BinaryOp::I32DivS) {
+                write!(
+                    self.body,
+                    "if((({a})|0)==(-2147483648|0)){{if((({b})|0)==(-1|0))X();}}"
+                )
+                .unwrap();
+            }
+        }
+        let expr = match op {
+            BinaryOp::I32DivS => format!("((({a})|0)/(({b})|0))|0"),
+            BinaryOp::I32DivU => format!("((({a})>>>0)/(({b})>>>0))>>>0|0"),
+            BinaryOp::I32RemS => format!("((({a})|0)%(({b})|0))|0"),
+            BinaryOp::I32RemU => format!("((({a})>>>0)%(({b})>>>0))>>>0|0"),
+            _ => unreachable!(),
+        };
+        Ok(Value::I32(expr))
+    }
+
+    fn i64_binary(
+        &mut self,
+        left: Value,
+        right: Value,
+        op: BinaryOp,
+    ) -> Result<Value, CompileError> {
+        let (al, ah) = expect_i64(left)?;
+        let (bl, bh) = expect_i64(right)?;
+        let code = match op {
+            BinaryOp::I64Add => 0,
+            BinaryOp::I64Sub => 1,
+            BinaryOp::I64Mul => 2,
+            BinaryOp::I64And => 3,
+            BinaryOp::I64Or => 4,
+            BinaryOp::I64Xor => 5,
+            BinaryOp::I64Shl => 6,
+            BinaryOp::I64ShrS => 7,
+            BinaryOp::I64ShrU => 8,
+            BinaryOp::I64Rotl => 9,
+            BinaryOp::I64Rotr => 10,
+            BinaryOp::I64DivS => 11,
+            BinaryOp::I64DivU => 12,
+            BinaryOp::I64RemS => 13,
+            BinaryOp::I64RemU => 14,
+            _ => unreachable!(),
+        };
+        let low = self.temp(ValType::I32);
+        let high = self.temp(ValType::I32);
+        write!(
+            self.body,
+            "{}=W({code}|0,({al})|0,({ah})|0,({bl})|0,({bh})|0)|0;{}=GH()|0;",
+            low.i32_expr()?,
+            high.i32_expr()?
+        )
+        .unwrap();
+        Ok(Value::I64(low.i32_expr()?.into(), high.i32_expr()?.into()))
+    }
+
+    fn trunc_i32(
+        &mut self,
+        value: String,
+        unsigned: bool,
+        saturating: bool,
+    ) -> Result<Value, CompileError> {
+        let temp = self.temp(ValType::I32);
+        write!(
+            self.body,
+            "{}=Y(+({value}),{}|0,{}|0)|0;",
+            temp.i32_expr()?,
+            unsigned as u8,
+            saturating as u8
+        )
+        .unwrap();
+        Ok(temp)
+    }
+
+    fn trunc_i64(
+        &mut self,
+        value: String,
+        unsigned: bool,
+        saturating: bool,
+    ) -> Result<Value, CompileError> {
+        let low = self.temp(ValType::I32);
+        let high = self.temp(ValType::I32);
+        write!(
+            self.body,
+            "{}=y(+({value}),{}|0,{}|0)|0;{}=GH()|0;",
+            low.i32_expr()?,
+            unsigned as u8,
+            saturating as u8,
+            high.i32_expr()?
+        )
+        .unwrap();
+        Ok(Value::I64(low.i32_expr()?.into(), high.i32_expr()?.into()))
+    }
+
+    fn emit_load(&mut self, op: LoadOp, arg: MemArg) -> Result<(), CompileError> {
+        let memory = self
+            .module
+            .module
+            .memories
+            .get(arg.memory as usize)
+            .ok_or_else(|| self.internal("invalid memory index"))?;
+        let (lo, hi) = self.pop_address(memory.memory64)?;
+        let code = load_code(op);
+        let call = format!(
+            "LI({}|0,({lo})|0,({hi})|0,+{},{}|0)",
+            arg.memory, arg.offset, code
+        );
+        match op {
+            LoadOp::I64 => {
+                let low = self.temp(ValType::I32);
+                let high = self.temp(ValType::I32);
+                write!(
+                    self.body,
+                    "{}={call}|0;{}=GH()|0;",
+                    low.i32_expr()?,
+                    high.i32_expr()?
+                )
+                .unwrap();
+                self.stack
+                    .push(Value::I64(low.i32_expr()?.into(), high.i32_expr()?.into()));
+            }
+            LoadOp::I64_8S
+            | LoadOp::I64_8U
+            | LoadOp::I64_16S
+            | LoadOp::I64_16U
+            | LoadOp::I64_32S
+            | LoadOp::I64_32U => {
+                let low = self.temp(ValType::I32);
+                write!(self.body, "{}={call}|0;", low.i32_expr()?).unwrap();
+                let low_name = low.i32_expr()?.to_string();
+                let high = if matches!(op, LoadOp::I64_8S | LoadOp::I64_16S | LoadOp::I64_32S) {
+                    format!("({low_name})>>31")
+                } else {
+                    "0".into()
+                };
+                self.stack.push(Value::I64(low_name, high));
+            }
+            LoadOp::F32 => {
+                let value = self.temp(ValType::F32);
+                write!(
+                    self.body,
+                    "{}=F(+LF({}|0,({lo})|0,({hi})|0,+{},{}|0));",
+                    value.components()[0],
+                    arg.memory,
+                    arg.offset,
+                    code
+                )
+                .unwrap();
+                self.stack.push(value);
+            }
+            LoadOp::F64 => {
+                let value = self.temp(ValType::F64);
+                write!(
+                    self.body,
+                    "{}=+LF({}|0,({lo})|0,({hi})|0,+{},{}|0);",
+                    value.components()[0],
+                    arg.memory,
+                    arg.offset,
+                    code
+                )
+                .unwrap();
+                self.stack.push(value);
+            }
+            _ => {
+                let value = self.temp(ValType::I32);
+                write!(self.body, "{}={call}|0;", value.i32_expr()?).unwrap();
+                self.stack.push(value);
+            }
+        }
+        Ok(())
+    }
+
+    fn emit_store(&mut self, op: StoreOp, arg: MemArg) -> Result<(), CompileError> {
+        let value = self.pop()?;
+        let memory = self
+            .module
+            .module
+            .memories
+            .get(arg.memory as usize)
+            .ok_or_else(|| self.internal("invalid memory index"))?;
+        let (lo, hi) = self.pop_address(memory.memory64)?;
+        let code = store_code(op);
+        match op {
+            StoreOp::F32 => write!(
+                self.body,
+                "SF({}|0,({lo})|0,({hi})|0,+{},{}|0,+{});",
+                arg.memory,
+                arg.offset,
+                code,
+                expect_f32(value)?
+            )
+            .unwrap(),
+            StoreOp::F64 => write!(
+                self.body,
+                "SF({}|0,({lo})|0,({hi})|0,+{},{}|0,+{});",
+                arg.memory,
+                arg.offset,
+                code,
+                expect_f64(value)?
+            )
+            .unwrap(),
+            StoreOp::I64 | StoreOp::I64_8 | StoreOp::I64_16 | StoreOp::I64_32 => {
+                let (value_lo, value_hi) = expect_i64(value)?;
+                write!(
+                    self.body,
+                    "SI({}|0,({lo})|0,({hi})|0,+{},{}|0,({value_lo})|0,({value_hi})|0);",
+                    arg.memory, arg.offset, code
+                )
+                .unwrap();
+            }
+            _ => write!(
+                self.body,
+                "SI({}|0,({lo})|0,({hi})|0,+{},{}|0,({})|0,0);",
+                arg.memory,
+                arg.offset,
+                code,
+                value.i32_expr()?
+            )
+            .unwrap(),
+        }
+        Ok(())
+    }
+
+    fn emit_memory_copy(&mut self, dst: u32, src: u32) -> Result<(), CompileError> {
+        let count = self.pop_i32()?.to_string();
+        let source = self.pop_i32()?.to_string();
+        let dest = self.pop_i32()?.to_string();
+        write!(
+            self.body,
+            "AB({dst}|0,{src}|0,({dest})|0,({source})|0,({count})|0);"
+        )
+        .unwrap();
+        Ok(())
+    }
+    fn emit_memory_fill(&mut self, memory: u32) -> Result<(), CompileError> {
+        let count = self.pop_i32()?.to_string();
+        let value = self.pop_i32()?.to_string();
+        let dest = self.pop_i32()?.to_string();
+        write!(
+            self.body,
+            "AC({memory}|0,({dest})|0,({value})|0,({count})|0);"
+        )
+        .unwrap();
+        Ok(())
+    }
+    fn emit_memory_init(&mut self, data: u32, memory: u32) -> Result<(), CompileError> {
+        let count = self.pop_i32()?.to_string();
+        let source = self.pop_i32()?.to_string();
+        let dest = self.pop_i32()?.to_string();
+        write!(
+            self.body,
+            "K({data}|0,{memory}|0,({dest})|0,({source})|0,({count})|0);"
+        )
+        .unwrap();
+        Ok(())
+    }
+
+    fn emit_simd(&mut self, op: &SimdOp) -> Result<(), CompileError> {
+        use SimdOp::*;
+        let value = match op {
+            Const(bytes) => Value::V128(std::array::from_fn(|i| {
+                i32::from_le_bytes(bytes[i * 4..i * 4 + 4].try_into().unwrap()).to_string()
+            })),
+            I32x4Splat => {
+                let x = self.pop_i32()?.to_string();
+                Value::V128(std::array::from_fn(|_| x.clone()))
+            }
+            F32x4Splat => {
+                let x = expect_f32(self.pop()?)?;
+                Value::V128(std::array::from_fn(|_| format!("rf(+({x}))|0")))
+            }
+            I32x4Add | I32x4Sub | I32x4Mul => {
+                let b = expect_v128(self.pop()?)?;
+                let a = expect_v128(self.pop()?)?;
+                Value::V128(std::array::from_fn(|i| match op {
+                    I32x4Add => format!("({}+{})|0", a[i], b[i]),
+                    I32x4Sub => format!("({}-{})|0", a[i], b[i]),
+                    _ => format!("U({},{})|0", a[i], b[i]),
+                }))
+            }
+            F32x4Add | F32x4Sub | F32x4Mul | F32x4Div => {
+                let b = expect_v128(self.pop()?)?;
+                let a = expect_v128(self.pop()?)?;
+                let symbol = match op {
+                    F32x4Add => "+",
+                    F32x4Sub => "-",
+                    F32x4Mul => "*",
+                    _ => "/",
+                };
+                Value::V128(std::array::from_fn(|i| {
+                    format!("rf(+(F((+ri(({})|0)){symbol}(+ri(({})|0)))))|0", a[i], b[i])
+                }))
+            }
+            F32x4Abs | F32x4Neg | F32x4Sqrt => {
+                let a = expect_v128(self.pop()?)?;
+                Value::V128(std::array::from_fn(|i| match op {
+                    F32x4Abs => format!("rf(+(F(Ma(+ri(({})|0)))))|0", a[i]),
+                    F32x4Neg => format!("rf(+(F(-(+ri(({})|0)))))|0", a[i]),
+                    _ => format!("rf(+(F(Ms(+ri(({})|0)))))|0", a[i]),
+                }))
+            }
+            I32x4Shl => {
+                let n = self.pop_i32()?.to_string();
+                let a = expect_v128(self.pop()?)?;
+                Value::V128(std::array::from_fn(|i| format!("({}<<({n}&31))|0", a[i])))
+            }
+            I32x4Extract(lane) => {
+                let a = expect_v128(self.pop()?)?;
+                Value::I32(a[*lane as usize].clone())
+            }
+            I32x4Replace(lane) => {
+                let x = self.pop_i32()?.to_string();
+                let mut a = expect_v128(self.pop()?)?;
+                a[*lane as usize] = x;
+                Value::V128(a)
+            }
+            F32x4Extract(lane) => {
+                let a = expect_v128(self.pop()?)?;
+                Value::F32(format!("F(+ri(({})|0))", a[*lane as usize]))
+            }
+            F32x4Replace(lane) => {
+                let x = expect_f32(self.pop()?)?;
+                let mut a = expect_v128(self.pop()?)?;
+                a[*lane as usize] = format!("rf(+({x}))|0");
+                Value::V128(a)
+            }
+            I8x16Shuffle(lanes) => {
+                let b = expect_v128(self.pop()?)?;
+                let a = expect_v128(self.pop()?)?;
+                Value::V128(std::array::from_fn(|word| {
+                    let mut parts = Vec::with_capacity(4);
+                    for byte in 0..4 {
+                        let lane = lanes[word * 4 + byte] as usize;
+                        let source = if lane < 16 {
+                            &a[lane / 4]
+                        } else {
+                            &b[(lane - 16) / 4]
+                        };
+                        let source_shift = (lane % 4) * 8;
+                        let target_shift = byte * 8;
+                        parts.push(if target_shift == 0 {
+                            format!("(({source}>>>{source_shift})&255)")
+                        } else {
+                            format!("((({source}>>>{source_shift})&255)<<{target_shift})")
+                        });
+                    }
+                    format!("({})|0", parts.join("|"))
+                }))
+            }
+            V128And | V128Or | V128Xor => {
+                let b = expect_v128(self.pop()?)?;
+                let a = expect_v128(self.pop()?)?;
+                let symbol = match op {
+                    V128And => "&",
+                    V128Or => "|",
+                    _ => "^",
+                };
+                Value::V128(std::array::from_fn(|i| {
+                    format!("({}{symbol}{})|0", a[i], b[i])
+                }))
+            }
+            V128Not => {
+                let a = expect_v128(self.pop()?)?;
+                Value::V128(std::array::from_fn(|i| format!("~{}", a[i])))
+            }
+            V128Bitselect => {
+                let c = expect_v128(self.pop()?)?;
+                let b = expect_v128(self.pop()?)?;
+                let a = expect_v128(self.pop()?)?;
+                Value::V128(std::array::from_fn(|i| {
+                    format!("(({}&{})|({}&~{}))|0", a[i], c[i], b[i], c[i])
+                }))
+            }
+            V128AnyTrue => {
+                let a = expect_v128(self.pop()?)?;
+                Value::I32(format!("(({}|{}|{}|{})!=0)|0", a[0], a[1], a[2], a[3]))
+            }
+            V128Load(arg) => {
+                let memory = &self.module.module.memories[arg.memory as usize];
+                let (lo, hi) = self.pop_address(memory.memory64)?;
+                Value::V128(std::array::from_fn(|i| {
+                    format!(
+                        "VL({}|0,({lo})|0,({hi})|0,+{},{}|0)|0",
+                        arg.memory, arg.offset, i
+                    )
+                }))
+            }
+            V128Store(arg) => {
+                let a = expect_v128(self.pop()?)?;
+                let memory = &self.module.module.memories[arg.memory as usize];
+                let (lo, hi) = self.pop_address(memory.memory64)?;
+                write!(
+                    self.body,
+                    "VS({}|0,({lo})|0,({hi})|0,+{},({})|0,({})|0,({})|0,({})|0);",
+                    arg.memory, arg.offset, a[0], a[1], a[2], a[3]
+                )
+                .unwrap();
+                return Ok(());
+            }
+            Other(name) => {
+                return Err(CompileError::unsupported(
+                    "simd",
+                    None,
+                    format!("SIMD instruction {name}"),
+                ));
+            }
+        };
+        self.stack.push(value);
+        Ok(())
+    }
+
+    fn emit_throw(&mut self, tag: u32) -> Result<(), CompileError> {
+        let type_index = *self
+            .module
+            .module
+            .tags
+            .get(tag as usize)
+            .ok_or_else(|| self.internal("invalid tag index"))?;
+        let ty = self
+            .module
+            .module
+            .types
+            .get(type_index as usize)
+            .ok_or_else(|| self.internal("invalid tag type"))?
+            .clone();
+        if ty.params.iter().any(|t| !t.is_scalar()) {
+            return Err(CompileError::unsupported(
+                "exception payload",
+                None,
+                "only numeric scalar payloads are supported",
+            ));
+        }
+        let values = self.pop_types(&ty.params)?;
+        let flat = flatten_names(&values);
+        write!(self.body, "throw{{w:1,t:{tag},v:[{}]}};", flat.join(",")).unwrap();
+        self.reachable = false;
+        Ok(())
+    }
+
+    fn pop_address(&mut self, memory64: bool) -> Result<(String, String), CompileError> {
+        if memory64 {
+            let (lo, hi) = expect_i64(self.pop()?)?;
+            Ok((lo, hi))
+        } else {
+            Ok((self.pop_i32()?.to_string(), "0".into()))
+        }
+    }
+    fn pop_table_index(&mut self, table: u32) -> Result<String, CompileError> {
+        if self.module.module.tables[table as usize].table64 {
+            let (lo, hi) = expect_i64(self.pop()?)?;
+            write!(self.body, "if(({hi})|0)X();").unwrap();
+            Ok(lo)
+        } else {
+            self.pop_i32()
+        }
+    }
+    fn ensure_table_zero(&self, table: u32) -> Result<(), CompileError> {
+        if table == 0 {
+            Ok(())
+        } else {
+            Err(CompileError::unsupported(
+                "multiple tables",
+                None,
+                "only table zero is supported",
+            ))
+        }
+    }
+    fn pop(&mut self) -> Result<Value, CompileError> {
+        self.stack
+            .pop()
+            .ok_or_else(|| self.internal("operand stack underflow"))
+    }
+    fn pop_i32(&mut self) -> Result<String, CompileError> {
+        let value = self.pop()?;
+        match value {
+            Value::I32(v) | Value::Ref(v) => Ok(v),
+            _ => Err(self.internal("expected i32")),
+        }
+    }
+    fn pop_types(&mut self, types: &[ValType]) -> Result<Vec<Value>, CompileError> {
+        let mut values = Vec::with_capacity(types.len());
+        for &ty in types.iter().rev() {
+            let value = self.pop()?;
+            if !type_compatible(value.ty(), ty) {
+                return Err(self.internal("operand type mismatch"));
+            }
+            values.push(value);
+        }
+        values.reverse();
+        Ok(values)
+    }
+    fn peek_types(&self, types: &[ValType]) -> Result<Vec<Value>, CompileError> {
+        if self.stack.len() < types.len() {
+            return Err(self.internal("operand stack underflow"));
+        }
+        let values = self.stack[self.stack.len() - types.len()..].to_vec();
+        for (value, &ty) in values.iter().zip(types) {
+            if !type_compatible(value.ty(), ty) {
+                return Err(self.internal("operand type mismatch"));
+            }
+        }
+        Ok(values)
+    }
+    fn local(&self, index: u32) -> Result<&Value, CompileError> {
+        self.locals
+            .get(index as usize)
+            .ok_or_else(|| self.internal("invalid local index"))
+    }
+    fn branch_types(&self, index: usize) -> Vec<ValType> {
+        let c = &self.controls[index];
+        if c.kind == ControlKind::Loop {
+            c.params.iter().map(Value::ty).collect()
+        } else {
+            c.results.clone()
+        }
+    }
+    fn target_index(&self, depth: u32) -> Result<usize, CompileError> {
+        self.controls
+            .len()
+            .checked_sub(1 + depth as usize)
+            .ok_or_else(|| self.internal("invalid branch depth"))
+    }
+    fn temp(&mut self, ty: ValType) -> Value {
+        let base = format!("$t{}", short_index(self.temp_index));
+        self.temp_index += 1;
+        let value = named_value(ty, &base);
+        for name in value.components() {
+            self.declarations
+                .push((name.to_string(), component_decl_type(ty, name)));
+        }
+        value
+    }
+    fn assign(&mut self, target: &Value, value: &Value) {
+        for (a, b) in target.components().iter().zip(value.components()) {
+            write!(
+                self.body,
+                "{a}={};",
+                coerce(value_component_type(value, b), b)
+            )
+            .unwrap();
+        }
+    }
+    fn materialize(&mut self, value: &Value) -> Value {
+        let snapshot = self.temp(value.ty());
+        self.assign(&snapshot, value);
+        snapshot
+    }
+    fn internal(&self, message: &str) -> CompileError {
+        CompileError::new(
+            ErrorKind::Internal,
+            format!(
+                "wasm2asm: internal code generation error in function {}: {message}",
+                self.function_index
+            ),
+        )
+    }
+}
+
+fn type_compatible(a: ValType, b: ValType) -> bool {
+    a == b || matches!((a, b), (ValType::FuncRef(_), ValType::FuncRef(_)))
+}
+fn component_decl_type(ty: ValType, _name: &str) -> ValType {
+    match ty {
+        ValType::I64 | ValType::V128 | ValType::FuncRef(_) => ValType::I32,
+        other => other,
+    }
+}
+fn value_component_type(value: &Value, _component: &str) -> ValType {
+    match value {
+        Value::I32(_) | Value::I64(_, _) | Value::Ref(_) | Value::V128(_) => ValType::I32,
+        Value::F32(_) => ValType::F32,
+        Value::F64(_) => ValType::F64,
+    }
+}
+fn component_type(values: &[Value], name: &str) -> Option<ValType> {
+    for value in values {
+        for component in value.components() {
+            if component == name {
+                return Some(value_component_type(value, component));
+            }
+        }
+    }
+    None
+}
+
+fn named_value(ty: ValType, base: &str) -> Value {
+    match ty {
+        ValType::I32 => Value::I32(base.into()),
+        ValType::I64 => Value::I64(format!("{base}l"), format!("{base}h")),
+        ValType::F32 => Value::F32(base.into()),
+        ValType::F64 => Value::F64(base.into()),
+        ValType::FuncRef(_) => Value::Ref(base.into()),
+        ValType::V128 => Value::V128(std::array::from_fn(|i| format!("{base}{i}"))),
+    }
+}
+fn parameter_values(types: &[ValType], prefix: &str) -> Vec<Value> {
+    types
+        .iter()
+        .enumerate()
+        .map(|(i, &ty)| named_value(ty, &format!("{prefix}{}", short_index(i))))
+        .collect()
+}
+fn flatten_names(values: &[Value]) -> Vec<String> {
+    values
+        .iter()
+        .flat_map(|v| v.components().into_iter().map(str::to_string))
+        .collect()
+}
+fn flatten_call_arguments(values: &[Value], external: bool) -> Vec<String> {
+    values
+        .iter()
+        .flat_map(|value| {
+            value.components().into_iter().map(move |component| {
+                if !external {
+                    return component.to_string();
+                }
+                match value_component_type(value, component) {
+                    ValType::F32 | ValType::F64 => format!("+({component})"),
+                    _ => format!("({component})|0"),
+                }
+            })
+        })
+        .collect()
+}
+fn zero_literal(ty: ValType) -> &'static str {
+    match ty {
+        ValType::F32 => "F(0)",
+        ValType::F64 => "0.0",
+        _ => "0",
+    }
+}
+fn coerce(ty: ValType, value: &str) -> String {
+    match ty {
+        ValType::I32 | ValType::I64 | ValType::FuncRef(_) | ValType::V128 => {
+            if value.ends_with("|0") {
+                value.to_string()
+            } else {
+                format!("{value}|0")
+            }
+        }
+        ValType::F32 => {
+            if value.starts_with("F(") {
+                value.to_string()
+            } else {
+                format!("F({value})")
+            }
+        }
+        ValType::F64 => {
+            if value.starts_with('+') {
+                value.to_string()
+            } else {
+                format!("+{value}")
+            }
+        }
+    }
+}
+fn emit_param_coercions(out: &mut String, values: &[Value]) {
+    for value in values {
+        for component in value.components() {
+            write!(
+                out,
+                "{component}={};",
+                coerce(value_component_type(value, component), component)
+            )
+            .unwrap();
+        }
+    }
+}
+fn emit_var_value(out: &mut String, target: &Value, source: &str) {
+    match target {
+        Value::I64(lo, hi) => {
+            write!(out, "var {lo}=({source}.low)|0,{hi}=({source}.high)|0;").unwrap()
+        }
+        Value::V128(_) => {}
+        _ => {
+            let name = target.components()[0];
+            write!(
+                out,
+                "var {name}={};",
+                coerce(value_component_type(target, name), source)
+            )
+            .unwrap();
+        }
+    }
+}
+fn emit_var_value_from_value(out: &mut String, target: &Value, value: &Value) {
+    for (name, source) in target.components().iter().zip(value.components()) {
+        write!(out, "var {name}={source};").unwrap();
+    }
+}
+fn emit_return_value(out: &mut String, value: &Value) {
+    match value {
+        Value::I64(lo, hi) => write!(out, "q0={hi}|0;return {lo}|0;").unwrap(),
+        Value::F32(x) => write!(out, "return {};", coerce(ValType::F32, x)).unwrap(),
+        Value::F64(x) => write!(out, "return {};", coerce(ValType::F64, x)).unwrap(),
+        Value::I32(x) | Value::Ref(x) => write!(out, "return {x}|0;").unwrap(),
+        Value::V128(_) => out.push_str("X();"),
+    }
+}
+fn emit_set_from_single_argument(out: &mut String, value: &Value, arg: &str) {
+    match value {
+        Value::I64(_, _) => out.push_str("X();"),
+        Value::F32(x) => write!(out, "{x}=F({arg});").unwrap(),
+        Value::F64(x) => write!(out, "{x}=+{arg};").unwrap(),
+        Value::I32(x) | Value::Ref(x) => write!(out, "{x}={arg}|0;").unwrap(),
+        Value::V128(_) => out.push_str("X();"),
+    }
+}
+fn emit_direct_js_return(out: &mut String, results: &[ValType], call: &str, external: bool) {
+    if results.is_empty() {
+        write!(out, "{call};return;").unwrap()
+    } else {
+        match results[0] {
+            ValType::F32 if external => write!(out, "return F(+{call});").unwrap(),
+            ValType::F32 => write!(out, "return {};", coerce(ValType::F32, call)).unwrap(),
+            ValType::F64 => write!(out, "return {};", coerce(ValType::F64, call)).unwrap(),
+            _ => write!(out, "return {call}|0;").unwrap(),
+        }
+    }
+}
+fn emit_primary_export_value(out: &mut String, ty: Option<ValType>, name: &str) {
+    match ty {
+        Some(ValType::I64) => write!(out, "[{name},q[0]()]").unwrap(),
+        _ => out.push_str(name),
+    }
+}
+
+fn const_value(expr: &ConstExpr, globals: &[Value]) -> Result<Value, CompileError> {
+    Ok(match expr {
+        ConstExpr::I32(v) => Value::I32(v.to_string()),
+        ConstExpr::I64(v) => i64_const(*v),
+        ConstExpr::F32(v) => Value::F32(float32_literal(*v)),
+        ConstExpr::F64(v) => Value::F64(float64_literal(*v)),
+        ConstExpr::GlobalGet(i) => globals
+            .get(*i as usize)
+            .ok_or_else(|| {
+                CompileError::new(ErrorKind::Internal, "wasm2asm: invalid const global index")
+            })?
+            .clone(),
+        ConstExpr::RefNull => Value::Ref("0".into()),
+        ConstExpr::RefFunc(i) => Value::Ref((i + 1).to_string()),
+    })
+}
+fn i64_const(value: i64) -> Value {
+    Value::I64(
+        (value as u32 as i32).to_string(),
+        ((value >> 32) as i32).to_string(),
+    )
+}
+fn float32_literal(bits: u32) -> String {
+    let value = f32::from_bits(bits);
+    if value.is_nan() {
+        "NaN".into()
+    } else if value == f32::INFINITY {
+        "Infinity".into()
+    } else if value == f32::NEG_INFINITY {
+        "-Infinity".into()
+    } else if bits == 0x80000000 {
+        "-0.0".into()
+    } else {
+        format!("F({:?})", value)
+    }
+}
+fn float64_literal(bits: u64) -> String {
+    let value = f64::from_bits(bits);
+    if value.is_nan() {
+        "NaN".into()
+    } else if value == f64::INFINITY {
+        "Infinity".into()
+    } else if value == f64::NEG_INFINITY {
+        "-Infinity".into()
+    } else if bits == 0x8000000000000000 {
+        "-0.0".into()
+    } else {
+        format!("{:?}", value)
+    }
+}
+fn return_slot_types(results: &[ValType]) -> Vec<ValType> {
+    let mut out = Vec::new();
+    match results.first() {
+        Some(ValType::I64) => out.push(ValType::I32),
+        Some(ValType::V128) => out.extend([ValType::I32; 3]),
+        _ => {}
+    }
+    for &ty in results.iter().skip(1) {
+        match ty {
+            ValType::I64 => {
+                out.push(ValType::I32);
+                out.push(ValType::I32)
+            }
+            ValType::V128 => out.extend([ValType::I32; 4]),
+            other => out.push(other),
+        }
+    }
+    out
+}
+fn emit_return_abi(out: &mut String, values: &[Value], slots: &[Value]) {
+    if values.is_empty() {
+        out.push_str("return;");
+        return;
+    }
+    let mut slot = 0usize;
+    match &values[0] {
+        Value::I64(_, hi) => {
+            write!(out, "{}={hi}|0;", slots[slot].i32_expr().unwrap()).unwrap();
+            slot += 1
+        }
+        Value::V128(a) => {
+            for component in a.iter().skip(1) {
+                write!(out, "{}={component}|0;", slots[slot].i32_expr().unwrap()).unwrap();
+                slot += 1
+            }
+        }
+        _ => {}
+    }
+    for value in values.iter().skip(1) {
+        for component in value.components() {
+            write!(
+                out,
+                "{}={};",
+                slots[slot].i32_expr().unwrap(),
+                coerce(value_component_type(value, component), component)
+            )
+            .unwrap();
+            slot += 1;
+        }
+    }
+    match &values[0] {
+        Value::I32(x) | Value::Ref(x) => write!(out, "return {x}|0;").unwrap(),
+        Value::I64(lo, _) => write!(out, "return {lo}|0;").unwrap(),
+        Value::F32(x) => write!(out, "return {};", coerce(ValType::F32, x)).unwrap(),
+        Value::F64(x) => write!(out, "return {};", coerce(ValType::F64, x)).unwrap(),
+        Value::V128(a) => write!(out, "return {}|0;", a[0]).unwrap(),
+    }
+}
+fn call_result_values(
+    results: &[ValType],
+    call: &str,
+    slots: &[Value],
+    body: &mut String,
+    primary: Value,
+    external: bool,
+) -> Result<Vec<Value>, CompileError> {
+    let name = primary.components()[0].to_string();
+    let result_expression = if external && results[0] == ValType::F32 {
+        format!("+{call}")
+    } else {
+        call.to_string()
+    };
+    write!(
+        body,
+        "{name}={};",
+        coerce(value_component_type(&primary, &name), &result_expression)
+    )
+    .unwrap();
+    let mut out = Vec::new();
+    let mut slot = 0usize;
+    match results[0] {
+        ValType::I64 => {
+            out.push(Value::I64(name, slots[0].i32_expr()?.into()));
+            slot = 1
+        }
+        ValType::V128 => {
+            out.push(Value::V128([
+                name,
+                slots[0].i32_expr()?.into(),
+                slots[1].i32_expr()?.into(),
+                slots[2].i32_expr()?.into(),
+            ]));
+            slot = 3
+        }
+        _ => out.push(primary),
+    }
+    for &ty in results.iter().skip(1) {
+        let value = match ty {
+            ValType::I64 => {
+                let v = Value::I64(
+                    slots[slot].i32_expr()?.into(),
+                    slots[slot + 1].i32_expr()?.into(),
+                );
+                slot += 2;
+                v
+            }
+            ValType::V128 => {
+                let v = Value::V128(std::array::from_fn(|i| {
+                    slots[slot + i].i32_expr().unwrap().into()
+                }));
+                slot += 4;
+                v
+            }
+            ValType::I32 => {
+                let v = Value::I32(slots[slot].i32_expr()?.into());
+                slot += 1;
+                v
+            }
+            ValType::FuncRef(_) => {
+                let v = Value::Ref(slots[slot].i32_expr()?.into());
+                slot += 1;
+                v
+            }
+            ValType::F32 => {
+                let v = Value::F32(slots[slot].i32_expr()?.into());
+                slot += 1;
+                v
+            }
+            ValType::F64 => {
+                let v = Value::F64(slots[slot].i32_expr()?.into());
+                slot += 1;
+                v
+            }
+        };
+        out.push(value)
+    }
+    Ok(out)
+}
+
+fn expect_i64(v: Value) -> Result<(String, String), CompileError> {
+    match v {
+        Value::I64(a, b) => Ok((a, b)),
+        _ => Err(CompileError::new(
+            ErrorKind::Internal,
+            "wasm2asm: expected i64",
+        )),
+    }
+}
+fn expect_v128(v: Value) -> Result<[String; 4], CompileError> {
+    match v {
+        Value::V128(a) => Ok(a),
+        _ => Err(CompileError::new(
+            ErrorKind::Internal,
+            "wasm2asm: expected v128",
+        )),
+    }
+}
+fn expect_f32(v: Value) -> Result<String, CompileError> {
+    match v {
+        Value::F32(a) => Ok(a),
+        _ => Err(CompileError::new(
+            ErrorKind::Internal,
+            "wasm2asm: expected f32",
+        )),
+    }
+}
+fn expect_f64(v: Value) -> Result<String, CompileError> {
+    match v {
+        Value::F64(a) => Ok(a),
+        _ => Err(CompileError::new(
+            ErrorKind::Internal,
+            "wasm2asm: expected f64",
+        )),
+    }
+}
+fn expect_float(v: Value) -> Result<String, CompileError> {
+    match v {
+        Value::F32(a) | Value::F64(a) => Ok(a),
+        _ => Err(CompileError::new(
+            ErrorKind::Internal,
+            "wasm2asm: expected float",
+        )),
+    }
+}
+fn expect_i32_pair(a: Value, b: Value) -> Result<(String, String), CompileError> {
+    Ok((a.i32_expr()?.into(), b.i32_expr()?.into()))
+}
+fn i32_bin(a: Value, b: Value, op: &str) -> Result<Value, CompileError> {
+    let (a, b) = expect_i32_pair(a, b)?;
+    Ok(Value::I32(format!("(({a}){op}({b}))|0")))
+}
+fn cmp_i32(a: Value, b: Value, op: &str, unsigned: bool) -> Result<Value, CompileError> {
+    let (a, b) = expect_i32_pair(a, b)?;
+    Ok(Value::I32(if unsigned {
+        format!("((({a})>>>0){op}(({b})>>>0))|0")
+    } else {
+        format!("((({a})|0){op}(({b})|0))|0")
+    }))
+}
+fn cmp_float(a: Value, b: Value, op: &str) -> Result<Value, CompileError> {
+    Ok(Value::I32(format!(
+        "({}{op}{})|0",
+        expect_float(a)?,
+        expect_float(b)?
+    )))
+}
+fn float_bin(a: Value, b: Value, op: &str, f32_: bool) -> Result<Value, CompileError> {
+    let a = expect_float(a)?;
+    let b = expect_float(b)?;
+    Ok(if f32_ {
+        Value::F32(format!("F({a}{op}{b})"))
+    } else {
+        Value::F64(format!("+({a}{op}{b})"))
+    })
+}
+fn float_helper(a: Value, b: Value, name: &str, f32_: bool) -> Result<Value, CompileError> {
+    let a = expect_float(a)?;
+    let b = expect_float(b)?;
+    Ok(if f32_ {
+        Value::F32(format!("F(+{name}(+({a}),+({b})))"))
+    } else {
+        Value::F64(format!("+{name}(+({a}),+({b}))"))
+    })
+}
+fn i64_compare(a: Value, b: Value, op: BinaryOp) -> Result<Value, CompileError> {
+    let (al, ah) = expect_i64(a)?;
+    let (bl, bh) = expect_i64(b)?;
+    let e = match op {
+        BinaryOp::I64Eq => format!("({al}=={bl}&&{ah}=={bh})"),
+        BinaryOp::I64Ne => format!("({al}!={bl}||{ah}!={bh})"),
+        BinaryOp::I64LtS => format!("({ah}<{bh}||({ah}=={bh}&&({al}>>>0)<({bl}>>>0)))"),
+        BinaryOp::I64LtU => format!("(({ah}>>>0)<({bh}>>>0)||({ah}=={bh}&&({al}>>>0)<({bl}>>>0)))"),
+        BinaryOp::I64GtS => format!("({ah}>{bh}||({ah}=={bh}&&({al}>>>0)>({bl}>>>0)))"),
+        BinaryOp::I64GtU => format!("(({ah}>>>0)>({bh}>>>0)||({ah}=={bh}&&({al}>>>0)>({bl}>>>0)))"),
+        BinaryOp::I64LeS => format!("!({ah}>{bh}||({ah}=={bh}&&({al}>>>0)>({bl}>>>0)))"),
+        BinaryOp::I64LeU => {
+            format!("!(({ah}>>>0)>({bh}>>>0)||({ah}=={bh}&&({al}>>>0)>({bl}>>>0)))")
+        }
+        BinaryOp::I64GeS => format!("!({ah}<{bh}||({ah}=={bh}&&({al}>>>0)<({bl}>>>0)))"),
+        BinaryOp::I64GeU => {
+            format!("!(({ah}>>>0)<({bh}>>>0)||({ah}=={bh}&&({al}>>>0)<({bl}>>>0)))")
+        }
+        _ => unreachable!(),
+    };
+    Ok(Value::I32(format!("({e})|0")))
+}
+
+fn load_code(op: LoadOp) -> u8 {
+    use LoadOp::*;
+    match op {
+        I32 => 0,
+        I64 => 1,
+        F32 => 2,
+        F64 => 3,
+        I32_8S => 4,
+        I32_8U => 5,
+        I32_16S => 6,
+        I32_16U => 7,
+        I64_8S => 8,
+        I64_8U => 9,
+        I64_16S => 10,
+        I64_16U => 11,
+        I64_32S => 12,
+        I64_32U => 13,
+    }
+}
+fn store_code(op: StoreOp) -> u8 {
+    use StoreOp::*;
+    match op {
+        I32 => 0,
+        I64 => 1,
+        F32 => 2,
+        F64 => 3,
+        I32_8 => 4,
+        I32_16 => 5,
+        I64_8 => 6,
+        I64_16 => 7,
+        I64_32 => 8,
+    }
+}
+fn js_ident(index: usize, upper: bool) -> String {
+    let mut n = index;
+    let first = if upper { b'A' } else { b'a' };
+    let mut s = String::from("$");
+    loop {
+        s.push((first + (n % 26) as u8) as char);
+        n /= 26;
+        if n == 0 {
+            break;
+        }
+        n -= 1;
+    }
+    s
+}
+fn short_index(index: usize) -> String {
+    let mut n = index;
+    let mut s = String::new();
+    loop {
+        s.push((b'a' + (n % 26) as u8) as char);
+        n /= 26;
+        if n == 0 {
+            break;
+        }
+        n -= 1;
+    }
+    s
+}
+fn js_string(value: &str) -> String {
+    let mut out = String::from("\"");
+    for c in value.chars() {
+        match c {
+            '\"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\u{2028}' => out.push_str("\\u2028"),
+            '\u{2029}' => out.push_str("\\u2029"),
+            c if c < ' ' => write!(out, "\\u{:04x}", c as u32).unwrap(),
+            c => out.push(c),
+        }
+    }
+    out.push('\"');
+    out
+}
+fn instruction_offset(_: &str, _: &str) -> usize {
+    0
+}
+
+const RUNTIME_HELPERS: &str = r#"
+function X(){throw Error('wasm trap')}
+function ct(x){x=x|0;if(!x)return 32;return 31-C((x&-x)-1)|0}
+function pc(x){x=x|0;x=x-((x>>>1)&1431655765)|0;x=(x&858993459)+((x>>>2)&858993459)|0;return U((x+(x>>>4)&252645135),16843009)>>>24}
+function tr(x){x=+x;return x<0?M.ceil(x):M.floor(x)}
+function ne(x){x=+x;var f=M.floor(x),d=x-f;if(d<.5)return f;if(d>.5)return f+1;if(f%2){f=f+1;return f==0&&x<0?-0:f}return f==0&&x<0?-0:f}
+function mn(a,b){a=+a;b=+b;if(a!=a||b!=b)return NaN;if(a==0&&b==0)return 1/a<0?a:b;return a<b?a:b}
+function mx(a,b){a=+a;b=+b;if(a!=a||b!=b)return NaN;if(a==0&&b==0)return 1/a>0?a:b;return a>b?a:b}
+var sb=new ArrayBuffer(8),sv=new DataView(sb);
+function cs(a,b){a=+a;b=+b;sv.setFloat64(0,a,true);var h=sv.getUint32(4,true);sv.setFloat64(0,b,true);h=(h&2147483647)|(sv.getUint32(4,true)&2147483648);sv.setUint32(4,h,true);return +sv.getFloat64(0,true)}
+function rf(x){x=+x;sv.setFloat32(0,x,true);return sv.getInt32(0,true)|0}
+function ri(x){x=x|0;sv.setInt32(0,x,true);return +sv.getFloat32(0,true)}
+function rd(x){x=+x;sv.setFloat64(0,x,true);hi=sv.getInt32(4,true)|0;return sv.getInt32(0,true)|0}
+function wr(l,h){l=l|0;h=h|0;sv.setInt32(0,l,true);sv.setInt32(4,h,true);return +sv.getFloat64(0,true)}
+function Y(x,u,z){x=+x;u=u|0;z=z|0;if(x!=x)return z?0:X();if(u){if(x<=-1)return z?0:X();if(x>=4294967296)return z?-1:X();return tr(x)|0}else{if(x<=-2147483649)return z?-2147483648:X();if(x>=2147483648)return z?2147483647:X();return tr(x)|0}}
+function y(x,u,z){x=+x;u=u|0;z=z|0;var n=0,h=0,l=0;if(x!=x){if(!z)X();hi=0;return 0}if(u){if(x<=-1){if(!z)X();hi=0;return 0}if(x>=18446744073709551616){if(!z)X();hi=-1;return -1}x=tr(x);h=M.floor(x/4294967296);l=x-h*4294967296;hi=h|0;return l|0}else{if(x<-9223372036854775808){if(!z)X();hi=-2147483648;return 0}if(x>=9223372036854775808){if(!z)X();hi=2147483647;return -1}n=x<0;if(n)x=-x;x=tr(x);h=M.floor(x/4294967296);l=x-h*4294967296;l=l|0;h=h|0;if(n){l=(~l+1)|0;h=(~h+(l==0))|0}hi=h;return l}}
+function ng(l,h){l=l|0;h=h|0;l=(~l+1)|0;hi=(~h+(l==0))|0;return l}
+function ge(al,ah,bl,bh){al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;return ((ah>>>0)>(bh>>>0)||ah==bh&&(al>>>0)>=(bl>>>0))|0}
+function dv(al,ah,bl,bh,sg,rm){al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;sg=sg|0;rm=rm|0;var nq=0,nr=0,i=0,ql=0,qh=0,rl=0,rh=0,bit=0,t=0;if(!(bl|bh))X();if(sg&&ah==-2147483648&&!al&&bh==-1&&bl==-1&&!rm)X();if(sg){nq=(ah<0)^(bh<0);nr=ah<0;if(ah<0){al=ng(al,ah)|0;ah=hi|0}if(bh<0){bl=ng(bl,bh)|0;bh=hi|0}}for(i=63;i>=0;i--){bit=i<32?(al>>>i)&1:(ah>>>(i-32))&1;rh=(rh<<1)|(rl>>>31);rl=(rl<<1)|bit;if(ge(rl,rh,bl,bh)){t=rl-bl|0;rh=(rh-bh-((rl>>>0)<(bl>>>0)))|0;rl=t;if(i<32)ql=ql|(1<<i);else qh=qh|(1<<(i-32))}}if(rm){if(nr){rl=ng(rl,rh)|0;rh=hi|0}hi=rh;return rl}if(nq){ql=ng(ql,qh)|0;qh=hi|0}hi=qh;return ql}
+
+function W(o,al,ah,bl,bh){o=o|0;al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;var l=0,h=0,n=0,a0=0,a1=0,a2=0,a3=0,b0=0,b1=0,b2=0,b3=0,c0=0,c1=0,c2=0,c3=0;if(o==0){l=al+bl|0;hi=ah+bh+((l>>>0)<(al>>>0))|0;return l}if(o==1){l=al-bl|0;hi=ah-bh-((al>>>0)<(bl>>>0))|0;return l}if(o==2){a0=al&65535;a1=al>>>16;a2=ah&65535;a3=ah>>>16;b0=bl&65535;b1=bl>>>16;b2=bh&65535;b3=bh>>>16;c0=a0*b0;c1=a1*b0+a0*b1+M.floor(c0/65536);c2=a2*b0+a1*b1+a0*b2+M.floor(c1/65536);c3=a3*b0+a2*b1+a1*b2+a0*b3+M.floor(c2/65536);l=(c0&65535)|((c1&65535)<<16);hi=(c2&65535)|((c3&65535)<<16);return l}if(o==3){hi=ah&bh;return al&bl}if(o==4){hi=ah|bh;return al|bl}if(o==5){hi=ah^bh;return al^bl}if(o>=11)return dv(al,ah,bl,bh,(o==11||o==13)|0,(o==13||o==14)|0)|0;n=bl&63;if(!n){hi=ah;return al}if(o==6){if(n<32){hi=(ah<<n)|(al>>>(32-n));return al<<n}hi=al<<(n-32);return 0}if(o==7){if(n<32){hi=ah>>n;return (al>>>n)|(ah<<(32-n))}hi=ah>>31;return ah>>(n-32)}if(o==8){if(n<32){hi=ah>>>n;return (al>>>n)|(ah<<(32-n))}hi=0;return ah>>>(n-32)}if(o==9){if(n<32){hi=(ah<<n)|(al>>>(32-n));return (al<<n)|(ah>>>(32-n))}n=n-32;hi=(al<<n)|(ah>>>(32-n));return (ah<<n)|(al>>>(32-n))}if(n<32){hi=(ah>>>n)|(al<<(32-n));return (al>>>n)|(ah<<(32-n))}n=n-32;hi=(al>>>n)|(ah<<(32-n));return (ah>>>n)|(al<<(32-n))}
+function AA(k,l,h,o,w){k=k|0;l=l|0;h=h|0;o=+o;w=w|0;var x=0;if(h||o>4294967295)X();x=(l>>>0)+o;if(x<0||x+w>s[k])X();return (a[k]+x)|0}
+function G(k,d){k=k|0;d=d|0;var old=0,add=0,ns=0,total=0,x=0,y=0,nb=null,nh=null;if(d<0)return -1;old=s[k]/p[k]|0;add=(d>>>0)*p[k];ns=s[k]+add;if(ns>4294967295||m[k]>=0&&ns>m[k])return -1;for(x=0;x<s.length;x++)total+=x==k?ns:s[x];if(total>4294967295)return -1;nb=new ArrayBuffer(total);nh=new Uint8Array(nb);for(x=0,y=0;x<s.length;x++){nh.set(new Uint8Array(B,a[x],s[x]),y);a[x]=y;y+=x==k?ns:s[x]}s[k]=ns;B=r.b=nb;V=new DataView(B);H=new Uint8Array(B);return old}
+function AB(dm,sm,d,sr,n){dm=dm|0;sm=sm|0;d=d>>>0;sr=sr>>>0;n=n>>>0;var da=AA(dm,d,0,0,n),sa=AA(sm,sr,0,0,n),i=0;if(da>sa&&da<sa+n)for(i=n-1;i>=0;i--)H[da+i]=H[sa+i];else for(i=0;i<n;i++)H[da+i]=H[sa+i]}
+function AC(k,d,v,n){k=k|0;d=d>>>0;v=v|0;n=n>>>0;var x=AA(k,d,0,0,n),i=0;for(i=0;i<n;i++)H[x+i]=v}
+function K(di,k,d,sr,n){di=di|0;k=k|0;d=d>>>0;sr=sr>>>0;n=n>>>0;var x=0,i=0;if(D[di].x||sr+n>D[di].length)X();x=AA(k,d,0,0,n);for(i=0;i<n;i++)H[x+i]=D[di][sr+i]}
+function N(x){x=x>>>0;if(x>=T.length)X();return T[x]|0}
+function O(x,v){x=x>>>0;v=v|0;if(x>=T.length)X();T[x]=v;S[x]=v?Z[v]:-1}
+function P(v,n){v=v|0;n=n>>>0;var o=T.length,i=0;if(r.l>=0&&o+n>r.l)return -1;for(i=0;i<n;i++){T.push(v);S.push(v?Z[v]:-1)}return o|0}
+function Q(d,v,n){d=d>>>0;v=v|0;n=n>>>0;var i=0;if(d+n>T.length)X();for(i=0;i<n;i++){T[d+i]=v;S[d+i]=v?Z[v]:-1}}
+function R(d,sr,n){d=d>>>0;sr=sr>>>0;n=n>>>0;var i=0;if(d+n>T.length||sr+n>T.length)X();if(d>sr&&d<sr+n)for(i=n-1;i>=0;i--){T[d+i]=T[sr+i];S[d+i]=S[sr+i]}else for(i=0;i<n;i++){T[d+i]=T[sr+i];S[d+i]=S[sr+i]}}
+function L(e,d,sr,n){e=e|0;d=d>>>0;sr=sr>>>0;n=n>>>0;var i=0,v=0;if(E[e].x||sr+n>E[e].length||d+n>T.length)X();for(i=0;i<n;i++){v=E[e][sr+i]|0;T[d+i]=v;S[d+i]=v?Z[v]:-1}}
+function LI(k,l,h,o,t){var x=AA(k,l,h,o,t==1?8:t==6||t==7||t==10||t==11?2:t==4||t==5||t==8||t==9?1:4);if(t==1){hi=V.getInt32(x+4,true);return V.getUint32(x,true)|0}if(t==4||t==8)return V.getInt8(x)|0;if(t==5||t==9)return V.getUint8(x)|0;if(t==6||t==10)return V.getInt16(x,true)|0;if(t==7||t==11)return V.getUint16(x,true)|0;if(t==12)return V.getInt32(x,true)|0;if(t==13)return V.getUint32(x,true)|0;return V.getInt32(x,true)|0}
+function LF(k,l,h,o,t){var x=AA(k,l,h,o,t==3?8:4);return t==3?V.getFloat64(x,true):V.getFloat32(x,true)}
+function SI(k,l,h,o,t,v,w){var x=AA(k,l,h,o,t==1?8:t==5||t==7?2:t==4||t==6?1:4);if(t==1){V.setInt32(x,v,true);V.setInt32(x+4,w,true)}else if(t==4||t==6)V.setInt8(x,v);else if(t==5||t==7)V.setInt16(x,v,true);else V.setInt32(x,v,true)}
+function SF(k,l,h,o,t,v){var x=AA(k,l,h,o,t==3?8:4);if(t==3)V.setFloat64(x,v,true);else V.setFloat32(x,v,true)}
+function MS(k){return s[k]/p[k]|0}
+function VL(k,l,h,o,i){var x=AA(k,l,h,o,16);return V.getInt32(x+i*4,true)|0}
+function VS(k,l,h,o,a,b,c,d){var x=AA(k,l,h,o,16);V.setInt32(x,a,true);V.setInt32(x+4,b,true);V.setInt32(x+8,c,true);V.setInt32(x+12,d,true)}
+function DD(i){D[i].x=1}
+function ED(i){E[i].x=1}
+function TS(){return T.length|0}
+function RS(v,t){return (v!=0&&Z[v]==t)|0}
+function IG(x,t){x=x>>>0;if(x>=T.length||!T[x]||S[x]!=t)X();return T[x]|0}
+"#;
