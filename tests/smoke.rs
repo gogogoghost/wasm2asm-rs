@@ -83,6 +83,43 @@ fn i64_comparison_runs_in_strict_module() {
 }
 
 #[test]
+fn i64_comparison_controls_strict_branch() {
+    let wat = r#"(module
+      (func (export "equal") (param i64 i64) (result i32)
+        local.get 0
+        local.get 1
+        i64.eq
+        if (result i32)
+          i32.const 1
+        else
+          i32.const 0
+        end))"#;
+    assert_eq!(
+        run(
+            wat,
+            "(()=>{let m=instantiate({});return [m.equal(1,0,1,0),m.equal(1,0,2,0)]})()"
+        ),
+        "1,0"
+    );
+}
+
+#[test]
+fn i64_bit_counts_run_in_strict_module() {
+    let wat = r#"(module
+      (func (export "clz") (param i64) (result i32)
+        local.get 0 i64.clz i32.wrap_i64)
+      (func (export "ctz") (param i64) (result i32)
+        local.get 0 i64.ctz i32.wrap_i64))"#;
+    assert_eq!(
+        run(
+            wat,
+            "(()=>{let m=instantiate({});return [m.clz(0,0),m.clz(0,1),m.ctz(0,1),m.ctz(8,0)]})()"
+        ),
+        "64,31,32,3"
+    );
+}
+
+#[test]
 fn pooled_temporaries_preserve_loop_state() {
     let wat = r#"(module
       (func (export "sum") (param $n i32) (result i32)
@@ -125,6 +162,22 @@ fn memory_round_trip_runs() {
             "(()=>{let m=instantiate({});m.store(4,305419896);return m.load(4)})()"
         ),
         "305419896"
+    );
+}
+
+#[test]
+fn memory_offset_overflow_traps() {
+    let wat = r#"(module
+      (memory 1)
+      (func (export "load_offset") (param i32) (result i32)
+        local.get 0
+        i32.load offset=8))"#;
+    assert_eq!(
+        run(
+            wat,
+            "(()=>{let m=instantiate({});let trapped=false;try{m.load_offset(-4)}catch{trapped=true}return [m.load_offset(4),trapped]})()"
+        ),
+        "0,true"
     );
 }
 

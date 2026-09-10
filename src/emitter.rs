@@ -1,7 +1,7 @@
 use crate::diagnostics::{CompileError, ErrorKind};
 use crate::ir::*;
 use crate::options::{CompileOptions, OutputFormat};
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
 pub fn emit(module: &Module, options: &CompileOptions) -> Result<Vec<u8>, CompileError> {
@@ -562,18 +562,218 @@ impl<'a> ModuleCx<'a> {
         }
         self.emit_import_aliases(out);
         self.emit_globals(out)?;
+        if self.module.memories.iter().any(|memory| !memory.memory64) {
+            out.push_str("function B0(a,o){a=a|0;o=o|0;if((a>>>0)>=((-o)>>>0))X();return (a+o)|0}function l2(a,o,t){a=a|0;o=o|0;t=t|0;return l(B0(a,o)|0,t|0)|0}function lf2(a,o,t){a=a|0;o=o|0;t=t|0;return +lf(B0(a,o)|0,t|0)}function st2(a,o,t,v,w){a=a|0;o=o|0;t=t|0;v=v|0;w=w|0;st(B0(a,o)|0,t|0,v|0,w|0)}function sf2(a,o,t,v){a=a|0;o=o|0;t=t|0;v=+v;sf(B0(a,o)|0,t|0,+v)}");
+        }
         self.emit_dispatchers(out)?;
+        let mut compiled = Vec::new();
         for (defined_index, function) in self.module.functions.iter().enumerate() {
             let function_index = self.module.imported_function_count as usize + defined_index;
             if !self.live_functions[function_index] {
                 continue;
             }
             let compiler = FunctionCompiler::new(self, function_index, function)?;
-            out.push_str(&compiler.compile()?);
+            compiled.push(CompiledFunction {
+                index: function_index,
+                code: compiler.compile()?,
+            });
         }
+        self.emit_compiled_functions(out, &compiled)?;
         self.emit_export_object(out)?;
         out.push('}');
         Ok(())
+    }
+
+    fn emit_compiled_functions(
+        &self,
+        out: &mut String,
+        compiled: &[CompiledFunction],
+    ) -> Result<(), CompileError> {
+        let mut groups: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+        for (position, function) in compiled.iter().enumerate() {
+            let body = compiled_function_body(&function.code).ok_or_else(|| {
+                CompileError::new(ErrorKind::Internal, "wasm2asm: malformed compiled function")
+            })?;
+            let literals = numeric_literals(body);
+            let type_index = self.module.function_type_indices[function.index];
+            let key = format!("{type_index}:{}", numeric_template_key(body, &literals));
+            groups.entry(key).or_default().push(position);
+        }
+
+        let mut templates = Vec::new();
+        let mut helper_index = self.function_names.len();
+        for members in groups.into_values() {
+            if members.len() < 2 {
+                continue;
+            }
+            let representative = &compiled[members[0]];
+            let representative_body =
+                compiled_function_body(&representative.code).ok_or_else(|| {
+                    CompileError::new(ErrorKind::Internal, "wasm2asm: malformed compiled function")
+                })?;
+            let representative_literals = numeric_literals(representative_body);
+            let member_bodies: Vec<_> = members
+                .iter()
+                .map(|&position| {
+                    compiled_function_body(&compiled[position].code).ok_or_else(|| {
+                        CompileError::new(
+                            ErrorKind::Internal,
+                            "wasm2asm: malformed compiled function",
+                        )
+                    })
+                })
+                .collect::<Result<_, CompileError>>()?;
+            let member_literals: Vec<_> = member_bodies
+                .iter()
+                .map(|body| numeric_literals(body))
+                .collect();
+            if member_literals
+                .iter()
+                .any(|literals| literals.len() != representative_literals.len())
+            {
+                continue;
+            }
+
+            let differing: Vec<usize> = (0..representative_literals.len())
+                .filter(|&index| {
+                    !representative_literals[index].case_label
+                        && !representative_literals[index].must_literal
+                        && member_literals
+                            .iter()
+                            .zip(&member_bodies)
+                            .any(|(literals, body)| {
+                                literal_text(body, &literals[index])
+                                    != literal_text(
+                                        representative_body,
+                                        &representative_literals[index],
+                                    )
+                            })
+                })
+                .collect();
+            if differing.is_empty() {
+                continue;
+            }
+
+            let helper = function_ident(helper_index);
+            let helper_body = render_numeric_template_body(
+                representative_body,
+                &representative_literals,
+                &differing,
+            );
+            let helper_code = self.render_template_helper(
+                &helper,
+                representative.index,
+                &helper_body,
+                differing.len(),
+            )?;
+            let mut wrappers = Vec::with_capacity(members.len());
+            for (member_position, &position) in members.iter().enumerate() {
+                let body = member_bodies[member_position];
+                let literals = &member_literals[member_position];
+                let constants = differing
+                    .iter()
+                    .map(|&index| literal_text(body, &literals[index]).to_string())
+                    .collect::<Vec<_>>();
+                wrappers.push(self.render_template_wrapper(
+                    &helper,
+                    compiled[position].index,
+                    &constants,
+                )?);
+            }
+            let original_size: usize = members
+                .iter()
+                .map(|&position| compiled[position].code.len())
+                .sum();
+            let replacement_size =
+                helper_code.len() + wrappers.iter().map(String::len).sum::<usize>();
+            if replacement_size >= original_size {
+                continue;
+            }
+            templates.push(FunctionTemplate {
+                members,
+                helper: helper_code,
+                wrappers,
+            });
+            helper_index += 1;
+        }
+
+        let mut by_position = BTreeMap::new();
+        for (template_index, template) in templates.iter().enumerate() {
+            for &position in &template.members {
+                by_position.insert(position, template_index);
+            }
+        }
+        for (position, function) in compiled.iter().enumerate() {
+            if let Some(&template_index) = by_position.get(&position) {
+                let template = &templates[template_index];
+                if template.members[0] == position {
+                    out.push_str(&template.helper);
+                    for wrapper in &template.wrappers {
+                        out.push_str(wrapper);
+                    }
+                }
+            } else {
+                out.push_str(&function.code);
+            }
+        }
+        Ok(())
+    }
+
+    fn render_template_helper(
+        &self,
+        helper: &str,
+        function_index: usize,
+        body: &str,
+        constant_count: usize,
+    ) -> Result<String, CompileError> {
+        let ty = self.function_type(function_index)?;
+        let params = parameter_values(&ty.params);
+        let mut names = flatten_names(&params);
+        let constants: Vec<String> = (0..constant_count)
+            .map(|index| format!("c{index}"))
+            .collect();
+        names.extend(constants.iter().cloned());
+        let mut out = String::new();
+        write!(out, "function {helper}({}){{", names.join(",")).unwrap();
+        emit_param_coercions(&mut out, &params);
+        for constant in &constants {
+            write!(out, "{constant}={constant}|0;").unwrap();
+        }
+        let mut parameter_prefix = String::new();
+        emit_param_coercions(&mut parameter_prefix, &params);
+        out.push_str(body.strip_prefix(&parameter_prefix).unwrap_or(body));
+        out.push('}');
+        Ok(out)
+    }
+
+    fn render_template_wrapper(
+        &self,
+        helper: &str,
+        function_index: usize,
+        constants: &[String],
+    ) -> Result<String, CompileError> {
+        let ty = self.function_type(function_index)?;
+        let params = parameter_values(&ty.params);
+        let flat_params = flatten_names(&params);
+        let mut args = flat_params.clone();
+        args.extend(constants.iter().cloned());
+        let call = format!("{helper}({})", args.join(","));
+        let mut out = String::new();
+        write!(
+            out,
+            "function {}({}){{",
+            self.function_names[function_index],
+            flat_params.join(",")
+        )
+        .unwrap();
+        emit_param_coercions(&mut out, &params);
+        if ty.results.is_empty() {
+            write!(out, "{call};return;").unwrap();
+        } else {
+            emit_direct_js_return(&mut out, &ty.results, &call, false);
+        }
+        out.push('}');
+        Ok(out)
     }
 
     fn emit_import_aliases(&self, out: &mut String) {
@@ -786,6 +986,7 @@ impl<'a> ModuleCx<'a> {
             )
             .unwrap();
         }
+
         out.push_str("return{");
         let mut first = true;
         for (export_position, export) in self.module.exports.iter().enumerate() {
@@ -948,6 +1149,23 @@ struct Control {
     then_reachable: bool,
     seen_else: bool,
     catches: Vec<CatchClause>,
+}
+
+struct CompiledFunction {
+    index: usize,
+    code: String,
+}
+struct FunctionTemplate {
+    members: Vec<usize>,
+    helper: String,
+    wrappers: Vec<String>,
+}
+#[derive(Clone)]
+struct NumericLiteral {
+    start: usize,
+    end: usize,
+    case_label: bool,
+    must_literal: bool,
 }
 
 struct FunctionCompiler<'a, 'm> {
@@ -1566,7 +1784,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     }
 
     fn emit_br_if(&mut self, depth: u32) -> Result<(), CompileError> {
-        let condition = self.pop_i32()?.to_string();
+        let condition = self.pop_i32()?;
         let target = self.target_index(depth)?;
         let values = self.peek_types(&self.branch_types(target))?;
         write!(self.body, "if({condition}){{").unwrap();
@@ -1789,14 +2007,31 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         if left.ty() != right.ty() {
             return Err(self.internal("select type mismatch"));
         }
+        let condition = compact_operand(&condition);
         let value = match (left, right) {
-            (Value::I32(a), Value::I32(b)) => Value::I32(format!("(({condition})?({a}):({b}))|0")),
-            (Value::Ref(a), Value::Ref(b)) => Value::Ref(format!("(({condition})?({a}):({b}))|0")),
-            (Value::F32(a), Value::F32(b)) => Value::F32(format!("F(({condition})?({a}):({b}))")),
-            (Value::F64(a), Value::F64(b)) => Value::F64(format!("+(({condition})?({a}):({b}))")),
+            (Value::I32(a), Value::I32(b)) => Value::I32(format!(
+                "({condition}?{}:{})|0",
+                compact_operand(&a),
+                compact_operand(&b)
+            )),
+            (Value::Ref(a), Value::Ref(b)) => Value::Ref(format!(
+                "({condition}?{}:{})|0",
+                compact_operand(&a),
+                compact_operand(&b)
+            )),
+            (Value::F32(a), Value::F32(b)) => Value::F32(format!(
+                "F({condition}?{}:{})",
+                compact_operand(&a),
+                compact_operand(&b)
+            )),
+            (Value::F64(a), Value::F64(b)) => Value::F64(format!(
+                "+({condition}?{}:{})",
+                compact_operand(&a),
+                compact_operand(&b)
+            )),
             (left, right) => {
                 let result = self.temp(left.ty());
-                write!(self.body, "if(({condition})|0){{").unwrap();
+                write!(self.body, "if({}){{", compact_i32(&condition)).unwrap();
                 self.assign(&result, &left);
                 self.body.push_str("}else{");
                 self.assign(&result, &right);
@@ -1812,45 +2047,89 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         use UnaryOp::*;
         let value = self.pop()?;
         let result = match op {
-            I32Eqz => Value::I32(format!("((({})|0)==0)|0", value.i32_expr()?)),
-            I32Clz => Value::I32(format!("C({})|0", value.i32_expr()?)),
-            I32Ctz => Value::I32(format!("ct(({})|0)|0", value.i32_expr()?)),
-            I32Popcnt => Value::I32(format!("pc(({})|0)|0", value.i32_expr()?)),
+            I32Eqz => Value::I32(format!(
+                "({}==0)|0",
+                compact_compare_operand(value.i32_expr()?, false)
+            )),
+            I32Clz => Value::I32(format!("C({})|0", compact_i32(value.i32_expr()?))),
+            I32Ctz => Value::I32(format!("ct({})|0", compact_i32(value.i32_expr()?))),
+            I32Popcnt => Value::I32(format!("pc({})|0", compact_i32(value.i32_expr()?))),
             I64Eqz => {
                 let (lo, hi) = expect_i64(value)?;
-                Value::I32(format!("((((({lo})|0)|(({hi})|0))|0)==0)|0"))
+                Value::I32(format!(
+                    "(({}|{})==0)|0",
+                    compact_i32(&lo),
+                    compact_i32(&hi)
+                ))
             }
             I64Clz => {
                 let (lo, hi) = expect_i64(value)?;
                 let result = self.temp(ValType::I32);
                 let target = result.i32_expr()?;
-                write!(self.body, "if(({hi})|0){{{target}=C(({hi})|0)|0;}}else{{{target}=(32+(C(({lo})|0)|0))|0;}}").unwrap();
+                let hi = compact_i32(&hi);
+                let lo = compact_i32(&lo);
+                write!(
+                    self.body,
+                    "if({hi}){{{target}=C({hi})|0;}}else{{{target}=(32+(C({lo})|0))|0;}}"
+                )
+                .unwrap();
                 Value::I64(target.into(), "0".into())
             }
             I64Ctz => {
                 let (lo, hi) = expect_i64(value)?;
                 let result = self.temp(ValType::I32);
                 let target = result.i32_expr()?;
-                write!(self.body, "if(({lo})|0){{{target}=ct(({lo})|0)|0;}}else{{{target}=(32+(ct(({hi})|0)|0))|0;}}").unwrap();
+                let lo = compact_i32(&lo);
+                let hi = compact_i32(&hi);
+                write!(
+                    self.body,
+                    "if({lo}){{{target}=ct({lo})|0;}}else{{{target}=(32+(ct({hi})|0))|0;}}"
+                )
+                .unwrap();
                 Value::I64(target.into(), "0".into())
             }
             I64Popcnt => {
                 let (lo, hi) = expect_i64(value)?;
-                Value::I64(format!("((pc(({lo})|0)|0)+(pc(({hi})|0)|0))|0"), "0".into())
+                Value::I64(
+                    format!(
+                        "((pc({})|0)+(pc({})|0))|0",
+                        compact_i32(&lo),
+                        compact_i32(&hi)
+                    ),
+                    "0".into(),
+                )
             }
             F32Abs => Value::F32(format!("F(Ma({}))", expect_f32(value)?)),
-            F32Neg => Value::F32(format!("F(-{})", expect_f32(value)?)),
+            F32Neg => {
+                let x = expect_f32(value)?;
+                Value::F32(format!("F(-{})", compact_operand(&x)))
+            }
             F32Ceil => Value::F32(format!("F(Mc({}))", expect_f32(value)?)),
             F32Floor => Value::F32(format!("F(Mf({}))", expect_f32(value)?)),
-            F32Trunc => Value::F32(format!("F(+tr(+({})))", expect_f32(value)?)),
-            F32Nearest => Value::F32(format!("F(+ne(+({})))", expect_f32(value)?)),
+            F32Trunc => {
+                let x = expect_f32(value)?;
+                Value::F32(format!("F(+tr({}))", compact_float_argument(&x)))
+            }
+            F32Nearest => {
+                let x = expect_f32(value)?;
+                Value::F32(format!("F(+ne({}))", compact_float_argument(&x)))
+            }
             F32Sqrt => Value::F32(format!("F(Ms({}))", expect_f32(value)?)),
             F64Abs => Value::F64(format!("+Ma({})", expect_f64(value)?)),
-            F64Neg => Value::F64(format!("-({})", expect_f64(value)?)),
+            F64Neg => {
+                let x = expect_f64(value)?;
+                Value::F64(format!("-{}", compact_operand(&x)))
+            }
             F64Ceil => Value::F64(format!("+Mc({})", expect_f64(value)?)),
             F64Floor => Value::F64(format!("+Mf({})", expect_f64(value)?)),
-            F64Trunc => Value::F64(format!("+tr(+({}))", expect_f64(value)?)),
-            F64Nearest => Value::F64(format!("+ne(+({}))", expect_f64(value)?)),
+            F64Trunc => {
+                let x = expect_f64(value)?;
+                Value::F64(format!("+tr({})", compact_float_argument(&x)))
+            }
+            F64Nearest => {
+                let x = expect_f64(value)?;
+                Value::F64(format!("+ne({})", compact_float_argument(&x)))
+            }
             F64Sqrt => Value::F64(format!("+Ms({})", expect_f64(value)?)),
             I32WrapI64 => {
                 let (lo, _) = expect_i64(value)?;
@@ -1865,12 +2144,12 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 self.trunc_i32(x, true, false)?
             }
             I64ExtendI32S => {
-                let x = value.i32_expr()?;
-                Value::I64(format!("({x})|0"), format!("({x})>>31"))
+                let x = compact_i32(value.i32_expr()?);
+                Value::I64(x.clone(), format!("({x})>>31"))
             }
             I64ExtendI32U => {
-                let x = value.i32_expr()?;
-                Value::I64(format!("({x})|0"), "0".into())
+                let x = compact_i32(value.i32_expr()?);
+                Value::I64(x, "0".into())
             }
             I64TruncF32S | I64TruncF64S => {
                 let x = expect_float(value)?;
@@ -1880,38 +2159,50 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 let x = expect_float(value)?;
                 self.trunc_i64(x, true, false)?
             }
-            F32ConvertI32S => Value::F32(format!("F(({})|0)", value.i32_expr()?)),
-            F32ConvertI32U => Value::F32(format!("F(({})>>>0)", value.i32_expr()?)),
+            F32ConvertI32S => Value::F32(format!("F({})", compact_i32(value.i32_expr()?))),
+            F32ConvertI32U => Value::F32(format!("F(({})>>>0)", compact_i32(value.i32_expr()?))),
             F32ConvertI64S => {
                 let (lo, hi) = expect_i64(value)?;
-                Value::F32(format!("F((+(({hi})|0)*4294967296.0)+(+(({lo})>>>0)))"))
+                let lo = compact_i32(&lo);
+                let hi = compact_i32(&hi);
+                Value::F32(format!("F(+({hi})*4294967296.0+(+({lo}>>>0)))"))
             }
             F32ConvertI64U => {
                 let (lo, hi) = expect_i64(value)?;
-                Value::F32(format!("F((+(({hi})>>>0)*4294967296.0)+(+(({lo})>>>0)))"))
+                let lo = compact_i32(&lo);
+                let hi = compact_i32(&hi);
+                Value::F32(format!("F(+({hi}>>>0)*4294967296.0+(+({lo}>>>0)))"))
             }
             F32DemoteF64 => Value::F32(format!("F({})", expect_f64(value)?)),
-            F64ConvertI32S => Value::F64(format!("+(({})|0)", value.i32_expr()?)),
-            F64ConvertI32U => Value::F64(format!("+(({})>>>0)", value.i32_expr()?)),
+            F64ConvertI32S => Value::F64(format!("+({})", compact_i32(value.i32_expr()?))),
+            F64ConvertI32U => Value::F64(format!("+(({})>>>0)", compact_i32(value.i32_expr()?))),
             F64ConvertI64S => {
                 let (lo, hi) = expect_i64(value)?;
-                Value::F64(format!("+((+(({hi})|0)*4294967296.0)+(+(({lo})>>>0)))"))
+                let lo = compact_i32(&lo);
+                let hi = compact_i32(&hi);
+                Value::F64(format!("+(+({hi})*4294967296.0+(+({lo}>>>0)))"))
             }
             F64ConvertI64U => {
                 let (lo, hi) = expect_i64(value)?;
-                Value::F64(format!("+((+(({hi})>>>0)*4294967296.0)+(+(({lo})>>>0)))"))
+                let lo = compact_i32(&lo);
+                let hi = compact_i32(&hi);
+                Value::F64(format!("+(+({hi}>>>0)*4294967296.0+(+({lo}>>>0)))"))
             }
             F64PromoteF32 => Value::F64(format!("+({})", expect_f32(value)?)),
-            I32ReinterpretF32 => Value::I32(format!("rf(+({}))|0", expect_f32(value)?)),
-            F32ReinterpretI32 => Value::F32(format!("F(+ri(({})|0))", value.i32_expr()?)),
+            I32ReinterpretF32 => Value::I32(format!(
+                "rf({})|0",
+                compact_float_argument(&expect_f32(value)?)
+            )),
+            F32ReinterpretI32 => Value::F32(format!("F(+ri({}))", compact_i32(value.i32_expr()?))),
             I64ReinterpretF64 => {
-                let x = expect_f64(value)?;
+                let x = compact_float_argument(&expect_f64(value)?);
                 let lo = self.temp(ValType::I32);
                 let high = self.temp(ValType::I32);
                 write!(
                     self.body,
-                    "{}=rd(+({x}))|0;{}=GH()|0;",
+                    "{}=rd({})|0;{}=GH()|0;",
                     lo.i32_expr()?,
+                    x,
                     high.i32_expr()?
                 )
                 .unwrap();
@@ -1919,7 +2210,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             }
             F64ReinterpretI64 => {
                 let (lo, hi) = expect_i64(value)?;
-                Value::F64(format!("+wr(({lo})|0,({hi})|0)"))
+                Value::F64(format!("+wr({},{})", compact_i32(&lo), compact_i32(&hi)))
             }
             I32Extend8S => Value::I32(format!("(({})<<24)>>24", value.i32_expr()?)),
             I32Extend16S => Value::I32(format!("(({})<<16)>>16", value.i32_expr()?)),
@@ -1991,15 +2282,21 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             I32ShrS => i32_bin(left, right, ">>")?,
             I32ShrU => {
                 let (a, b) = expect_i32_pair(left, right)?;
-                Value::I32(format!("(({a})>>>(({b})&31))|0"))
+                let a = compact_operand(&a);
+                let b = compact_operand(&b);
+                Value::I32(format!("({a}>>>({b}&31))|0"))
             }
             I32Rotl => {
                 let (a, b) = expect_i32_pair(left, right)?;
-                Value::I32(format!("((({a})<<(({b})&31))|(({a})>>>(32-(({b})&31))))|0"))
+                let a = compact_operand(&a);
+                let b = compact_operand(&b);
+                Value::I32(format!("(({a}<<({b}&31))|({a}>>>(32-({b}&31))))|0"))
             }
             I32Rotr => {
                 let (a, b) = expect_i32_pair(left, right)?;
-                Value::I32(format!("((({a})>>>(({b})&31))|(({a})<<(32-(({b})&31))))|0"))
+                let a = compact_operand(&a);
+                let b = compact_operand(&b);
+                Value::I32(format!("(({a}>>>({b}&31))|({a}<<(32-({b}&31))))|0"))
             }
             I64Eq | I64Ne | I64LtS | I64LtU | I64GtS | I64GtU | I64LeS | I64LeU | I64GeS
             | I64GeU => i64_compare(left, right, op)?,
@@ -2033,21 +2330,23 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         op: BinaryOp,
     ) -> Result<Value, CompileError> {
         let (a, b) = expect_i32_pair(left, right)?;
+        let a_i32 = compact_i32(&a);
+        let b_i32 = compact_i32(&b);
         if self.module.options.preserve_traps {
-            write!(self.body, "if((({b})|0)==0)X();").unwrap();
+            write!(self.body, "if(({b_i32})==0)X();").unwrap();
             if matches!(op, BinaryOp::I32DivS) {
                 write!(
                     self.body,
-                    "if((({a})|0)==(-2147483648|0)){{if((({b})|0)==(-1|0))X();}}"
+                    "if(({a_i32})==(-2147483648|0)){{if(({b_i32})==(-1|0))X();}}"
                 )
                 .unwrap();
             }
         }
         let expr = match op {
-            BinaryOp::I32DivS => format!("((({a})|0)/(({b})|0))|0"),
-            BinaryOp::I32DivU => format!("((({a})>>>0)/(({b})>>>0))>>>0|0"),
-            BinaryOp::I32RemS => format!("((({a})|0)%(({b})|0))|0"),
-            BinaryOp::I32RemU => format!("((({a})>>>0)%(({b})>>>0))>>>0|0"),
+            BinaryOp::I32DivS => format!("(({a_i32})/({b_i32}))|0"),
+            BinaryOp::I32DivU => format!("((({a_i32})>>>0)/(({b_i32})>>>0))>>>0|0"),
+            BinaryOp::I32RemS => format!("(({a_i32})%({b_i32}))|0"),
+            BinaryOp::I32RemU => format!("((({a_i32})>>>0)%(({b_i32})>>>0))>>>0|0"),
             _ => unreachable!(),
         };
         Ok(Value::I32(expr))
@@ -2079,11 +2378,15 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             BinaryOp::I64RemU => 14,
             _ => unreachable!(),
         };
+        let al = compact_i32(&al);
+        let ah = compact_i32(&ah);
+        let bl = compact_i32(&bl);
+        let bh = compact_i32(&bh);
         let low = self.temp(ValType::I32);
         let high = self.temp(ValType::I32);
         write!(
             self.body,
-            "{}=W({code}|0,({al})|0,({ah})|0,({bl})|0,({bh})|0)|0;{}=GH()|0;",
+            "{}=W({code}|0,{al},{ah},{bl},{bh})|0;{}=GH()|0;",
             low.i32_expr()?,
             high.i32_expr()?
         )
@@ -2143,14 +2446,27 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let (lo, hi) = self.pop_address(memory.memory64)?;
         let code = load_code(op);
         let compact_address = compact.then(|| compact_memory_address(&lo, arg.offset));
+        let lo_i32 = compact_i32(&lo);
+        let hi_i32 = compact_i32(&hi);
         let call = if let Some(address) = &compact_address {
-            format!("l({address},{code})")
+            if arg.offset == 0 {
+                format!("l({address},{code})")
+            } else {
+                format!("l2({address},{},{code})", arg.offset)
+            }
         } else {
             format!(
-                "LI({}|0,({lo})|0,({hi})|0,+{},{}|0)",
+                "LI({}|0,{lo_i32},{hi_i32},+{},{}|0)",
                 arg.memory, arg.offset, code
             )
         };
+        let float_call = compact_address.as_ref().map(|address| {
+            if arg.offset == 0 {
+                format!("lf({address},{code})")
+            } else {
+                format!("lf2({address},{},{code})", arg.offset)
+            }
+        });
         match op {
             LoadOp::I64 => {
                 let low = self.temp(ValType::I32);
@@ -2183,17 +2499,12 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             }
             LoadOp::F32 => {
                 let value = self.temp(ValType::F32);
-                if let Some(address) = compact_address {
-                    write!(
-                        self.body,
-                        "{}=F(+lf({address},{code}));",
-                        value.components()[0]
-                    )
-                    .unwrap();
+                if let Some(call) = &float_call {
+                    write!(self.body, "{}=F(+{call});", value.components()[0]).unwrap();
                 } else {
                     write!(
                         self.body,
-                        "{}=F(+LF({}|0,({lo})|0,({hi})|0,+{},{}|0));",
+                        "{}=F(+LF({}|0,{lo_i32},{hi_i32},+{},{}|0));",
                         value.components()[0],
                         arg.memory,
                         arg.offset,
@@ -2205,17 +2516,12 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             }
             LoadOp::F64 => {
                 let value = self.temp(ValType::F64);
-                if let Some(address) = compact_address {
-                    write!(
-                        self.body,
-                        "{}=+lf({address},{code});",
-                        value.components()[0]
-                    )
-                    .unwrap();
+                if let Some(call) = &float_call {
+                    write!(self.body, "{}=+{call};", value.components()[0]).unwrap();
                 } else {
                     write!(
                         self.body,
-                        "{}=+LF({}|0,({lo})|0,({hi})|0,+{},{}|0);",
+                        "{}=+LF({}|0,{lo_i32},{hi_i32},+{},{}|0);",
                         value.components()[0],
                         arg.memory,
                         arg.offset,
@@ -2247,27 +2553,49 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             && !memory.memory64
             && arg.offset <= u32::MAX as u64;
         let (lo, hi) = self.pop_address(memory.memory64)?;
+        let lo_i32 = compact_i32(&lo);
+        let hi_i32 = compact_i32(&hi);
         let code = store_code(op);
         if let Some(address) = compact.then(|| compact_memory_address(&lo, arg.offset)) {
             match op {
                 StoreOp::F32 | StoreOp::F64 => {
                     let value = coerce(ValType::F64, &expect_float(value)?);
-                    write!(self.body, "sf({address},{code},{value});").unwrap();
+                    if arg.offset == 0 {
+                        write!(self.body, "sf({address},{code},{value});").unwrap();
+                    } else {
+                        write!(self.body, "sf2({address},{},{code},{value});", arg.offset).unwrap();
+                    }
                 }
                 StoreOp::I64 | StoreOp::I64_8 | StoreOp::I64_16 | StoreOp::I64_32 => {
                     let (value_lo, value_hi) = expect_i64(value)?;
-                    write!(
-                        self.body,
-                        "st({address},{code},({value_lo})|0,({value_hi})|0);"
-                    )
-                    .unwrap();
+                    if arg.offset == 0 {
+                        write!(
+                            self.body,
+                            "st({address},{code},{},{});",
+                            compact_i32(&value_lo),
+                            compact_i32(&value_hi)
+                        )
+                        .unwrap();
+                    } else {
+                        write!(
+                            self.body,
+                            "st2({address},{},{code},{},{});",
+                            arg.offset,
+                            compact_i32(&value_lo),
+                            compact_i32(&value_hi)
+                        )
+                        .unwrap();
+                    }
                 }
-                _ => write!(
-                    self.body,
-                    "st({address},{code},({})|0,0);",
-                    value.i32_expr()?
-                )
-                .unwrap(),
+                _ => {
+                    let value = compact_i32(value.i32_expr()?);
+                    if arg.offset == 0 {
+                        write!(self.body, "st({address},{code},{value},0);").unwrap();
+                    } else {
+                        write!(self.body, "st2({address},{},{code},{value},0);", arg.offset)
+                            .unwrap();
+                    }
+                }
             }
             return Ok(());
         }
@@ -2277,7 +2605,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 let value = coerce(ValType::F64, &value);
                 write!(
                     self.body,
-                    "SF({}|0,({lo})|0,({hi})|0,+{},{}|0,{value});",
+                    "SF({}|0,{lo_i32},{hi_i32},+{},{}|0,{value});",
                     arg.memory, arg.offset, code
                 )
                 .unwrap();
@@ -2286,55 +2614,47 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 let (value_lo, value_hi) = expect_i64(value)?;
                 write!(
                     self.body,
-                    "SI({}|0,({lo})|0,({hi})|0,+{},{}|0,({value_lo})|0,({value_hi})|0);",
+                    "SI({}|0,{lo_i32},{hi_i32},+{},{}|0,{},{});",
+                    arg.memory,
+                    arg.offset,
+                    code,
+                    compact_i32(&value_lo),
+                    compact_i32(&value_hi)
+                )
+                .unwrap();
+            }
+            _ => {
+                let value = compact_i32(value.i32_expr()?);
+                write!(
+                    self.body,
+                    "SI({}|0,{lo_i32},{hi_i32},+{},{}|0,{value},0);",
                     arg.memory, arg.offset, code
                 )
                 .unwrap();
             }
-            _ => write!(
-                self.body,
-                "SI({}|0,({lo})|0,({hi})|0,+{},{}|0,({})|0,0);",
-                arg.memory,
-                arg.offset,
-                code,
-                value.i32_expr()?
-            )
-            .unwrap(),
         }
         Ok(())
     }
 
     fn emit_memory_copy(&mut self, dst: u32, src: u32) -> Result<(), CompileError> {
-        let count = self.pop_i32()?.to_string();
-        let source = self.pop_i32()?.to_string();
-        let dest = self.pop_i32()?.to_string();
-        write!(
-            self.body,
-            "AB({dst}|0,{src}|0,({dest})|0,({source})|0,({count})|0);"
-        )
-        .unwrap();
+        let count = compact_i32(&self.pop_i32()?.to_string());
+        let source = compact_i32(&self.pop_i32()?.to_string());
+        let dest = compact_i32(&self.pop_i32()?.to_string());
+        write!(self.body, "AB({dst}|0,{src}|0,{dest},{source},{count});").unwrap();
         Ok(())
     }
     fn emit_memory_fill(&mut self, memory: u32) -> Result<(), CompileError> {
-        let count = self.pop_i32()?.to_string();
-        let value = self.pop_i32()?.to_string();
-        let dest = self.pop_i32()?.to_string();
-        write!(
-            self.body,
-            "AC({memory}|0,({dest})|0,({value})|0,({count})|0);"
-        )
-        .unwrap();
+        let count = compact_i32(&self.pop_i32()?.to_string());
+        let value = compact_i32(&self.pop_i32()?.to_string());
+        let dest = compact_i32(&self.pop_i32()?.to_string());
+        write!(self.body, "AC({memory}|0,{dest},{value},{count});").unwrap();
         Ok(())
     }
     fn emit_memory_init(&mut self, data: u32, memory: u32) -> Result<(), CompileError> {
-        let count = self.pop_i32()?.to_string();
-        let source = self.pop_i32()?.to_string();
-        let dest = self.pop_i32()?.to_string();
-        write!(
-            self.body,
-            "K({data}|0,{memory}|0,({dest})|0,({source})|0,({count})|0);"
-        )
-        .unwrap();
+        let count = compact_i32(&self.pop_i32()?.to_string());
+        let source = compact_i32(&self.pop_i32()?.to_string());
+        let dest = compact_i32(&self.pop_i32()?.to_string());
+        write!(self.body, "K({data}|0,{memory}|0,{dest},{source},{count});").unwrap();
         Ok(())
     }
 
@@ -2688,6 +3008,145 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     }
 }
 
+fn compiled_function_body(code: &str) -> Option<&str> {
+    let open = code.find('{')?;
+    let close = code.rfind('}')?;
+    (open < close).then_some(&code[open + 1..close])
+}
+fn call_name_before(body: &str, open: usize) -> Option<&str> {
+    let bytes = body.as_bytes();
+    let mut end = open;
+    while end > 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut start = end;
+    while start > 0 && (is_js_identifier_byte(bytes[start - 1]) || bytes[start - 1] == b'.') {
+        start -= 1;
+    }
+    let name = &body[start..end];
+    (!name.is_empty()).then_some(name)
+}
+fn literal_requires_constant_call_argument(name: Option<&str>, argument: usize) -> bool {
+    match name {
+        Some("l2" | "lf2" | "st2" | "sf2") => matches!(argument, 1 | 2),
+        Some("l" | "lf" | "st" | "sf") => argument == 1,
+        _ => false,
+    }
+}
+fn numeric_literals(body: &str) -> Vec<NumericLiteral> {
+    let bytes = body.as_bytes();
+    let mut literals = Vec::new();
+    let mut calls = Vec::new();
+    let mut quote = None;
+    let mut escaped = false;
+    let mut index = 0;
+    while index < bytes.len() {
+        let byte = bytes[index];
+        if let Some(delimiter) = quote {
+            if escaped {
+                escaped = false;
+            } else if byte == b'\\' {
+                escaped = true;
+            } else if byte == delimiter {
+                quote = None;
+            }
+            index += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"' | b'`') {
+            quote = Some(byte);
+            index += 1;
+            continue;
+        }
+        match byte {
+            b'(' => {
+                calls.push((call_name_before(body, index), 0));
+                index += 1;
+                continue;
+            }
+            b',' => {
+                if let Some((_, argument)) = calls.last_mut() {
+                    *argument += 1;
+                }
+                index += 1;
+                continue;
+            }
+            b')' => {
+                calls.pop();
+                index += 1;
+                continue;
+            }
+            _ => {}
+        }
+        if !byte.is_ascii_digit()
+            || index > 0 && is_js_identifier_byte(bytes[index - 1])
+            || index + 1 < bytes.len() && is_js_identifier_byte(bytes[index + 1])
+        {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        while index < bytes.len() && bytes[index].is_ascii_digit() {
+            index += 1;
+        }
+        let end = index;
+        if start > 0 && bytes[start - 1] == b'.' || end < bytes.len() && bytes[end] == b'.' {
+            continue;
+        }
+        let prefix = &body[..start];
+        let case_label = prefix
+            .rfind("case ")
+            .is_some_and(|case| prefix.rfind(':').is_none_or(|colon| colon < case));
+        let must_literal = calls
+            .iter()
+            .any(|(name, argument)| literal_requires_constant_call_argument(*name, *argument));
+        literals.push(NumericLiteral {
+            start,
+            end,
+            case_label,
+            must_literal,
+        });
+    }
+    literals
+}
+fn literal_text<'a>(body: &'a str, literal: &NumericLiteral) -> &'a str {
+    &body[literal.start..literal.end]
+}
+fn numeric_template_key(body: &str, literals: &[NumericLiteral]) -> String {
+    let mut key = String::with_capacity(body.len());
+    let mut previous = 0;
+    for literal in literals {
+        key.push_str(&body[previous..literal.start]);
+        if literal.case_label || literal.must_literal {
+            key.push_str(literal_text(body, literal));
+        } else {
+            key.push('#');
+        }
+        previous = literal.end;
+    }
+    key.push_str(&body[previous..]);
+    key
+}
+fn render_numeric_template_body(
+    body: &str,
+    literals: &[NumericLiteral],
+    differing: &[usize],
+) -> String {
+    let mut rendered = String::with_capacity(body.len());
+    let mut previous = 0;
+    for (index, literal) in literals.iter().enumerate() {
+        rendered.push_str(&body[previous..literal.start]);
+        if let Some(parameter) = differing.iter().position(|&candidate| candidate == index) {
+            write!(rendered, "c{parameter}").unwrap();
+        } else {
+            rendered.push_str(literal_text(body, literal));
+        }
+        previous = literal.end;
+    }
+    rendered.push_str(&body[previous..]);
+    rendered
+}
+
 fn type_compatible(a: ValType, b: ValType) -> bool {
     a == b || matches!((a, b), (ValType::FuncRef(_), ValType::FuncRef(_)))
 }
@@ -2727,9 +3186,9 @@ fn named_value(ty: ValType, base: &str) -> Value {
 }
 fn compact_memory_address(lo: &str, offset: u64) -> String {
     if offset == 0 {
-        format!("({lo})|0")
+        compact_i32(lo)
     } else {
-        format!("(({lo})+{offset})|0")
+        compact_operand(lo)
     }
 }
 fn local_ident(index: usize) -> String {
@@ -3104,41 +3563,160 @@ fn expect_float(v: Value) -> Result<String, CompileError> {
 fn expect_i32_pair(a: Value, b: Value) -> Result<(String, String), CompileError> {
     Ok((a.i32_expr()?.into(), b.i32_expr()?.into()))
 }
+fn is_js_identifier(value: &str) -> bool {
+    let mut chars = value.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first.is_ascii_alphabetic() || matches!(first, '_' | '$')) && chars.all(is_js_identifier_char)
+}
+fn is_js_identifier_char(value: char) -> bool {
+    value.is_ascii_alphanumeric() || matches!(value, '_' | '$')
+}
+fn is_js_callee(value: &str) -> bool {
+    !value.is_empty() && value.split('.').all(is_js_identifier)
+}
+fn is_js_call(value: &str) -> bool {
+    let Some(open) = value.find('(') else {
+        return false;
+    };
+    if !value.ends_with(')') || !is_js_callee(&value[..open]) {
+        return false;
+    }
+    let mut depth = 0usize;
+    for (index, byte) in value.as_bytes()[open..].iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 {
+                    return open + index + 1 == value.len();
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+fn is_fully_parenthesized(value: &str) -> bool {
+    if !value.starts_with('(') || !value.ends_with(')') {
+        return false;
+    }
+    let mut depth = 0usize;
+    for (index, byte) in value.as_bytes().iter().enumerate() {
+        match byte {
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth.saturating_sub(1);
+                if depth == 0 && index + 1 != value.len() {
+                    return false;
+                }
+            }
+            _ => {}
+        }
+    }
+    depth == 0
+}
+fn is_js_atom(value: &str) -> bool {
+    let value = value.trim();
+    if is_js_identifier(value) || is_js_call(value) || is_fully_parenthesized(value) {
+        return true;
+    }
+    if let Some(value) = value.strip_prefix(['+', '-']) {
+        return is_js_atom(value);
+    }
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|value| value.is_ascii_digit() || matches!(value, '.' | 'e' | 'E'))
+}
+fn compact_operand(value: &str) -> String {
+    let value = value.trim();
+    if value.starts_with(['+', '-']) {
+        format!("({value})")
+    } else if is_js_atom(value) {
+        value.into()
+    } else {
+        format!("({value})")
+    }
+}
+fn compact_i32(value: &str) -> String {
+    let value = value.trim();
+    if value.ends_with("|0") {
+        value.into()
+    } else if is_js_atom(value) {
+        format!("{value}|0")
+    } else {
+        format!("({value})|0")
+    }
+}
+fn compact_compare_operand(value: &str, unsigned: bool) -> String {
+    let value = compact_i32(value);
+    if unsigned {
+        format!("(({value})>>>0)")
+    } else {
+        format!("({value})")
+    }
+}
+fn compact_float_argument(value: &str) -> String {
+    let value = value.trim();
+    if value.starts_with('+') {
+        value.into()
+    } else if is_js_atom(value) {
+        format!("+{value}")
+    } else {
+        format!("+({value})")
+    }
+}
 fn i32_bin(a: Value, b: Value, op: &str) -> Result<Value, CompileError> {
     let (a, b) = expect_i32_pair(a, b)?;
-    Ok(Value::I32(format!("(({a}){op}({b}))|0")))
+    Ok(Value::I32(format!(
+        "({}{op}{})|0",
+        compact_operand(&a),
+        compact_operand(&b)
+    )))
 }
 fn cmp_i32(a: Value, b: Value, op: &str, unsigned: bool) -> Result<Value, CompileError> {
     let (a, b) = expect_i32_pair(a, b)?;
-    Ok(Value::I32(if unsigned {
-        format!("((({a})>>>0){op}(({b})>>>0))|0")
-    } else {
-        format!("((({a})|0){op}(({b})|0))|0")
-    }))
+    Ok(Value::I32(format!(
+        "({}{op}{})|0",
+        compact_compare_operand(&a, unsigned),
+        compact_compare_operand(&b, unsigned)
+    )))
 }
 fn cmp_float(a: Value, b: Value, op: &str) -> Result<Value, CompileError> {
     Ok(Value::I32(format!(
         "({}{op}{})|0",
-        expect_float(a)?,
-        expect_float(b)?
+        compact_operand(&expect_float(a)?),
+        compact_operand(&expect_float(b)?)
     )))
 }
 fn float_bin(a: Value, b: Value, op: &str, f32_: bool) -> Result<Value, CompileError> {
     let a = expect_float(a)?;
     let b = expect_float(b)?;
     Ok(if f32_ {
-        Value::F32(format!("F(({a}){op}({b}))"))
+        Value::F32(format!(
+            "F({}{op}{})",
+            compact_operand(&a),
+            compact_operand(&b)
+        ))
     } else {
-        Value::F64(format!("+(({a}){op}({b}))"))
+        Value::F64(format!(
+            "+({}{op}{})",
+            compact_operand(&a),
+            compact_operand(&b)
+        ))
     })
 }
 fn float_helper(a: Value, b: Value, name: &str, f32_: bool) -> Result<Value, CompileError> {
     let a = expect_float(a)?;
     let b = expect_float(b)?;
+    let a = compact_float_argument(&a);
+    let b = compact_float_argument(&b);
     Ok(if f32_ {
-        Value::F32(format!("F(+{name}(+({a}),+({b})))"))
+        Value::F32(format!("F(+{name}({a},{b}))"))
     } else {
-        Value::F64(format!("+{name}(+({a}),+({b}))"))
+        Value::F64(format!("+{name}({a},{b})"))
     })
 }
 fn i64_compare(a: Value, b: Value, op: BinaryOp) -> Result<Value, CompileError> {
@@ -3310,7 +3888,7 @@ fn instruction_offset(_: &str, _: &str) -> usize {
 
 const RUNTIME_HELPERS: &str = r#"
 function X(){throw Error('wasm trap')}
-function ct(x){x=x|0;if(!x)return 32;return 31-C((x&-x)-1)|0}
+function ct(x){x=x|0;if(!x)return 32;return 32-C((x&-x)-1)|0}
 function pc(x){x=x|0;x=x-((x>>>1)&1431655765)|0;x=(x&858993459)+((x>>>2)&858993459)|0;return U((x+(x>>>4)&252645135),16843009)>>>24}
 function tr(x){x=+x;return x<0?M.ceil(x):M.floor(x)}
 function ne(x){x=+x;var f=M.floor(x),d=x-f;if(d<.5)return f;if(d>.5)return f+1;if(f%2){f=f+1;return f==0&&x<0?-0:f}return f==0&&x<0?-0:f}
