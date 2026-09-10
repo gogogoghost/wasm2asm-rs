@@ -149,6 +149,68 @@ fn validate_boundaries(module: &Module) -> Result<(), CompileError> {
     Ok(())
 }
 
+fn mark_live_function(index: u32, live: &mut [bool], work: &mut Vec<usize>) {
+    let Some(slot) = live.get_mut(index as usize) else {
+        return;
+    };
+    if !*slot {
+        *slot = true;
+        work.push(index as usize);
+    }
+}
+
+fn reachable_functions(module: &Module) -> (Vec<bool>, BTreeSet<u32>) {
+    let mut live = vec![false; module.function_type_indices.len()];
+    let mut work = Vec::new();
+
+    for export in &module.exports {
+        if export.kind == ExportKind::Func {
+            mark_live_function(export.index, &mut live, &mut work);
+        }
+    }
+    if let Some(start) = module.start {
+        mark_live_function(start, &mut live, &mut work);
+    }
+    for element in &module.elements {
+        for &item in &element.items {
+            if let Some(index) = item {
+                mark_live_function(index, &mut live, &mut work);
+            }
+        }
+    }
+    for global in &module.globals {
+        if let ConstExpr::RefFunc(index) = global.init {
+            mark_live_function(index, &mut live, &mut work);
+        }
+    }
+
+    let mut indirect_types = BTreeSet::new();
+    while let Some(function_index) = work.pop() {
+        if function_index < module.imported_function_count as usize {
+            continue;
+        }
+        let defined_index = function_index - module.imported_function_count as usize;
+        let Some(function) = module.functions.get(defined_index) else {
+            continue;
+        };
+        for instruction in &function.body {
+            match &instruction.op {
+                Op::Call(target) | Op::ReturnCall(target) | Op::RefFunc(target) => {
+                    mark_live_function(*target, &mut live, &mut work);
+                }
+                Op::CallIndirect { type_index, .. }
+                | Op::ReturnCallIndirect { type_index, .. }
+                | Op::CallRef(type_index) => {
+                    indirect_types.insert(*type_index);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    (live, indirect_types)
+}
+
 struct ModuleCx<'a> {
     module: &'a Module,
     options: &'a CompileOptions,
@@ -158,13 +220,14 @@ struct ModuleCx<'a> {
     return_slots: Vec<Value>,
     max_return_slots: usize,
     indirect_types: BTreeSet<u32>,
+    live_functions: Vec<bool>,
 }
 
 impl<'a> ModuleCx<'a> {
     fn new(module: &'a Module, options: &'a CompileOptions) -> Result<Self, CompileError> {
         let mut function_names = Vec::with_capacity(module.function_type_indices.len());
         for index in 0..module.function_type_indices.len() {
-            function_names.push(js_ident(index, true));
+            function_names.push(function_ident(index));
         }
         let import_function_names =
             function_names[..module.imported_function_count as usize].to_vec();
@@ -172,6 +235,7 @@ impl<'a> ModuleCx<'a> {
         for (index, ty) in module.global_types.iter().enumerate() {
             global_names.push(named_value(ty.ty, &format!("$g{}", short_index(index))));
         }
+        let (live_functions, indirect_types) = reachable_functions(module);
         let max_return_slots = module
             .types
             .iter()
@@ -181,19 +245,6 @@ impl<'a> ModuleCx<'a> {
         let return_slots = (0..max_return_slots)
             .map(|index| Value::I32(format!("q{}", short_index(index))))
             .collect();
-        let mut indirect_types = BTreeSet::new();
-        for function in &module.functions {
-            for instruction in &function.body {
-                match instruction.op {
-                    Op::CallIndirect { type_index, .. }
-                    | Op::ReturnCallIndirect { type_index, .. }
-                    | Op::CallRef(type_index) => {
-                        indirect_types.insert(type_index);
-                    }
-                    _ => {}
-                }
-            }
-        }
         Ok(Self {
             module,
             options,
@@ -203,6 +254,7 @@ impl<'a> ModuleCx<'a> {
             return_slots,
             max_return_slots,
             indirect_types,
+            live_functions,
         })
     }
 
@@ -362,11 +414,14 @@ impl<'a> ModuleCx<'a> {
             out.push_str("r.l=0;");
         }
         for (function_index, type_index) in self.module.function_type_indices.iter().enumerate() {
+            if !self.live_functions[function_index] {
+                continue;
+            }
             write!(out, "Z[{}]={type_index};", function_index + 1).unwrap();
         }
         out.push_str("B=r.b;V=new DataView(B);H=new Uint8Array(B);");
         out.push_str(RUNTIME_HELPERS);
-        out.push_str("f.X=X;f.ct=ct;f.pc=pc;f.tr=tr;f.ne=ne;f.mn=mn;f.mx=mx;f.cs=cs;f.rf=rf;f.ri=ri;f.rd=rd;f.wr=wr;f.Y=Y;f.y=y;f.W=W;f.GH=function(){return hi|0};f.IC=IC;f.AA=AA;f.LI=LI;f.LF=LF;f.SI=SI;f.SF=SF;f.VL=VL;f.VS=VS;f.MS=MS;f.DD=DD;f.ED=ED;f.TS=TS;f.RS=RS;f.IG=IG;f.G=G;f.AB=AB;f.AC=AC;f.K=K;f.N=N;f.O=O;f.P=P;f.Q=Q;f.R=R;f.L=L;");
+        out.push_str("f.X=X;f.ct=ct;f.pc=pc;f.tr=tr;f.ne=ne;f.mn=mn;f.mx=mx;f.cs=cs;f.rf=rf;f.ri=ri;f.rd=rd;f.wr=wr;f.Y=Y;f.y=y;f.W=W;f.GH=function(){return hi|0};f.IC=IC;f.AA=AA;f.LI=LI;f.l=l;f.LF=LF;f.lf=lf;f.SI=SI;f.st=st;f.SF=SF;f.sf=sf;f.VL=VL;f.vl=vl;f.VS=VS;f.vs=vs;f.MS=MS;f.DD=DD;f.ED=ED;f.TS=TS;f.RS=RS;f.IG=IG;f.G=G;f.AB=AB;f.AC=AC;f.K=K;f.N=N;f.O=O;f.P=P;f.Q=Q;f.R=R;f.L=L;");
         self.emit_outer_initializers(out)?;
         out.push_str("var x=asmModule({Math:M,NaN:NaN,Infinity:Infinity},f);");
         if self.module.start.is_some() {
@@ -493,7 +548,7 @@ impl<'a> ModuleCx<'a> {
     }
 
     fn emit_core(&mut self, out: &mut String) -> Result<(), CompileError> {
-        out.push_str("function asmModule(stdlib,foreign){'use asm';var F=stdlib.Math.fround,U=stdlib.Math.imul,C=stdlib.Math.clz32,Ma=stdlib.Math.abs,Mc=stdlib.Math.ceil,Mf=stdlib.Math.floor,Ms=stdlib.Math.sqrt,Na=stdlib.NaN,In=stdlib.Infinity,X=foreign.X,ct=foreign.ct,pc=foreign.pc,tr=foreign.tr,ne=foreign.ne,mn=foreign.mn,mx=foreign.mx,cs=foreign.cs,rf=foreign.rf,ri=foreign.ri,rd=foreign.rd,wr=foreign.wr,Y=foreign.Y,y=foreign.y,W=foreign.W,GH=foreign.GH,IC=foreign.IC,AA=foreign.AA,LI=foreign.LI,LF=foreign.LF,SI=foreign.SI,SF=foreign.SF,VL=foreign.VL,VS=foreign.VS,MS=foreign.MS,DD=foreign.DD,ED=foreign.ED,TS=foreign.TS,RS=foreign.RS,IG=foreign.IG,G=foreign.G,AB=foreign.AB,AC=foreign.AC,K=foreign.K,N=foreign.N,O=foreign.O,P=foreign.P,Q=foreign.Q,R=foreign.R,L=foreign.L,");
+        out.push_str("function asmModule(stdlib,foreign){'use asm';var F=stdlib.Math.fround,U=stdlib.Math.imul,C=stdlib.Math.clz32,Ma=stdlib.Math.abs,Mc=stdlib.Math.ceil,Mf=stdlib.Math.floor,Ms=stdlib.Math.sqrt,Na=stdlib.NaN,In=stdlib.Infinity,X=foreign.X,ct=foreign.ct,pc=foreign.pc,tr=foreign.tr,ne=foreign.ne,mn=foreign.mn,mx=foreign.mx,cs=foreign.cs,rf=foreign.rf,ri=foreign.ri,rd=foreign.rd,wr=foreign.wr,Y=foreign.Y,y=foreign.y,W=foreign.W,GH=foreign.GH,IC=foreign.IC,AA=foreign.AA,LI=foreign.LI,l=foreign.l,LF=foreign.LF,lf=foreign.lf,SI=foreign.SI,st=foreign.st,SF=foreign.SF,sf=foreign.sf,VL=foreign.VL,vl=foreign.vl,VS=foreign.VS,vs=foreign.vs,MS=foreign.MS,DD=foreign.DD,ED=foreign.ED,TS=foreign.TS,RS=foreign.RS,IG=foreign.IG,G=foreign.G,AB=foreign.AB,AC=foreign.AC,K=foreign.K,N=foreign.N,O=foreign.O,P=foreign.P,Q=foreign.Q,R=foreign.R,L=foreign.L,");
         if self.max_return_slots == 0 {
             out.push_str("q0=0;");
         } else {
@@ -510,6 +565,9 @@ impl<'a> ModuleCx<'a> {
         self.emit_dispatchers(out)?;
         for (defined_index, function) in self.module.functions.iter().enumerate() {
             let function_index = self.module.imported_function_count as usize + defined_index;
+            if !self.live_functions[function_index] {
+                continue;
+            }
             let compiler = FunctionCompiler::new(self, function_index, function)?;
             out.push_str(&compiler.compile()?);
         }
@@ -519,7 +577,10 @@ impl<'a> ModuleCx<'a> {
     }
 
     fn emit_import_aliases(&self, out: &mut String) {
-        for name in &self.import_function_names {
+        for (function_index, name) in self.import_function_names.iter().enumerate() {
+            if !self.live_functions[function_index] {
+                continue;
+            }
             write!(out, "var {name}=foreign.{name};").unwrap();
         }
         if self.module.function_type_indices[..self.module.imported_function_count as usize]
@@ -555,7 +616,7 @@ impl<'a> ModuleCx<'a> {
             let ty = self.module.types.get(type_index as usize).ok_or_else(|| {
                 CompileError::new(ErrorKind::Internal, "wasm2asm: invalid dispatcher type")
             })?;
-            let params = parameter_values(&ty.params, "$d");
+            let params = parameter_values(&ty.params);
             let flat = flatten_names(&params);
             write!(out, "function I{}(x", short_index(type_index as usize)).unwrap();
             for name in &flat {
@@ -591,7 +652,7 @@ impl<'a> ModuleCx<'a> {
             for (function_index, function_type) in
                 self.module.function_type_indices.iter().enumerate()
             {
-                if *function_type != type_index {
+                if *function_type != type_index || !self.live_functions[function_index] {
                     continue;
                 }
                 write!(out, "case {}:", function_index + 1).unwrap();
@@ -914,13 +975,12 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         function: &'a Function,
     ) -> Result<Self, CompileError> {
         let ty = module.function_type(function_index)?;
-        let mut locals = parameter_values(&ty.params, "$a");
-        let first_local = locals.len();
-        for (offset, &local) in function.locals.iter().enumerate() {
-            locals.push(named_value(
-                local,
-                &format!("$l{}", short_index(first_local + offset)),
-            ));
+        let mut locals = parameter_values(&ty.params);
+        let mut next_local = flatten_names(&locals).len();
+        for &local in &function.locals {
+            let value = named_value(local, &local_ident(next_local));
+            next_local += value.components().len();
+            locals.push(value);
         }
         Ok(Self {
             module,
@@ -934,7 +994,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             temp_slots: Vec::new(),
             instruction_temps: Vec::new(),
             body: String::new(),
-            temp_index: 0,
+            temp_index: next_local,
             label_index: 0,
             reachable: true,
         })
@@ -1312,7 +1372,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         }
         self.stack.extend(stored_params.iter().cloned());
         let result_values = sig.results.iter().map(|&t| self.temp(t)).collect();
-        let label = format!("$b{}", short_index(self.label_index));
+        let label = format!("L{}", short_index(self.label_index));
         self.label_index += 1;
         match kind {
             ControlKind::Block => write!(self.body, "{label}:{{").unwrap(),
@@ -2076,12 +2136,21 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             .memories
             .get(arg.memory as usize)
             .ok_or_else(|| self.internal("invalid memory index"))?;
+        let compact = arg.memory == 0
+            && self.module.module.memories.len() == 1
+            && !memory.memory64
+            && arg.offset <= u32::MAX as u64;
         let (lo, hi) = self.pop_address(memory.memory64)?;
         let code = load_code(op);
-        let call = format!(
-            "LI({}|0,({lo})|0,({hi})|0,+{},{}|0)",
-            arg.memory, arg.offset, code
-        );
+        let compact_address = compact.then(|| compact_memory_address(&lo, arg.offset));
+        let call = if let Some(address) = &compact_address {
+            format!("l({address},{code})")
+        } else {
+            format!(
+                "LI({}|0,({lo})|0,({hi})|0,+{},{}|0)",
+                arg.memory, arg.offset, code
+            )
+        };
         match op {
             LoadOp::I64 => {
                 let low = self.temp(ValType::I32);
@@ -2114,28 +2183,46 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             }
             LoadOp::F32 => {
                 let value = self.temp(ValType::F32);
-                write!(
-                    self.body,
-                    "{}=F(+LF({}|0,({lo})|0,({hi})|0,+{},{}|0));",
-                    value.components()[0],
-                    arg.memory,
-                    arg.offset,
-                    code
-                )
-                .unwrap();
+                if let Some(address) = compact_address {
+                    write!(
+                        self.body,
+                        "{}=F(+lf({address},{code}));",
+                        value.components()[0]
+                    )
+                    .unwrap();
+                } else {
+                    write!(
+                        self.body,
+                        "{}=F(+LF({}|0,({lo})|0,({hi})|0,+{},{}|0));",
+                        value.components()[0],
+                        arg.memory,
+                        arg.offset,
+                        code
+                    )
+                    .unwrap();
+                }
                 self.stack.push(value);
             }
             LoadOp::F64 => {
                 let value = self.temp(ValType::F64);
-                write!(
-                    self.body,
-                    "{}=+LF({}|0,({lo})|0,({hi})|0,+{},{}|0);",
-                    value.components()[0],
-                    arg.memory,
-                    arg.offset,
-                    code
-                )
-                .unwrap();
+                if let Some(address) = compact_address {
+                    write!(
+                        self.body,
+                        "{}=+lf({address},{code});",
+                        value.components()[0]
+                    )
+                    .unwrap();
+                } else {
+                    write!(
+                        self.body,
+                        "{}=+LF({}|0,({lo})|0,({hi})|0,+{},{}|0);",
+                        value.components()[0],
+                        arg.memory,
+                        arg.offset,
+                        code
+                    )
+                    .unwrap();
+                }
                 self.stack.push(value);
             }
             _ => {
@@ -2155,8 +2242,35 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             .memories
             .get(arg.memory as usize)
             .ok_or_else(|| self.internal("invalid memory index"))?;
+        let compact = arg.memory == 0
+            && self.module.module.memories.len() == 1
+            && !memory.memory64
+            && arg.offset <= u32::MAX as u64;
         let (lo, hi) = self.pop_address(memory.memory64)?;
         let code = store_code(op);
+        if let Some(address) = compact.then(|| compact_memory_address(&lo, arg.offset)) {
+            match op {
+                StoreOp::F32 | StoreOp::F64 => {
+                    let value = coerce(ValType::F64, &expect_float(value)?);
+                    write!(self.body, "sf({address},{code},{value});").unwrap();
+                }
+                StoreOp::I64 | StoreOp::I64_8 | StoreOp::I64_16 | StoreOp::I64_32 => {
+                    let (value_lo, value_hi) = expect_i64(value)?;
+                    write!(
+                        self.body,
+                        "st({address},{code},({value_lo})|0,({value_hi})|0);"
+                    )
+                    .unwrap();
+                }
+                _ => write!(
+                    self.body,
+                    "st({address},{code},({})|0,0);",
+                    value.i32_expr()?
+                )
+                .unwrap(),
+            }
+            return Ok(());
+        }
         match op {
             StoreOp::F32 | StoreOp::F64 => {
                 let value = expect_float(value)?;
@@ -2504,7 +2618,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let index = if let Some(index) = reusable {
             index
         } else {
-            let base = format!("$t{}", short_index(self.temp_index));
+            let base = local_ident(self.temp_index);
             self.temp_index += 1;
             let value = named_value(ty, &base);
             for name in value.components() {
@@ -2611,11 +2725,21 @@ fn named_value(ty: ValType, base: &str) -> Value {
         ValType::V128 => Value::V128(std::array::from_fn(|i| format!("{base}{i}"))),
     }
 }
-fn parameter_values(types: &[ValType], prefix: &str) -> Vec<Value> {
+fn compact_memory_address(lo: &str, offset: u64) -> String {
+    if offset == 0 {
+        format!("({lo})|0")
+    } else {
+        format!("(({lo})+{offset})|0")
+    }
+}
+fn local_ident(index: usize) -> String {
+    compact_index(index)
+}
+fn parameter_values(types: &[ValType]) -> Vec<Value> {
     types
         .iter()
         .enumerate()
-        .map(|(i, &ty)| named_value(ty, &format!("{prefix}{}", short_index(i))))
+        .map(|(i, &ty)| named_value(ty, &local_ident(i)))
         .collect()
 }
 fn flatten_names(values: &[Value]) -> Vec<String> {
@@ -3071,10 +3195,60 @@ fn store_code(op: StoreOp) -> u8 {
         I64_32 => 8,
     }
 }
+fn function_ident(index: usize) -> String {
+    let mut candidate = 0;
+    let mut remaining = index;
+    loop {
+        let name = js_ident(candidate, true);
+        if !is_reserved_function(&name) {
+            if remaining == 0 {
+                return name;
+            }
+            remaining -= 1;
+        }
+        candidate += 1;
+    }
+}
+fn is_reserved_function(name: &str) -> bool {
+    matches!(
+        name,
+        "AA" | "AB"
+            | "AC"
+            | "C"
+            | "DD"
+            | "ED"
+            | "F"
+            | "G"
+            | "GH"
+            | "IC"
+            | "IG"
+            | "K"
+            | "L"
+            | "LI"
+            | "LF"
+            | "MS"
+            | "N"
+            | "O"
+            | "P"
+            | "Q"
+            | "R"
+            | "RS"
+            | "SI"
+            | "SF"
+            | "TS"
+            | "U"
+            | "V"
+            | "VL"
+            | "VS"
+            | "W"
+            | "X"
+            | "Y"
+    )
+}
 fn js_ident(index: usize, upper: bool) -> String {
     let mut n = index;
     let first = if upper { b'A' } else { b'a' };
-    let mut s = String::from("$");
+    let mut s = String::new();
     loop {
         s.push((first + (n % 26) as u8) as char);
         n /= 26;
@@ -3091,6 +3265,21 @@ fn short_index(index: usize) -> String {
     loop {
         s.push((b'a' + (n % 26) as u8) as char);
         n /= 26;
+        if n == 0 {
+            break;
+        }
+        n -= 1;
+    }
+    s
+}
+fn compact_index(index: usize) -> String {
+    // Keep generated locals out of helper aliases and JavaScript keywords.
+    const ALPHABET: &[u8] = b"abdehijkquz";
+    let mut n = index;
+    let mut s = String::new();
+    loop {
+        s.push(ALPHABET[n % ALPHABET.len()] as char);
+        n /= ALPHABET.len();
         if n == 0 {
             break;
         }
@@ -3141,6 +3330,12 @@ function dv(al,ah,bl,bh,sg,rm){al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;sg=sg|0;rm=rm|0;v
 
 function W(o,al,ah,bl,bh){o=o|0;al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;var l=0,h=0,n=0,a0=0,a1=0,a2=0,a3=0,b0=0,b1=0,b2=0,b3=0,c0=0,c1=0,c2=0,c3=0;if(o==0){l=al+bl|0;hi=ah+bh+((l>>>0)<(al>>>0))|0;return l}if(o==1){l=al-bl|0;hi=ah-bh-((al>>>0)<(bl>>>0))|0;return l}if(o==2){a0=al&65535;a1=al>>>16;a2=ah&65535;a3=ah>>>16;b0=bl&65535;b1=bl>>>16;b2=bh&65535;b3=bh>>>16;c0=a0*b0;c1=a1*b0+a0*b1+M.floor(c0/65536);c2=a2*b0+a1*b1+a0*b2+M.floor(c1/65536);c3=a3*b0+a2*b1+a1*b2+a0*b3+M.floor(c2/65536);l=(c0&65535)|((c1&65535)<<16);hi=(c2&65535)|((c3&65535)<<16);return l}if(o==3){hi=ah&bh;return al&bl}if(o==4){hi=ah|bh;return al|bl}if(o==5){hi=ah^bh;return al^bl}if(o>=11)return dv(al,ah,bl,bh,(o==11||o==13)|0,(o==13||o==14)|0)|0;n=bl&63;if(!n){hi=ah;return al}if(o==6){if(n<32){hi=(ah<<n)|(al>>>(32-n));return al<<n}hi=al<<(n-32);return 0}if(o==7){if(n<32){hi=ah>>n;return (al>>>n)|(ah<<(32-n))}hi=ah>>31;return ah>>(n-32)}if(o==8){if(n<32){hi=ah>>>n;return (al>>>n)|(ah<<(32-n))}hi=0;return ah>>>(n-32)}if(o==9){if(n<32){hi=(ah<<n)|(al>>>(32-n));return (al<<n)|(ah>>>(32-n))}n=n-32;hi=(al<<n)|(ah>>>(32-n));return (ah<<n)|(al>>>(32-n))}if(n<32){hi=(ah>>>n)|(al<<(32-n));return (al>>>n)|(ah<<(32-n))}n=n-32;hi=(al>>>n)|(ah<<(32-n));return (ah>>>n)|(al<<(32-n))}
 function AA(k,l,h,o,w){k=k|0;l=l|0;h=h|0;o=+o;w=w|0;var x=0;if(h||o>4294967295)X();x=(l>>>0)+o;if(x<0||x+w>s[k])X();return (a[k]+x)|0}
+function l(a,t){a=a|0;t=t|0;var x=AA(0,a,0,0,t==1?8:t==6||t==7||t==10||t==11?2:t==4||t==5||t==8||t==9?1:4);if(t==1){hi=V.getInt32(x+4,true);return V.getUint32(x,true)|0}if(t==4||t==8)return V.getInt8(x)|0;if(t==5||t==9)return V.getUint8(x)|0;if(t==6||t==10)return V.getInt16(x,true)|0;if(t==7||t==11)return V.getUint16(x,true)|0;if(t==12)return V.getInt32(x,true)|0;if(t==13)return V.getUint32(x,true)|0;return V.getInt32(x,true)|0}
+function lf(a,t){a=a|0;t=t|0;var x=AA(0,a,0,0,t==3?8:4);return t==3?V.getFloat64(x,true):V.getFloat32(x,true)}
+function st(a,t,v,w){a=a|0;t=t|0;v=v|0;w=w|0;var x=AA(0,a,0,0,t==1?8:t==5||t==7?2:t==4||t==6?1:4);if(t==1){V.setInt32(x,v,true);V.setInt32(x+4,w,true)}else if(t==4||t==6)V.setInt8(x,v);else if(t==5||t==7)V.setInt16(x,v,true);else V.setInt32(x,v,true)}
+function sf(a,t,v){a=a|0;t=t|0;v=+v;var x=AA(0,a,0,0,t==3?8:4);if(t==3)V.setFloat64(x,v,true);else V.setFloat32(x,v,true)}
+function vl(a,i){a=a|0;i=i|0;var x=AA(0,a,0,0,16);return V.getInt32(x+i*4,true)|0}
+function vs(a,v0,v1,v2,v3){a=a|0;v0=v0|0;v1=v1|0;v2=v2|0;v3=v3|0;var x=AA(0,a,0,0,16);V.setInt32(x,v0,true);V.setInt32(x+4,v1,true);V.setInt32(x+8,v2,true);V.setInt32(x+12,v3,true)}
 function G(k,d){k=k|0;d=d|0;var old=0,add=0,ns=0,total=0,x=0,y=0,nb=null,nh=null;if(d<0)return -1;old=s[k]/p[k]|0;add=(d>>>0)*p[k];ns=s[k]+add;if(ns>4294967295||m[k]>=0&&ns>m[k])return -1;for(x=0;x<s.length;x++)total+=x==k?ns:s[x];if(total>4294967295)return -1;nb=new ArrayBuffer(total);nh=new Uint8Array(nb);for(x=0,y=0;x<s.length;x++){nh.set(new Uint8Array(B,a[x],s[x]),y);a[x]=y;y+=x==k?ns:s[x]}s[k]=ns;B=r.b=nb;V=new DataView(B);H=new Uint8Array(B);return old}
 function IC(al,ah,bl,bh,o){al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;o=o|0;if((o|0)==0)return ((al==bl)&(ah==bh))|0;if((o|0)==1)return ((al!=bl)|(ah!=bh))|0;if((o|0)==2)return ((ah<bh)|((ah==bh)&((al>>>0)<(bl>>>0))))|0;if((o|0)==3)return (((ah>>>0)<(bh>>>0))|((ah==bh)&((al>>>0)<(bl>>>0))))|0;if((o|0)==4)return ((ah>bh)|((ah==bh)&((al>>>0)>(bl>>>0))))|0;if((o|0)==5)return (((ah>>>0)>(bh>>>0))|((ah==bh)&((al>>>0)>(bl>>>0))))|0;if((o|0)==6)return ((ah<bh)|((ah==bh)&((al>>>0)<=(bl>>>0))))|0;if((o|0)==7)return (((ah>>>0)<(bh>>>0))|((ah==bh)&((al>>>0)<=(bl>>>0))))|0;if((o|0)==8)return ((ah>bh)|((ah==bh)&((al>>>0)>=(bl>>>0))))|0;if((o|0)==9)return (((ah>>>0)>(bh>>>0))|((ah==bh)&((al>>>0)>=(bl>>>0))))|0;return 0}
 function AB(dm,sm,d,sr,n){dm=dm|0;sm=sm|0;d=d>>>0;sr=sr>>>0;n=n>>>0;var da=AA(dm,d,0,0,n),sa=AA(sm,sr,0,0,n),i=0;if(da>sa&&da<sa+n)for(i=n-1;i>=0;i--)H[da+i]=H[sa+i];else for(i=0;i<n;i++)H[da+i]=H[sa+i]}
