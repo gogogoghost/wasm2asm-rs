@@ -36,6 +36,84 @@ fn scalar_add_runs() {
 }
 
 #[test]
+fn nested_float_additions_generate_valid_javascript() {
+    let wat = r#"(module
+      (func (export "sum") (result f64)
+        f64.const 1
+        f64.const 2
+        f64.add
+        f64.const 3
+        f64.const 4
+        f64.add
+        f64.add))"#;
+    assert_eq!(run(wat, "instantiate({}).sum()"), "10");
+}
+
+#[test]
+fn i64_select_runs_in_strict_module() {
+    let wat = r#"(module
+      (func (export "pick") (param i32 i64 i64) (result i64)
+        local.get 1
+        local.get 2
+        local.get 0
+        select))"#;
+    assert_eq!(
+        run(
+            wat,
+            "(()=>{let m=instantiate({});let low=m.pick(1,11,0,22,0);return [low,m.getTempRet0()]})()"
+        ),
+        "11,0"
+    );
+}
+
+#[test]
+fn i64_comparison_runs_in_strict_module() {
+    let wat = r#"(module
+      (func (export "lt") (param i64 i64) (result i32)
+        local.get 0
+        local.get 1
+        i64.lt_s))"#;
+    assert_eq!(
+        run(
+            wat,
+            "(()=>{let m=instantiate({});return [m.lt(-1,-1,0,0),m.lt(0,0,-1,-1),m.lt(0,0,1,0)]})()"
+        ),
+        "1,0,1"
+    );
+}
+
+#[test]
+fn pooled_temporaries_preserve_loop_state() {
+    let wat = r#"(module
+      (func (export "sum") (param $n i32) (result i32)
+        (local $i i32) (local $acc i32)
+        local.get $n
+        local.set $i
+        i32.const 0
+        local.set $acc
+        block $exit
+          loop $loop
+            local.get $i
+            i32.eqz
+            br_if $exit
+            local.get $acc
+            local.get $i
+            i32.const 3
+            i32.mul
+            i32.add
+            local.set $acc
+            local.get $i
+            i32.const 1
+            i32.sub
+            local.set $i
+            br $loop
+          end
+        end
+        local.get $acc))"#;
+    assert_eq!(run(wat, "instantiate({}).sum(10)"), "165");
+}
+
+#[test]
 fn memory_round_trip_runs() {
     let wat = r#"(module
       (memory (export "memory") 1 2)

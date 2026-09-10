@@ -366,9 +366,9 @@ impl<'a> ModuleCx<'a> {
         }
         out.push_str("B=r.b;V=new DataView(B);H=new Uint8Array(B);");
         out.push_str(RUNTIME_HELPERS);
-        out.push_str("f.X=X;f.ct=ct;f.pc=pc;f.tr=tr;f.ne=ne;f.mn=mn;f.mx=mx;f.cs=cs;f.rf=rf;f.ri=ri;f.rd=rd;f.wr=wr;f.Y=Y;f.y=y;f.W=W;f.GH=function(){return hi|0};f.AA=AA;f.LI=LI;f.LF=LF;f.SI=SI;f.SF=SF;f.VL=VL;f.VS=VS;f.MS=MS;f.DD=DD;f.ED=ED;f.TS=TS;f.RS=RS;f.IG=IG;f.G=G;f.AB=AB;f.AC=AC;f.K=K;f.N=N;f.O=O;f.P=P;f.Q=Q;f.R=R;f.L=L;");
+        out.push_str("f.X=X;f.ct=ct;f.pc=pc;f.tr=tr;f.ne=ne;f.mn=mn;f.mx=mx;f.cs=cs;f.rf=rf;f.ri=ri;f.rd=rd;f.wr=wr;f.Y=Y;f.y=y;f.W=W;f.GH=function(){return hi|0};f.IC=IC;f.AA=AA;f.LI=LI;f.LF=LF;f.SI=SI;f.SF=SF;f.VL=VL;f.VS=VS;f.MS=MS;f.DD=DD;f.ED=ED;f.TS=TS;f.RS=RS;f.IG=IG;f.G=G;f.AB=AB;f.AC=AC;f.K=K;f.N=N;f.O=O;f.P=P;f.Q=Q;f.R=R;f.L=L;");
         self.emit_outer_initializers(out)?;
-        out.push_str("var x=asmModule({Math:M},f);");
+        out.push_str("var x=asmModule({Math:M,NaN:NaN,Infinity:Infinity},f);");
         if self.module.start.is_some() {
             out.push_str("x.$start();delete x.$start;");
         }
@@ -493,7 +493,7 @@ impl<'a> ModuleCx<'a> {
     }
 
     fn emit_core(&mut self, out: &mut String) -> Result<(), CompileError> {
-        out.push_str("function asmModule(stdlib,foreign){'use asm';var F=stdlib.Math.fround,U=stdlib.Math.imul,C=stdlib.Math.clz32,Ma=stdlib.Math.abs,Mc=stdlib.Math.ceil,Mf=stdlib.Math.floor,Ms=stdlib.Math.sqrt,X=foreign.X,ct=foreign.ct,pc=foreign.pc,tr=foreign.tr,ne=foreign.ne,mn=foreign.mn,mx=foreign.mx,cs=foreign.cs,rf=foreign.rf,ri=foreign.ri,rd=foreign.rd,wr=foreign.wr,Y=foreign.Y,y=foreign.y,W=foreign.W,GH=foreign.GH,AA=foreign.AA,LI=foreign.LI,LF=foreign.LF,SI=foreign.SI,SF=foreign.SF,VL=foreign.VL,VS=foreign.VS,MS=foreign.MS,DD=foreign.DD,ED=foreign.ED,TS=foreign.TS,RS=foreign.RS,IG=foreign.IG,G=foreign.G,AB=foreign.AB,AC=foreign.AC,K=foreign.K,N=foreign.N,O=foreign.O,P=foreign.P,Q=foreign.Q,R=foreign.R,L=foreign.L,");
+        out.push_str("function asmModule(stdlib,foreign){'use asm';var F=stdlib.Math.fround,U=stdlib.Math.imul,C=stdlib.Math.clz32,Ma=stdlib.Math.abs,Mc=stdlib.Math.ceil,Mf=stdlib.Math.floor,Ms=stdlib.Math.sqrt,Na=stdlib.NaN,In=stdlib.Infinity,X=foreign.X,ct=foreign.ct,pc=foreign.pc,tr=foreign.tr,ne=foreign.ne,mn=foreign.mn,mx=foreign.mx,cs=foreign.cs,rf=foreign.rf,ri=foreign.ri,rd=foreign.rd,wr=foreign.wr,Y=foreign.Y,y=foreign.y,W=foreign.W,GH=foreign.GH,IC=foreign.IC,AA=foreign.AA,LI=foreign.LI,LF=foreign.LF,SI=foreign.SI,SF=foreign.SF,VL=foreign.VL,VS=foreign.VS,MS=foreign.MS,DD=foreign.DD,ED=foreign.ED,TS=foreign.TS,RS=foreign.RS,IG=foreign.IG,G=foreign.G,AB=foreign.AB,AC=foreign.AC,K=foreign.K,N=foreign.N,O=foreign.O,P=foreign.P,Q=foreign.Q,R=foreign.R,L=foreign.L,");
         if self.max_return_slots == 0 {
             out.push_str("q0=0;");
         } else {
@@ -836,6 +836,34 @@ impl Value {
             )),
         }
     }
+    fn mentions_identifier(&self, name: &str) -> bool {
+        match self {
+            Self::I32(value) | Self::F32(value) | Self::F64(value) | Self::Ref(value) => {
+                expression_mentions_identifier(value, name)
+            }
+            Self::I64(low, high) => {
+                expression_mentions_identifier(low, name)
+                    || expression_mentions_identifier(high, name)
+            }
+            Self::V128(values) => values
+                .iter()
+                .any(|value| expression_mentions_identifier(value, name)),
+        }
+    }
+}
+
+fn expression_mentions_identifier(expression: &str, name: &str) -> bool {
+    expression.match_indices(name).any(|(offset, _)| {
+        let bytes = expression.as_bytes();
+        let before = offset.checked_sub(1).and_then(|index| bytes.get(index));
+        let after = bytes.get(offset + name.len());
+        before.is_none_or(|byte| !is_js_identifier_byte(*byte))
+            && after.is_none_or(|byte| !is_js_identifier_byte(*byte))
+    })
+}
+
+fn is_js_identifier_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'$')
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -869,6 +897,9 @@ struct FunctionCompiler<'a, 'm> {
     locals: Vec<Value>,
     stack: Vec<Value>,
     controls: Vec<Control>,
+    // Pool temporaries across instructions; the per-instruction set protects Rust-local values.
+    temp_slots: Vec<(String, ValType)>,
+    instruction_temps: Vec<usize>,
     declarations: Vec<(String, ValType)>,
     body: String,
     temp_index: usize,
@@ -900,6 +931,8 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             stack: Vec::new(),
             controls: Vec::new(),
             declarations: Vec::new(),
+            temp_slots: Vec::new(),
+            instruction_temps: Vec::new(),
             body: String::new(),
             temp_index: 0,
             label_index: 0,
@@ -920,12 +953,28 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let param_components: usize = params.iter().map(|v| v.components().len()).sum();
         let all_components = flatten_names(&self.locals);
         let local_components = &all_components[param_components..];
+        let mut has_declarations = false;
         for component in local_components {
+            if has_declarations {
+                out.push(',');
+            } else {
+                out.push_str("var ");
+                has_declarations = true;
+            }
             let ty = component_type(&self.locals, component).unwrap_or(ValType::I32);
-            write!(out, "var {component}={};", zero_literal(ty)).unwrap();
+            write!(out, "{component}={}", zero_literal(ty)).unwrap();
         }
         for (name, ty) in &self.declarations {
-            write!(out, "var {name}={};", zero_literal(*ty)).unwrap();
+            if has_declarations {
+                out.push(',');
+            } else {
+                out.push_str("var ");
+                has_declarations = true;
+            }
+            write!(out, "{name}={}", zero_literal(*ty)).unwrap();
+        }
+        if has_declarations {
+            out.push(';');
         }
         out.push_str(&self.body);
         if self.ty.results.is_empty() {
@@ -953,6 +1002,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
 
     fn emit_instruction(&mut self, instruction: &Instr) -> Result<(), CompileError> {
         use Op::*;
+        self.instruction_temps.clear();
         if !self.reachable
             && !matches!(
                 instruction.op,
@@ -1002,27 +1052,6 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 table_index,
             } => self.emit_indirect(*type_index, *table_index, true, false)?,
             CallRef(type_index) => self.emit_indirect(*type_index, 0, false, true)?,
-            Drop => {
-                self.pop()?;
-            }
-            Select(_) => self.emit_select()?,
-            LocalGet(index) => {
-                let value = self.local(*index)?.clone();
-                let snapshot = self.materialize(&value);
-                self.stack.push(snapshot);
-            }
-            LocalSet(index) => {
-                let value = self.pop()?;
-                let target = self.local(*index)?.clone();
-                self.assign(&target, &value);
-            }
-            LocalTee(index) => {
-                let value = self.pop()?;
-                let target = self.local(*index)?.clone();
-                self.assign(&target, &value);
-                let snapshot = self.materialize(&target);
-                self.stack.push(snapshot);
-            }
             GlobalGet(index) => {
                 let value = self
                     .module
@@ -1030,8 +1059,36 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     .get(*index as usize)
                     .ok_or_else(|| self.internal("invalid global index"))?
                     .clone();
-                let snapshot = self.materialize(&value);
-                self.stack.push(snapshot);
+                if self
+                    .module
+                    .module
+                    .global_types
+                    .get(*index as usize)
+                    .is_some_and(|global| global.mutable)
+                {
+                    let snapshot = self.materialize(&value);
+                    self.stack.push(snapshot);
+                } else {
+                    self.stack.push(value);
+                }
+            }
+            Drop => {
+                self.pop()?;
+            }
+            Select(_) => self.emit_select()?,
+            LocalGet(index) => self.stack.push(self.local(*index)?.clone()),
+            LocalSet(index) => {
+                let value = self.pop()?;
+                let target = self.local(*index)?.clone();
+                self.preserve_local_values(&target);
+                self.assign(&target, &value);
+            }
+            LocalTee(index) => {
+                let value = self.pop()?;
+                let target = self.local(*index)?.clone();
+                self.preserve_local_values(&target);
+                self.assign(&target, &value);
+                self.stack.push(target);
             }
             GlobalSet(index) => {
                 let value = self.pop()?;
@@ -1673,18 +1730,19 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             return Err(self.internal("select type mismatch"));
         }
         let value = match (left, right) {
-            (Value::I32(a), Value::I32(b)) => Value::I32(format!("({condition}?{a}:{b})|0")),
-            (Value::Ref(a), Value::Ref(b)) => Value::Ref(format!("({condition}?{a}:{b})|0")),
-            (Value::F32(a), Value::F32(b)) => Value::F32(format!("F({condition}?{a}:{b})")),
-            (Value::F64(a), Value::F64(b)) => Value::F64(format!("+({condition}?{a}:{b})")),
-            (Value::I64(al, ah), Value::I64(bl, bh)) => Value::I64(
-                format!("({condition}?{al}:{bl})|0"),
-                format!("({condition}?{ah}:{bh})|0"),
-            ),
-            (Value::V128(a), Value::V128(b)) => Value::V128(std::array::from_fn(|i| {
-                format!("({condition}?{}:{})|0", a[i], b[i])
-            })),
-            _ => return Err(self.internal("select type mismatch")),
+            (Value::I32(a), Value::I32(b)) => Value::I32(format!("(({condition})?({a}):({b}))|0")),
+            (Value::Ref(a), Value::Ref(b)) => Value::Ref(format!("(({condition})?({a}):({b}))|0")),
+            (Value::F32(a), Value::F32(b)) => Value::F32(format!("F(({condition})?({a}):({b}))")),
+            (Value::F64(a), Value::F64(b)) => Value::F64(format!("+(({condition})?({a}):({b}))")),
+            (left, right) => {
+                let result = self.temp(left.ty());
+                write!(self.body, "if(({condition})|0){{").unwrap();
+                self.assign(&result, &left);
+                self.body.push_str("}else{");
+                self.assign(&result, &right);
+                self.body.push('}');
+                result
+            }
         };
         self.stack.push(value);
         Ok(())
@@ -1704,17 +1762,17 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             }
             I64Clz => {
                 let (lo, hi) = expect_i64(value)?;
-                Value::I64(
-                    format!("(({hi})|0?C(({hi})|0):32+C(({lo})|0))|0"),
-                    "0".into(),
-                )
+                let result = self.temp(ValType::I32);
+                let target = result.i32_expr()?;
+                write!(self.body, "if(({hi})|0){{{target}=C(({hi})|0)|0;}}else{{{target}=(32+(C(({lo})|0)|0))|0;}}").unwrap();
+                Value::I64(target.into(), "0".into())
             }
             I64Ctz => {
                 let (lo, hi) = expect_i64(value)?;
-                Value::I64(
-                    format!("(({lo})|0?ct(({lo})|0)|0:(32+(ct(({hi})|0)|0))|0)|0"),
-                    "0".into(),
-                )
+                let result = self.temp(ValType::I32);
+                let target = result.i32_expr()?;
+                write!(self.body, "if(({lo})|0){{{target}=ct(({lo})|0)|0;}}else{{{target}=(32+(ct(({hi})|0)|0))|0;}}").unwrap();
+                Value::I64(target.into(), "0".into())
             }
             I64Popcnt => {
                 let (lo, hi) = expect_i64(value)?;
@@ -1762,26 +1820,26 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 let x = expect_float(value)?;
                 self.trunc_i64(x, true, false)?
             }
-            F32ConvertI32S => Value::F32(format!("F({})", value.i32_expr()?)),
+            F32ConvertI32S => Value::F32(format!("F(({})|0)", value.i32_expr()?)),
             F32ConvertI32U => Value::F32(format!("F(({})>>>0)", value.i32_expr()?)),
             F32ConvertI64S => {
                 let (lo, hi) = expect_i64(value)?;
-                Value::F32(format!("F(({hi})*4294967296+(({lo})>>>0))"))
+                Value::F32(format!("F((+(({hi})|0)*4294967296.0)+(+(({lo})>>>0)))"))
             }
             F32ConvertI64U => {
                 let (lo, hi) = expect_i64(value)?;
-                Value::F32(format!("F((({hi})>>>0)*4294967296+(({lo})>>>0))"))
+                Value::F32(format!("F((+(({hi})>>>0)*4294967296.0)+(+(({lo})>>>0)))"))
             }
             F32DemoteF64 => Value::F32(format!("F({})", expect_f64(value)?)),
-            F64ConvertI32S => Value::F64(format!("+({})", value.i32_expr()?)),
+            F64ConvertI32S => Value::F64(format!("+(({})|0)", value.i32_expr()?)),
             F64ConvertI32U => Value::F64(format!("+(({})>>>0)", value.i32_expr()?)),
             F64ConvertI64S => {
                 let (lo, hi) = expect_i64(value)?;
-                Value::F64(format!("+(({hi})*4294967296+(({lo})>>>0))"))
+                Value::F64(format!("+((+(({hi})|0)*4294967296.0)+(+(({lo})>>>0)))"))
             }
             F64ConvertI64U => {
                 let (lo, hi) = expect_i64(value)?;
-                Value::F64(format!("+((({hi})>>>0)*4294967296+(({lo})>>>0))"))
+                Value::F64(format!("+((+(({hi})>>>0)*4294967296.0)+(+(({lo})>>>0)))"))
             }
             F64PromoteF32 => Value::F64(format!("+({})", expect_f32(value)?)),
             I32ReinterpretF32 => Value::I32(format!("rf(+({}))|0", expect_f32(value)?)),
@@ -2100,24 +2158,16 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let (lo, hi) = self.pop_address(memory.memory64)?;
         let code = store_code(op);
         match op {
-            StoreOp::F32 => write!(
-                self.body,
-                "SF({}|0,({lo})|0,({hi})|0,+{},{}|0,+{});",
-                arg.memory,
-                arg.offset,
-                code,
-                expect_f32(value)?
-            )
-            .unwrap(),
-            StoreOp::F64 => write!(
-                self.body,
-                "SF({}|0,({lo})|0,({hi})|0,+{},{}|0,+{});",
-                arg.memory,
-                arg.offset,
-                code,
-                expect_f64(value)?
-            )
-            .unwrap(),
+            StoreOp::F32 | StoreOp::F64 => {
+                let value = expect_float(value)?;
+                let value = coerce(ValType::F64, &value);
+                write!(
+                    self.body,
+                    "SF({}|0,({lo})|0,({hi})|0,+{},{}|0,{value});",
+                    arg.memory, arg.offset, code
+                )
+                .unwrap();
+            }
             StoreOp::I64 | StoreOp::I64_8 | StoreOp::I64_16 | StoreOp::I64_32 => {
                 let (value_lo, value_hi) = expect_i64(value)?;
                 write!(
@@ -2440,14 +2490,51 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             .ok_or_else(|| self.internal("invalid branch depth"))
     }
     fn temp(&mut self, ty: ValType) -> Value {
-        let base = format!("$t{}", short_index(self.temp_index));
-        self.temp_index += 1;
-        let value = named_value(ty, &base);
-        for name in value.components() {
-            self.declarations
-                .push((name.to_string(), component_decl_type(ty, name)));
-        }
-        value
+        // Values from earlier instructions are live only through the operand/control state.
+        let reusable = self
+            .temp_slots
+            .iter()
+            .enumerate()
+            .find(|(index, (base, slot_ty))| {
+                *slot_ty == ty
+                    && !self.instruction_temps.contains(index)
+                    && !self.temp_is_live(base, ty)
+            })
+            .map(|(index, _)| index);
+        let index = if let Some(index) = reusable {
+            index
+        } else {
+            let base = format!("$t{}", short_index(self.temp_index));
+            self.temp_index += 1;
+            let value = named_value(ty, &base);
+            for name in value.components() {
+                self.declarations
+                    .push((name.to_string(), component_decl_type(ty, name)));
+            }
+            self.temp_slots.push((base, ty));
+            self.temp_slots.len() - 1
+        };
+        self.instruction_temps.push(index);
+        named_value(ty, &self.temp_slots[index].0)
+    }
+
+    fn temp_is_live(&self, base: &str, ty: ValType) -> bool {
+        let candidate = named_value(ty, base);
+        let uses_candidate = |value: &Value| {
+            candidate
+                .components()
+                .into_iter()
+                .any(|name| value.mentions_identifier(name))
+        };
+        self.stack.iter().any(uses_candidate)
+            || self
+                .controls
+                .iter()
+                .any(|control| control.params.iter().any(uses_candidate))
+            || self
+                .controls
+                .iter()
+                .any(|control| control.result_values.iter().any(uses_candidate))
     }
     fn assign(&mut self, target: &Value, value: &Value) {
         for (a, b) in target.components().iter().zip(value.components()) {
@@ -2463,6 +2550,18 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let snapshot = self.temp(value.ty());
         self.assign(&snapshot, value);
         snapshot
+    }
+    fn preserve_local_values(&mut self, target: &Value) {
+        let names = target.components();
+        for index in 0..self.stack.len() {
+            if names
+                .iter()
+                .any(|name| self.stack[index].mentions_identifier(name))
+            {
+                let value = self.stack[index].clone();
+                self.stack[index] = self.materialize(&value);
+            }
+        }
     }
     fn internal(&self, message: &str) -> CompileError {
         CompileError::new(
@@ -2505,7 +2604,7 @@ fn component_type(values: &[Value], name: &str) -> Option<ValType> {
 fn named_value(ty: ValType, base: &str) -> Value {
     match ty {
         ValType::I32 => Value::I32(base.into()),
-        ValType::I64 => Value::I64(format!("{base}l"), format!("{base}h")),
+        ValType::I64 => Value::I64(format!("{base}L"), format!("{base}H")),
         ValType::F32 => Value::F32(base.into()),
         ValType::F64 => Value::F64(base.into()),
         ValType::FuncRef(_) => Value::Ref(base.into()),
@@ -2565,7 +2664,7 @@ fn coerce(ty: ValType, value: &str) -> String {
             }
         }
         ValType::F64 => {
-            if value.starts_with('+') {
+            if value.starts_with(['+', '-']) {
                 value.to_string()
             } else {
                 format!("+{value}")
@@ -2669,13 +2768,13 @@ fn i64_const(value: i64) -> Value {
 fn float32_literal(bits: u32) -> String {
     let value = f32::from_bits(bits);
     if value.is_nan() {
-        "NaN".into()
+        "F(Na)".into()
     } else if value == f32::INFINITY {
-        "Infinity".into()
+        "F(In)".into()
     } else if value == f32::NEG_INFINITY {
-        "-Infinity".into()
+        "F(-In)".into()
     } else if bits == 0x80000000 {
-        "-0.0".into()
+        "F(-0.0)".into()
     } else {
         format!("F({:?})", value)
     }
@@ -2683,11 +2782,11 @@ fn float32_literal(bits: u32) -> String {
 fn float64_literal(bits: u64) -> String {
     let value = f64::from_bits(bits);
     if value.is_nan() {
-        "NaN".into()
+        "Na".into()
     } else if value == f64::INFINITY {
-        "Infinity".into()
+        "In".into()
     } else if value == f64::NEG_INFINITY {
-        "-Infinity".into()
+        "-In".into()
     } else if bits == 0x8000000000000000 {
         "-0.0".into()
     } else {
@@ -2904,9 +3003,9 @@ fn float_bin(a: Value, b: Value, op: &str, f32_: bool) -> Result<Value, CompileE
     let a = expect_float(a)?;
     let b = expect_float(b)?;
     Ok(if f32_ {
-        Value::F32(format!("F({a}{op}{b})"))
+        Value::F32(format!("F(({a}){op}({b}))"))
     } else {
-        Value::F64(format!("+({a}{op}{b})"))
+        Value::F64(format!("+(({a}){op}({b}))"))
     })
 }
 fn float_helper(a: Value, b: Value, name: &str, f32_: bool) -> Result<Value, CompileError> {
@@ -2921,24 +3020,22 @@ fn float_helper(a: Value, b: Value, name: &str, f32_: bool) -> Result<Value, Com
 fn i64_compare(a: Value, b: Value, op: BinaryOp) -> Result<Value, CompileError> {
     let (al, ah) = expect_i64(a)?;
     let (bl, bh) = expect_i64(b)?;
-    let e = match op {
-        BinaryOp::I64Eq => format!("({al}=={bl}&&{ah}=={bh})"),
-        BinaryOp::I64Ne => format!("({al}!={bl}||{ah}!={bh})"),
-        BinaryOp::I64LtS => format!("({ah}<{bh}||({ah}=={bh}&&({al}>>>0)<({bl}>>>0)))"),
-        BinaryOp::I64LtU => format!("(({ah}>>>0)<({bh}>>>0)||({ah}=={bh}&&({al}>>>0)<({bl}>>>0)))"),
-        BinaryOp::I64GtS => format!("({ah}>{bh}||({ah}=={bh}&&({al}>>>0)>({bl}>>>0)))"),
-        BinaryOp::I64GtU => format!("(({ah}>>>0)>({bh}>>>0)||({ah}=={bh}&&({al}>>>0)>({bl}>>>0)))"),
-        BinaryOp::I64LeS => format!("!({ah}>{bh}||({ah}=={bh}&&({al}>>>0)>({bl}>>>0)))"),
-        BinaryOp::I64LeU => {
-            format!("!(({ah}>>>0)>({bh}>>>0)||({ah}=={bh}&&({al}>>>0)>({bl}>>>0)))")
-        }
-        BinaryOp::I64GeS => format!("!({ah}<{bh}||({ah}=={bh}&&({al}>>>0)<({bl}>>>0)))"),
-        BinaryOp::I64GeU => {
-            format!("!(({ah}>>>0)<({bh}>>>0)||({ah}=={bh}&&({al}>>>0)<({bl}>>>0)))")
-        }
+    let opcode = match op {
+        BinaryOp::I64Eq => 0,
+        BinaryOp::I64Ne => 1,
+        BinaryOp::I64LtS => 2,
+        BinaryOp::I64LtU => 3,
+        BinaryOp::I64GtS => 4,
+        BinaryOp::I64GtU => 5,
+        BinaryOp::I64LeS => 6,
+        BinaryOp::I64LeU => 7,
+        BinaryOp::I64GeS => 8,
+        BinaryOp::I64GeU => 9,
         _ => unreachable!(),
     };
-    Ok(Value::I32(format!("({e})|0")))
+    Ok(Value::I32(format!(
+        "IC(({al})|0,({ah})|0,({bl})|0,({bh})|0,{opcode}|0)|0"
+    )))
 }
 
 fn load_code(op: LoadOp) -> u8 {
@@ -3045,6 +3142,7 @@ function dv(al,ah,bl,bh,sg,rm){al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;sg=sg|0;rm=rm|0;v
 function W(o,al,ah,bl,bh){o=o|0;al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;var l=0,h=0,n=0,a0=0,a1=0,a2=0,a3=0,b0=0,b1=0,b2=0,b3=0,c0=0,c1=0,c2=0,c3=0;if(o==0){l=al+bl|0;hi=ah+bh+((l>>>0)<(al>>>0))|0;return l}if(o==1){l=al-bl|0;hi=ah-bh-((al>>>0)<(bl>>>0))|0;return l}if(o==2){a0=al&65535;a1=al>>>16;a2=ah&65535;a3=ah>>>16;b0=bl&65535;b1=bl>>>16;b2=bh&65535;b3=bh>>>16;c0=a0*b0;c1=a1*b0+a0*b1+M.floor(c0/65536);c2=a2*b0+a1*b1+a0*b2+M.floor(c1/65536);c3=a3*b0+a2*b1+a1*b2+a0*b3+M.floor(c2/65536);l=(c0&65535)|((c1&65535)<<16);hi=(c2&65535)|((c3&65535)<<16);return l}if(o==3){hi=ah&bh;return al&bl}if(o==4){hi=ah|bh;return al|bl}if(o==5){hi=ah^bh;return al^bl}if(o>=11)return dv(al,ah,bl,bh,(o==11||o==13)|0,(o==13||o==14)|0)|0;n=bl&63;if(!n){hi=ah;return al}if(o==6){if(n<32){hi=(ah<<n)|(al>>>(32-n));return al<<n}hi=al<<(n-32);return 0}if(o==7){if(n<32){hi=ah>>n;return (al>>>n)|(ah<<(32-n))}hi=ah>>31;return ah>>(n-32)}if(o==8){if(n<32){hi=ah>>>n;return (al>>>n)|(ah<<(32-n))}hi=0;return ah>>>(n-32)}if(o==9){if(n<32){hi=(ah<<n)|(al>>>(32-n));return (al<<n)|(ah>>>(32-n))}n=n-32;hi=(al<<n)|(ah>>>(32-n));return (ah<<n)|(al>>>(32-n))}if(n<32){hi=(ah>>>n)|(al<<(32-n));return (al>>>n)|(ah<<(32-n))}n=n-32;hi=(al>>>n)|(ah<<(32-n));return (ah>>>n)|(al<<(32-n))}
 function AA(k,l,h,o,w){k=k|0;l=l|0;h=h|0;o=+o;w=w|0;var x=0;if(h||o>4294967295)X();x=(l>>>0)+o;if(x<0||x+w>s[k])X();return (a[k]+x)|0}
 function G(k,d){k=k|0;d=d|0;var old=0,add=0,ns=0,total=0,x=0,y=0,nb=null,nh=null;if(d<0)return -1;old=s[k]/p[k]|0;add=(d>>>0)*p[k];ns=s[k]+add;if(ns>4294967295||m[k]>=0&&ns>m[k])return -1;for(x=0;x<s.length;x++)total+=x==k?ns:s[x];if(total>4294967295)return -1;nb=new ArrayBuffer(total);nh=new Uint8Array(nb);for(x=0,y=0;x<s.length;x++){nh.set(new Uint8Array(B,a[x],s[x]),y);a[x]=y;y+=x==k?ns:s[x]}s[k]=ns;B=r.b=nb;V=new DataView(B);H=new Uint8Array(B);return old}
+function IC(al,ah,bl,bh,o){al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;o=o|0;if((o|0)==0)return ((al==bl)&(ah==bh))|0;if((o|0)==1)return ((al!=bl)|(ah!=bh))|0;if((o|0)==2)return ((ah<bh)|((ah==bh)&((al>>>0)<(bl>>>0))))|0;if((o|0)==3)return (((ah>>>0)<(bh>>>0))|((ah==bh)&((al>>>0)<(bl>>>0))))|0;if((o|0)==4)return ((ah>bh)|((ah==bh)&((al>>>0)>(bl>>>0))))|0;if((o|0)==5)return (((ah>>>0)>(bh>>>0))|((ah==bh)&((al>>>0)>(bl>>>0))))|0;if((o|0)==6)return ((ah<bh)|((ah==bh)&((al>>>0)<=(bl>>>0))))|0;if((o|0)==7)return (((ah>>>0)<(bh>>>0))|((ah==bh)&((al>>>0)<=(bl>>>0))))|0;if((o|0)==8)return ((ah>bh)|((ah==bh)&((al>>>0)>=(bl>>>0))))|0;if((o|0)==9)return (((ah>>>0)>(bh>>>0))|((ah==bh)&((al>>>0)>=(bl>>>0))))|0;return 0}
 function AB(dm,sm,d,sr,n){dm=dm|0;sm=sm|0;d=d>>>0;sr=sr>>>0;n=n>>>0;var da=AA(dm,d,0,0,n),sa=AA(sm,sr,0,0,n),i=0;if(da>sa&&da<sa+n)for(i=n-1;i>=0;i--)H[da+i]=H[sa+i];else for(i=0;i<n;i++)H[da+i]=H[sa+i]}
 function AC(k,d,v,n){k=k|0;d=d>>>0;v=v|0;n=n>>>0;var x=AA(k,d,0,0,n),i=0;for(i=0;i<n;i++)H[x+i]=v}
 function K(di,k,d,sr,n){di=di|0;k=k|0;d=d>>>0;sr=sr>>>0;n=n>>>0;var x=0,i=0;if(D[di].x||sr+n>D[di].length)X();x=AA(k,d,0,0,n);for(i=0;i<n;i++)H[x+i]=D[di][sr+i]}
