@@ -203,5 +203,5 @@ Features without a valid strict asm.js representation are rejected with a diagno
 
 ## Build-system integration
 
-The generated `asmModule` function is deliberately formatted for strict asm.js validators. Do not allow a JavaScript optimizer, transpiler, or minifier to rewrite its function body. If a build tool modifies generated code, copy the output as a static asset or exclude it from further syntax transformations. The generated output is already compact.
+The generated `asmModule` function is deliberately formatted for strict asm.js validators. Do not allow a JavaScript optimizer, transpiler, or minifier to rewrite its function body. If a build tool modifies generated code, copy the output as a static asset or exclude it from further syntax transformations.
 

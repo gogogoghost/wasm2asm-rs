@@ -206,6 +206,10 @@ fn literal_and_identifier_helpers_cover_all_lexical_cases() {
     assert_eq!(compact_float_argument("+x"), "+x");
     assert_eq!(compact_float_argument("x"), "+x");
     assert_eq!(compact_float_argument("x+y"), "+(x+y)");
+    assert_eq!(compact_condition("((x|0)==0)|0"), "!x");
+    assert_eq!(compact_condition("((x|0)!=0)|0"), "x");
+    assert_eq!(compact_condition("((x|0)<(16|0))|0"), "(x|0)<16");
+    assert_eq!(compact_condition("(x+y)|0"), "(x+y)|0");
     assert_eq!(js_ident(26, false), "aa");
     assert_eq!(js_ident(26, true), "AA");
     assert_eq!(short_index(26), "aa");
@@ -214,7 +218,28 @@ fn literal_and_identifier_helpers_cover_all_lexical_cases() {
         js_string("\"\\\n\r\u{2028}\u{2029}\u{0001}"),
         "\"\\\"\\\\\\n\\r\\u2028\\u2029\\u0001\""
     );
+    assert_eq!(
+        js_byte_string(&[0x41, 0x42, 0xd8, 0, 0, 0x22]),
+        "\"䅂\\ud800\\\"\""
+    );
     assert_eq!(instruction_offset("a", "b"), 0);
+}
+
+#[test]
+fn repeated_static_memory_accesses_are_extracted_without_changing_arguments() {
+    let repeated = "a=l(100|0,0)|0;st(104|0,0,a,0);".repeat(20);
+    let mut compiled = [CompiledFunction {
+        index: 0,
+        code: format!("function A(){{var a=0;{repeated}return a|0}}"),
+    }];
+
+    let helpers = optimize_static_memory_accesses(&mut compiled);
+
+    assert!(helpers.contains("return l(100|0,0)|0"));
+    assert!(helpers.contains("st(104|0,0|0,a|0,0|0)"));
+    assert!(!compiled[0].code.contains("l(100|0,0)"));
+    assert!(!compiled[0].code.contains("st(104|0,0,a,0)"));
+    assert_eq!(compiled[0].code.matches("(a);").count(), 20);
 }
 
 #[test]

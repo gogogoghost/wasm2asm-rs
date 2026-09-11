@@ -215,6 +215,49 @@ fn reachable_functions(module: &Module) -> (Vec<bool>, BTreeSet<u32>) {
     (live, indirect_types)
 }
 
+type OffsetHelpers = BTreeMap<(u64, u8), String>;
+
+fn memory_offset_helpers(
+    module: &Module,
+    live_functions: &[bool],
+) -> (OffsetHelpers, OffsetHelpers) {
+    if module.memories.len() != 1 || module.memories[0].memory64 {
+        return (BTreeMap::new(), BTreeMap::new());
+    }
+    let mut loads = BTreeMap::<(u64, u8), usize>::new();
+    let mut stores = BTreeMap::<(u64, u8), usize>::new();
+    for (defined, function) in module.functions.iter().enumerate() {
+        let index = module.imported_function_count as usize + defined;
+        if !live_functions[index] {
+            continue;
+        }
+        for instruction in &function.body {
+            match instruction.op {
+                Op::Load(op, arg) if arg.memory == 0 && arg.offset != 0 => {
+                    *loads.entry((arg.offset, load_code(op))).or_default() += 1;
+                }
+                Op::Store(op, arg) if arg.memory == 0 && arg.offset != 0 => {
+                    *stores.entry((arg.offset, store_code(op))).or_default() += 1;
+                }
+                _ => {}
+            }
+        }
+    }
+    let loads = loads
+        .into_iter()
+        .filter(|(_, count)| *count >= 16)
+        .enumerate()
+        .map(|(index, (key, _))| (key, format!("$l{}", short_index(index))))
+        .collect();
+    let stores = stores
+        .into_iter()
+        .filter(|(_, count)| *count >= 16)
+        .enumerate()
+        .map(|(index, (key, _))| (key, format!("$s{}", short_index(index))))
+        .collect();
+    (loads, stores)
+}
+
 struct ModuleCx<'a> {
     module: &'a Module,
     options: &'a CompileOptions,
@@ -225,6 +268,8 @@ struct ModuleCx<'a> {
     return_slot_counts: [usize; 3],
     indirect_types: BTreeSet<u32>,
     live_functions: Vec<bool>,
+    load_offset_helpers: OffsetHelpers,
+    store_offset_helpers: OffsetHelpers,
 }
 
 impl<'a> ModuleCx<'a> {
@@ -240,6 +285,8 @@ impl<'a> ModuleCx<'a> {
             global_names.push(named_value(ty.ty, &format!("$g{}", short_index(index))));
         }
         let (live_functions, indirect_types) = reachable_functions(module);
+        let (load_offset_helpers, store_offset_helpers) =
+            memory_offset_helpers(module, &live_functions);
         let (return_slot_counts, return_slots) = return_slot_layout(module);
         Ok(Self {
             module,
@@ -251,6 +298,8 @@ impl<'a> ModuleCx<'a> {
             return_slot_counts,
             indirect_types,
             live_functions,
+            load_offset_helpers,
+            store_offset_helpers,
         })
     }
 
@@ -381,16 +430,13 @@ impl<'a> ModuleCx<'a> {
         }
 
         for (index, segment) in self.module.data.iter().enumerate() {
-            write!(out, "r.d[{index}]=[").unwrap();
-            for (position, byte) in segment.bytes.iter().enumerate() {
-                if position != 0 {
-                    out.push(',');
-                }
-                write!(out, "{byte}").unwrap();
-            }
-            out.push_str("];r.d[");
-            write!(out, "{index}").unwrap();
-            out.push_str("].x=0;");
+            write!(
+                out,
+                "r.d[{index}]={{b:{},n:{},x:0}};",
+                js_byte_string(&segment.bytes),
+                segment.bytes.len()
+            )
+            .unwrap();
         }
         for (index, element) in self.module.elements.iter().enumerate() {
             write!(out, "r.e[{index}]=[").unwrap();
@@ -585,6 +631,7 @@ impl<'a> ModuleCx<'a> {
         if self.module.memories.iter().any(|memory| !memory.memory64) {
             out.push_str("function B0(a,o){a=a|0;o=o|0;if((a>>>0)>=((-o)>>>0))X();return (a+o)|0}function l2(a,o,t){a=a|0;o=o|0;t=t|0;return l(B0(a,o)|0,t|0)|0}function lf2(a,o,t){a=a|0;o=o|0;t=t|0;return +lf(B0(a,o)|0,t|0)}function st2(a,o,t,v,w){a=a|0;o=o|0;t=t|0;v=v|0;w=w|0;st(B0(a,o)|0,t|0,v|0,w|0)}function sf2(a,o,t,v){a=a|0;o=o|0;t=t|0;v=+v;sf(B0(a,o)|0,t|0,+v)}");
         }
+        self.emit_memory_offset_helpers(out);
         self.emit_dispatchers(out)?;
         let mut compiled = Vec::new();
         for (defined_index, function) in self.module.functions.iter().enumerate() {
@@ -598,10 +645,51 @@ impl<'a> ModuleCx<'a> {
                 code: compiler.compile()?,
             });
         }
+        let static_memory_helpers = optimize_static_memory_accesses(&mut compiled);
+        out.push_str(&static_memory_helpers);
         self.emit_compiled_functions(out, &compiled)?;
         self.emit_export_object(out)?;
         out.push('}');
         Ok(())
+    }
+
+    fn emit_memory_offset_helpers(&self, out: &mut String) {
+        for (&(offset, code), name) in &self.load_offset_helpers {
+            if matches!(code, 2 | 3) {
+                write!(
+                    out,
+                    "function {name}(a){{a=a|0;return +lf2(a,{offset},{code})}}"
+                )
+                .unwrap();
+            } else {
+                write!(
+                    out,
+                    "function {name}(a){{a=a|0;return l2(a,{offset},{code})|0}}"
+                )
+                .unwrap();
+            }
+        }
+        for (&(offset, code), name) in &self.store_offset_helpers {
+            if matches!(code, 2 | 3) {
+                write!(
+                    out,
+                    "function {name}(a,v){{a=a|0;v=+v;sf2(a,{offset},{code},+v)}}"
+                )
+                .unwrap();
+            } else if matches!(code, 1 | 6 | 7 | 8) {
+                write!(
+                    out,
+                    "function {name}(a,v,w){{a=a|0;v=v|0;w=w|0;st2(a,{offset},{code},v,w)}}"
+                )
+                .unwrap();
+            } else {
+                write!(
+                    out,
+                    "function {name}(a,v){{a=a|0;v=v|0;st2(a,{offset},{code},v,0)}}"
+                )
+                .unwrap();
+            }
+        }
     }
 
     fn emit_compiled_functions(
@@ -1177,6 +1265,8 @@ struct Control {
     kind: ControlKind,
     label: String,
     base: usize,
+    label_start: usize,
+    label_used: bool,
     params: Vec<Value>,
     results: Vec<ValType>,
     result_values: Vec<Value>,
@@ -1334,7 +1424,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             Loop(sig) => self.begin_control(ControlKind::Loop, sig.clone())?,
             If(sig) => {
                 let condition = if self.reachable {
-                    self.pop_i32()?.to_string()
+                    compact_condition(&self.pop_i32()?)
                 } else {
                     "0".into()
                 };
@@ -1607,8 +1697,9 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         }
         self.stack.extend(stored_params.iter().cloned());
         let result_values = sig.results.iter().map(|&t| self.temp(t)).collect();
-        let label = format!("L{}", short_index(self.label_index));
+        let label = compact_index(self.label_index);
         self.label_index += 1;
+        let label_start = self.body.len();
         match kind {
             ControlKind::Block => write!(self.body, "{label}:{{").unwrap(),
             ControlKind::Loop => write!(self.body, "{label}:for(;;){{").unwrap(),
@@ -1622,6 +1713,8 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         self.controls.push(Control {
             kind,
             label,
+            label_start,
+            label_used: false,
             base,
             params: stored_params,
             results: sig.results,
@@ -1677,11 +1770,17 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         match control.kind {
             ControlKind::Loop => {
                 if self.reachable {
-                    write!(self.body, "break {};", control.label).unwrap();
+                    self.body.push_str("break;");
                 }
                 self.body.push('}');
             }
             _ => self.body.push('}'),
+        }
+        if !control.label_used {
+            self.body.replace_range(
+                control.label_start..control.label_start + control.label.len() + 1,
+                "",
+            );
         }
         let after = match control.kind {
             ControlKind::If if control.seen_else => {
@@ -1714,12 +1813,17 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     }
 
     fn emit_br_if(&mut self, depth: u32) -> Result<(), CompileError> {
-        let condition = self.pop_i32()?;
+        let condition = compact_condition(&self.pop_i32()?);
         let target = self.target_index(depth)?;
         let values = self.peek_types(&self.branch_types(target))?;
-        write!(self.body, "if({condition}){{").unwrap();
-        self.emit_branch_to_index(target, &values)?;
-        self.body.push('}');
+        if values.is_empty() {
+            write!(self.body, "if({condition})").unwrap();
+            self.emit_branch_to_index(target, &values)?;
+        } else {
+            write!(self.body, "if({condition}){{").unwrap();
+            self.emit_branch_to_index(target, &values)?;
+            self.body.push('}');
+        }
         Ok(())
     }
 
@@ -1745,11 +1849,8 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         target: usize,
         values: &[Value],
     ) -> Result<(), CompileError> {
-        let control = self
-            .controls
-            .get(target)
-            .ok_or_else(|| self.internal("invalid branch target"))?
-            .clone();
+        self.controls[target].label_used = true;
+        let control = self.controls[target].clone();
         let targets = if control.kind == ControlKind::Loop {
             control.params
         } else {
@@ -2380,9 +2481,12 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let compact_address = compact.then(|| compact_memory_address(&lo, arg.offset));
         let lo_i32 = compact_i32(&lo);
         let hi_i32 = compact_i32(&hi);
+        let offset_helper = self.module.load_offset_helpers.get(&(arg.offset, code));
         let call = if let Some(address) = &compact_address {
             if arg.offset == 0 {
                 format!("l({address},{code})")
+            } else if let Some(helper) = offset_helper {
+                format!("{helper}({address})")
             } else {
                 format!("l2({address},{},{code})", arg.offset)
             }
@@ -2395,6 +2499,8 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let float_call = compact_address.as_ref().map(|address| {
             if arg.offset == 0 {
                 format!("lf({address},{code})")
+            } else if let Some(helper) = offset_helper {
+                format!("{helper}({address})")
             } else {
                 format!("lf2({address},{},{code})", arg.offset)
             }
@@ -2488,12 +2594,15 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let lo_i32 = compact_i32(&lo);
         let hi_i32 = compact_i32(&hi);
         let code = store_code(op);
+        let offset_helper = self.module.store_offset_helpers.get(&(arg.offset, code));
         if let Some(address) = compact.then(|| compact_memory_address(&lo, arg.offset)) {
             match op {
                 StoreOp::F32 | StoreOp::F64 => {
                     let value = coerce(ValType::F64, &expect_float(value)?);
                     if arg.offset == 0 {
                         write!(self.body, "sf({address},{code},{value});").unwrap();
+                    } else if let Some(helper) = offset_helper {
+                        write!(self.body, "{helper}({address},{value});").unwrap();
                     } else {
                         write!(self.body, "sf2({address},{},{code},{value});", arg.offset).unwrap();
                     }
@@ -2504,6 +2613,14 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                         write!(
                             self.body,
                             "st({address},{code},{},{});",
+                            compact_i32(&value_lo),
+                            compact_i32(&value_hi)
+                        )
+                        .unwrap();
+                    } else if let Some(helper) = offset_helper {
+                        write!(
+                            self.body,
+                            "{helper}({address},{},{});",
                             compact_i32(&value_lo),
                             compact_i32(&value_hi)
                         )
@@ -2523,6 +2640,8 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     let value = compact_i32(value.i32_expr()?);
                     if arg.offset == 0 {
                         write!(self.body, "st({address},{code},{value},0);").unwrap();
+                    } else if let Some(helper) = offset_helper {
+                        write!(self.body, "{helper}({address},{value});").unwrap();
                     } else {
                         write!(self.body, "st2({address},{},{code},{value},0);", arg.offset)
                             .unwrap();
@@ -2912,6 +3031,166 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     }
 }
 
+fn generated_call_arguments<'a>(
+    source: &'a str,
+    start: usize,
+    name: &str,
+) -> Option<(usize, Vec<&'a str>)> {
+    if start != 0 && is_js_identifier_byte(source.as_bytes()[start - 1]) {
+        return None;
+    }
+    let open = start + name.len();
+    if source.as_bytes().get(open) != Some(&b'(') {
+        return None;
+    }
+    let bytes = source.as_bytes();
+    let mut arguments = Vec::new();
+    let mut argument_start = open + 1;
+    let mut depth = 0usize;
+    let mut index = argument_start;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' if depth == 0 => {
+                arguments.push(&source[argument_start..index]);
+                return Some((index + 1, arguments));
+            }
+            b')' => depth -= 1,
+            b',' if depth == 0 => {
+                arguments.push(&source[argument_start..index]);
+                argument_start = index + 1;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn static_memory_key(arguments: &[&str]) -> Option<(i32, u8)> {
+    let address = arguments.first()?.strip_suffix("|0")?.parse().ok()?;
+    let code = arguments.get(1)?.parse().ok()?;
+    Some((address, code))
+}
+
+fn static_store_key(arguments: &[&str]) -> Option<(i32, u8)> {
+    if arguments.len() != 4 {
+        return None;
+    }
+    let key = static_memory_key(arguments)?;
+    if !matches!(key.1, 1 | 6 | 7 | 8) && arguments[3] != "0" {
+        return None;
+    }
+    Some(key)
+}
+
+fn optimize_static_memory_accesses(compiled: &mut [CompiledFunction]) -> String {
+    let mut load_counts = BTreeMap::<(i32, u8), usize>::new();
+    let mut store_counts = BTreeMap::<(i32, u8), usize>::new();
+    for function in compiled.iter() {
+        for (start, _) in function.code.match_indices("l(") {
+            if let Some((_, arguments)) = generated_call_arguments(&function.code, start, "l")
+                && arguments.len() == 2
+                && let Some(key) = static_memory_key(&arguments)
+            {
+                *load_counts.entry(key).or_default() += 1;
+            }
+        }
+        for (start, _) in function.code.match_indices("st(") {
+            if let Some((_, arguments)) = generated_call_arguments(&function.code, start, "st")
+                && let Some(key) = static_store_key(&arguments)
+            {
+                *store_counts.entry(key).or_default() += 1;
+            }
+        }
+    }
+
+    let mut definitions = String::new();
+    let mut load_helpers = BTreeMap::new();
+    for (key @ (address, code), count) in load_counts {
+        let name = format!("$c{}", short_index(load_helpers.len()));
+        let original = format!("l({address}|0,{code})");
+        let replacement = format!("{name}()");
+        let definition = format!("function {name}(){{return l({address}|0,{code})|0}}");
+        if original.len().saturating_sub(replacement.len()) * count > definition.len() {
+            definitions.push_str(&definition);
+            load_helpers.insert(key, name);
+        }
+    }
+
+    let mut store_helpers = BTreeMap::new();
+    for (key @ (address, code), count) in store_counts {
+        let name = format!("$d{}", short_index(store_helpers.len()));
+        let (original_fixed, replacement_fixed, definition) = if matches!(code, 1 | 6 | 7 | 8) {
+            (
+                format!("st({address}|0,{code},,)"),
+                format!("{name}(,)"),
+                format!("function {name}(a,b){{a=a|0;b=b|0;st({address}|0,{code}|0,a|0,b|0)}}"),
+            )
+        } else {
+            (
+                format!("st({address}|0,{code},,0)"),
+                format!("{name}()"),
+                format!("function {name}(a){{a=a|0;st({address}|0,{code}|0,a|0,0|0)}}"),
+            )
+        };
+        if original_fixed.len().saturating_sub(replacement_fixed.len()) * count > definition.len() {
+            definitions.push_str(&definition);
+            store_helpers.insert(key, name);
+        }
+    }
+
+    if load_helpers.is_empty() && store_helpers.is_empty() {
+        return definitions;
+    }
+    for function in compiled {
+        let source = &function.code;
+        let mut output = String::with_capacity(source.len());
+        let mut copied = 0usize;
+        let mut index = 0usize;
+        while index < source.len() {
+            let load = source[index..].starts_with("l(").then(|| {
+                generated_call_arguments(source, index, "l").and_then(|(end, arguments)| {
+                    (arguments.len() == 2)
+                        .then(|| static_memory_key(&arguments))
+                        .flatten()
+                        .and_then(|key| {
+                            load_helpers
+                                .get(&key)
+                                .map(|name| (end, format!("{name}()")))
+                        })
+                })
+            });
+            let store = source[index..].starts_with("st(").then(|| {
+                generated_call_arguments(source, index, "st").and_then(|(end, arguments)| {
+                    let key = static_store_key(&arguments)?;
+                    let name = store_helpers.get(&key)?;
+                    let replacement = if matches!(key.1, 1 | 6 | 7 | 8) {
+                        format!("{name}({},{})", arguments[2], arguments[3])
+                    } else {
+                        format!("{name}({})", arguments[2])
+                    };
+                    Some((end, replacement))
+                })
+            });
+            let replacement = load.flatten().or_else(|| store.flatten());
+            if let Some((end, replacement)) = replacement {
+                output.push_str(&source[copied..index]);
+                output.push_str(&replacement);
+                copied = end;
+                index = end;
+            } else {
+                index += 1;
+            }
+        }
+        if copied != 0 {
+            output.push_str(&source[copied..]);
+            function.code = output;
+        }
+    }
+    definitions
+}
+
 fn compiled_function_body(code: &str) -> Option<&str> {
     let open = code.find('{')?;
     let close = code.rfind('}')?;
@@ -3141,7 +3420,7 @@ fn zero_literal(ty: ValType) -> &'static str {
 fn coerce(ty: ValType, value: &str) -> String {
     match ty {
         ValType::I32 | ValType::I64 | ValType::FuncRef(_) | ValType::V128 => {
-            if value.ends_with("|0") {
+            if value.parse::<i32>().is_ok() || value.ends_with("|0") {
                 value.to_string()
             } else {
                 format!("{value}|0")
@@ -3631,6 +3910,92 @@ fn compact_i32(value: &str) -> String {
         format!("({value})|0")
     }
 }
+fn compact_condition(value: &str) -> String {
+    let value = value.trim();
+    let Some(parenthesized) = value.strip_suffix("|0") else {
+        return value.into();
+    };
+    if !is_fully_parenthesized(parenthesized) {
+        return value.into();
+    }
+    let inner = &parenthesized[1..parenthesized.len() - 1];
+    for (operator, negate) in [("==0", true), ("!=0", false)] {
+        if let Some(operand) = inner.strip_suffix(operator)
+            && let Some(identifier) = coerced_identifier(operand)
+        {
+            return if negate {
+                format!("!{identifier}")
+            } else {
+                identifier.into()
+            };
+        }
+    }
+    let bytes = inner.as_bytes();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'=' | b'!' if depth == 0 && bytes.get(index + 1) == Some(&b'=') => {
+                return compact_condition_literals(inner);
+            }
+            b'<' if depth == 0 && bytes.get(index + 1) != Some(&b'<') => {
+                return compact_condition_literals(inner);
+            }
+            b'>' if depth == 0 && bytes.get(index + 1) != Some(&b'>') => {
+                return compact_condition_literals(inner);
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    value.into()
+}
+
+fn coerced_identifier(value: &str) -> Option<&str> {
+    let identifier = value.strip_prefix('(')?.strip_suffix("|0)")?;
+    is_js_identifier(identifier).then_some(identifier)
+}
+
+fn compact_condition_literals(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut output = String::with_capacity(value.len());
+    let mut copied = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if bytes[index] != b'(' {
+            index += 1;
+            continue;
+        }
+        let mut end = index + 1;
+        if bytes.get(end) == Some(&b'-') {
+            end += 1;
+        }
+        let digits = end;
+        while bytes.get(end).is_some_and(u8::is_ascii_digit) {
+            end += 1;
+        }
+        if end == digits || bytes.get(end..end + 3) != Some(b"|0)") {
+            index += 1;
+            continue;
+        }
+        let literal = &value[index + 1..end];
+        if literal.parse::<i32>().is_err() {
+            index += 1;
+            continue;
+        }
+        output.push_str(&value[copied..index]);
+        output.push_str(literal);
+        copied = end + 3;
+        index = copied;
+    }
+    if copied == 0 {
+        return value.into();
+    }
+    output.push_str(&value[copied..]);
+    output
+}
 fn compact_compare_operand(value: &str, unsigned: bool) -> String {
     let value = compact_i32(value);
     if unsigned {
@@ -3832,20 +4197,100 @@ fn short_index(index: usize) -> String {
     s
 }
 fn compact_index(index: usize) -> String {
-    // Keep generated locals out of helper aliases and JavaScript keywords.
-    const ALPHABET: &[u8] = b"abdehijkquz";
-    let mut n = index;
-    let mut s = String::new();
+    let mut candidate = 0;
+    let mut remaining = index;
     loop {
-        s.push(ALPHABET[n % ALPHABET.len()] as char);
-        n /= ALPHABET.len();
-        if n == 0 {
-            break;
+        let name = js_ident(candidate, false);
+        if !is_reserved_local(&name) {
+            if remaining == 0 {
+                return name;
+            }
+            remaining -= 1;
         }
-        n -= 1;
+        candidate += 1;
     }
-    s
 }
+
+fn is_reserved_local(name: &str) -> bool {
+    matches!(
+        name,
+        "l" | "y"
+            | "ct"
+            | "pc"
+            | "tr"
+            | "ne"
+            | "mn"
+            | "mx"
+            | "cs"
+            | "rf"
+            | "ri"
+            | "rd"
+            | "wr"
+            | "lf"
+            | "st"
+            | "sf"
+            | "vl"
+            | "vs"
+            | "as"
+            | "do"
+            | "if"
+            | "in"
+            | "of"
+            | "for"
+            | "let"
+            | "new"
+            | "try"
+            | "var"
+            | "case"
+            | "else"
+            | "enum"
+            | "eval"
+            | "false"
+            | "null"
+            | "this"
+            | "true"
+            | "void"
+            | "with"
+            | "await"
+            | "break"
+            | "catch"
+            | "class"
+            | "const"
+            | "super"
+            | "throw"
+            | "while"
+            | "yield"
+            | "delete"
+            | "export"
+            | "import"
+            | "public"
+            | "static"
+            | "arguments"
+            | "interface"
+            | "implements"
+            | "package"
+            | "private"
+            | "protected"
+    )
+}
+fn js_byte_string(bytes: &[u8]) -> String {
+    let mut out = String::from("\"");
+    for pair in bytes.chunks(2) {
+        let unit = u16::from(pair[0]) << 8 | u16::from(*pair.get(1).unwrap_or(&0));
+        match unit {
+            0x22 => out.push_str("\\\""),
+            0x5c => out.push_str("\\\\"),
+            0x20..=0x7e => out.push(char::from_u32(u32::from(unit)).unwrap()),
+            0x80..=0xd7ff | 0xe000..=0xffff if !matches!(unit, 0x2028 | 0x2029) => {
+                out.push(char::from_u32(u32::from(unit)).unwrap());
+            }
+            _ => write!(out, "\\u{unit:04x}").unwrap(),
+        }
+    }
+    out.push('"');
+    out
+}
+
 fn js_string(value: &str) -> String {
     let mut out = String::from("\"");
     for c in value.chars() {
@@ -3860,7 +4305,7 @@ fn js_string(value: &str) -> String {
             c => out.push(c),
         }
     }
-    out.push('\"');
+    out.push('"');
     out
 }
 fn instruction_offset(_: &str, _: &str) -> usize {
@@ -3899,7 +4344,7 @@ function G(k,d){k=k|0;d=d|0;var old=0,add=0,ns=0,total=0,x=0,y=0,nb=null,nh=null
 function IC(al,ah,bl,bh,o){al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;o=o|0;if((o|0)==0)return ((al==bl)&(ah==bh))|0;if((o|0)==1)return ((al!=bl)|(ah!=bh))|0;if((o|0)==2)return ((ah<bh)|((ah==bh)&((al>>>0)<(bl>>>0))))|0;if((o|0)==3)return (((ah>>>0)<(bh>>>0))|((ah==bh)&((al>>>0)<(bl>>>0))))|0;if((o|0)==4)return ((ah>bh)|((ah==bh)&((al>>>0)>(bl>>>0))))|0;if((o|0)==5)return (((ah>>>0)>(bh>>>0))|((ah==bh)&((al>>>0)>(bl>>>0))))|0;if((o|0)==6)return ((ah<bh)|((ah==bh)&((al>>>0)<=(bl>>>0))))|0;if((o|0)==7)return (((ah>>>0)<(bh>>>0))|((ah==bh)&((al>>>0)<=(bl>>>0))))|0;if((o|0)==8)return ((ah>bh)|((ah==bh)&((al>>>0)>=(bl>>>0))))|0;if((o|0)==9)return (((ah>>>0)>(bh>>>0))|((ah==bh)&((al>>>0)>=(bl>>>0))))|0;return 0}
 function AB(dm,sm,d,sr,n){dm=dm|0;sm=sm|0;d=d>>>0;sr=sr>>>0;n=n>>>0;var da=AA(dm,d,0,0,n),sa=AA(sm,sr,0,0,n),i=0;if(da>sa&&da<sa+n)for(i=n-1;i>=0;i--)H[da+i]=H[sa+i];else for(i=0;i<n;i++)H[da+i]=H[sa+i]}
 function AC(k,d,v,n){k=k|0;d=d>>>0;v=v|0;n=n>>>0;var x=AA(k,d,0,0,n),i=0;for(i=0;i<n;i++)H[x+i]=v}
-function K(di,k,d,sr,n){di=di|0;k=k|0;d=d>>>0;sr=sr>>>0;n=n>>>0;var x=0,i=0;if(D[di].x||sr+n>D[di].length)X();x=AA(k,d,0,0,n);for(i=0;i<n;i++)H[x+i]=D[di][sr+i]}
+function K(di,k,d,sr,n){di=di|0;k=k|0;d=d>>>0;sr=sr>>>0;n=n>>>0;var x=0,i=0,j=0,v='';v=D[di].b;if(D[di].x||sr+n>D[di].n)X();x=AA(k,d,0,0,n);for(i=0;i<n;i++){j=sr+i;H[x+i]=(j&1)?v.charCodeAt(j>>>1)&255:v.charCodeAt(j>>>1)>>>8}}
 function N(x){x=x>>>0;if(x>=T.length)X();return T[x]|0}
 function O(x,v){x=x>>>0;v=v|0;if(x>=T.length)X();T[x]=v;S[x]=v?Z[v]:-1}
 function P(v,n){v=v|0;n=n>>>0;var o=T.length,i=0;if(r.l>=0&&o+n>r.l)return -1;for(i=0;i<n;i++){T.push(v);S.push(v?Z[v]:-1)}return o|0}
