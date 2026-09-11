@@ -243,15 +243,27 @@ fn memory_offset_helpers(
             }
         }
     }
-    let loads = loads
+    let mut loads = loads
         .into_iter()
         .filter(|(_, count)| *count >= 16)
+        .collect::<Vec<_>>();
+    loads.sort_by(|(left_key, left_count), (right_key, right_count)| {
+        right_count.cmp(left_count).then(left_key.cmp(right_key))
+    });
+    let loads = loads
+        .into_iter()
         .enumerate()
         .map(|(index, (key, _))| (key, format!("$l{}", short_index(index))))
         .collect();
-    let stores = stores
+    let mut stores = stores
         .into_iter()
         .filter(|(_, count)| *count >= 16)
+        .collect::<Vec<_>>();
+    stores.sort_by(|(left_key, left_count), (right_key, right_count)| {
+        right_count.cmp(left_count).then(left_key.cmp(right_key))
+    });
+    let stores = stores
+        .into_iter()
         .enumerate()
         .map(|(index, (key, _))| (key, format!("$s{}", short_index(index))))
         .collect();
@@ -320,7 +332,7 @@ impl<'a> ModuleCx<'a> {
         out = out.replace(";}", "}");
         self.emit_wrapper_prefix(&mut out)?;
         self.emit_wrapper_suffix(&mut out)?;
-        Ok(out)
+        Ok(rename_module_functions(&out, &self.function_names))
     }
 
     fn emit_wrapper_prefix(&self, out: &mut String) -> Result<(), CompileError> {
@@ -1357,8 +1369,17 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let param_components: usize = params.iter().map(|v| v.components().len()).sum();
         let all_components = flatten_names(&self.locals);
         let local_components = &all_components[param_components..];
+        let live_local_components = local_components
+            .iter()
+            .filter(|component| expression_mentions_identifier(&self.body, component))
+            .collect::<Vec<_>>();
+        let live_declarations = self
+            .declarations
+            .iter()
+            .filter(|(name, _)| expression_mentions_identifier(&self.body, name))
+            .collect::<Vec<_>>();
         let mut has_declarations = false;
-        for component in local_components {
+        for component in &live_local_components {
             if has_declarations {
                 out.push(',');
             } else {
@@ -1368,7 +1389,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             let ty = component_type(&self.locals, component).unwrap_or(ValType::I32);
             write!(out, "{component}={}", zero_literal(ty)).unwrap();
         }
-        for (name, ty) in &self.declarations {
+        for (name, ty) in &live_declarations {
             if has_declarations {
                 out.push(',');
             } else {
@@ -1401,9 +1422,14 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             }
         }
         out.push('}');
-        let mut identifiers = all_components[param_components..].to_vec();
-        identifiers.extend(self.declarations.iter().map(|(name, _)| name.clone()));
-        Ok(rename_function_locals(&out, &identifiers, &flat_params))
+        let mut identifiers = live_local_components
+            .into_iter()
+            .map(|name| (*name).clone())
+            .collect::<Vec<_>>();
+        identifiers.extend(live_declarations.into_iter().map(|(name, _)| name.clone()));
+        let out = rename_function_locals(&out, &identifiers, &flat_params);
+        let out = rename_function_labels(&out);
+        Ok(optimize_labeled_early_exits(&out))
     }
 
     fn emit_instruction(&mut self, instruction: &Instr) -> Result<(), CompileError> {
@@ -1481,14 +1507,24 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             LocalSet(index) => {
                 let value = self.pop()?;
                 let target = self.local(*index)?.clone();
+                let before_preserve = self.body.len();
                 self.preserve_local_values(&target);
-                self.assign(&target, &value);
+                if self.body.len() != before_preserve
+                    || !self.retarget_last_temp_assignment(&target, &value)
+                {
+                    self.assign(&target, &value);
+                }
             }
             LocalTee(index) => {
                 let value = self.pop()?;
                 let target = self.local(*index)?.clone();
+                let before_preserve = self.body.len();
                 self.preserve_local_values(&target);
-                self.assign(&target, &value);
+                if self.body.len() != before_preserve
+                    || !self.retarget_last_temp_assignment(&target, &value)
+                {
+                    self.assign(&target, &value);
+                }
                 self.stack.push(target);
             }
             GlobalSet(index) => {
@@ -1499,7 +1535,9 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     .get(*index as usize)
                     .ok_or_else(|| self.internal("invalid global index"))?
                     .clone();
-                self.assign(&target, &value);
+                if !self.retarget_last_temp_assignment(&target, &value) {
+                    self.assign(&target, &value);
+                }
             }
             I32Const(value) => self.stack.push(Value::I32(value.to_string())),
             I64Const(value) => self.stack.push(i64_const(*value)),
@@ -1694,9 +1732,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let base = self.stack.len();
         let stored_params: Vec<Value> = sig.params.iter().map(|&t| self.temp(t)).collect();
         if self.reachable {
-            for (target, value) in stored_params.iter().zip(&params) {
-                self.assign(target, value);
-            }
+            self.assign_values(&stored_params, &params);
         }
         self.stack.extend(stored_params.iter().cloned());
         let result_values = sig.results.iter().map(|&t| self.temp(t)).collect();
@@ -1742,9 +1778,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         if self.reachable {
             let values = self.pop_types(&self.controls[index].results.clone())?;
             let targets = self.controls[index].result_values.clone();
-            for (target, value) in targets.iter().zip(&values) {
-                self.assign(target, value);
-            }
+            self.assign_values(&targets, &values);
         }
         self.controls[index].then_reachable = self.reachable;
         self.controls[index].seen_else = true;
@@ -1766,9 +1800,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let mut control = self.controls.pop().unwrap();
         if self.reachable {
             let values = self.pop_types(&control.results)?;
-            for (target, value) in control.result_values.iter().zip(&values) {
-                self.assign(target, value);
-            }
+            self.assign_values(&control.result_values, &values);
         }
         match control.kind {
             ControlKind::Loop => {
@@ -1832,10 +1864,10 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     }
 
     fn emit_br_table(&mut self, targets: &[u32], default: u32) -> Result<(), CompileError> {
-        let selector = self.pop_i32()?.to_string();
+        let selector = compact_i32(&self.pop_i32()?.to_string());
         let target = self.target_index(default)?;
         let values = self.pop_types(&self.branch_types(target))?;
-        write!(self.body, "switch(({selector})|0){{").unwrap();
+        write!(self.body, "switch({selector}){{").unwrap();
         for (case, depth) in targets.iter().enumerate() {
             let index = self.target_index(*depth)?;
             write!(self.body, "case {case}:").unwrap();
@@ -1860,9 +1892,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         } else {
             control.result_values
         };
-        for (target, value) in targets.iter().zip(values) {
-            self.assign(target, value);
-        }
+        self.assign_values(&targets, values);
         if control.kind == ControlKind::Loop {
             write!(self.body, "continue {};", control.label).unwrap();
         } else {
@@ -1882,7 +1912,9 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             self.pop_types(&results)?
         };
         let slots = self.module.return_slots_for(&results);
-        emit_return_abi(&mut self.body, &values, &slots);
+        if !self.inline_last_temp_return(&values) {
+            emit_return_abi(&mut self.body, &values, &slots);
+        }
         self.reachable = false;
         Ok(())
     }
@@ -2023,7 +2055,9 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             write!(self.body, "{slot}=(gh())|0;").unwrap();
         }
         if tail {
-            emit_return_abi(&mut self.body, &values, &slots);
+            if !self.inline_last_temp_return(&values) {
+                emit_return_abi(&mut self.body, &values, &slots);
+            }
             self.reachable = false;
         } else {
             self.stack.extend(values);
@@ -3006,12 +3040,96 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 .iter()
                 .any(|control| control.result_values.iter().any(uses_candidate))
     }
+    fn retarget_last_temp_assignment(&mut self, target: &Value, value: &Value) -> bool {
+        let value_components = value.components();
+        let target_components = target.components();
+        let (Some(source), Some(target)) = (value_components.first(), target_components.first())
+        else {
+            return false;
+        };
+        if value_components.len() != target_components.len()
+            || !self.temp_slots.iter().any(|(base, ty)| {
+                named_value(*ty, base)
+                    .components()
+                    .iter()
+                    .any(|component| component == source)
+            })
+            || !self.body.ends_with(';')
+        {
+            return false;
+        }
+        let statement_end = self.body.len() - 1;
+        let statement_start = self.body[..statement_end]
+            .rfind([';', '{', '}'])
+            .map_or(0, |index| index + 1);
+        if !self.body[statement_start..statement_end].starts_with(&format!("{source}=")) {
+            return false;
+        }
+        self.body
+            .replace_range(statement_start..statement_start + source.len(), target);
+        for (target, source) in target_components.iter().zip(&value_components).skip(1) {
+            write!(
+                self.body,
+                "{target}={};",
+                coerce_assignment(value_component_type(value, source), source)
+            )
+            .unwrap();
+        }
+        true
+    }
+
+    fn inline_last_temp_return(&mut self, values: &[Value]) -> bool {
+        let [value] = values else {
+            return false;
+        };
+        let value_components = value.components();
+        let [source] = value_components.as_slice() else {
+            return false;
+        };
+        if !self.temp_slots.iter().any(|(base, ty)| {
+            named_value(*ty, base)
+                .components()
+                .iter()
+                .any(|component| component == source)
+        }) || !self.body.ends_with(';')
+        {
+            return false;
+        }
+        let statement_end = self.body.len() - 1;
+        let statement_start = self.body[..statement_end]
+            .rfind([';', '{', '}'])
+            .map_or(0, |index| index + 1);
+        let expression_start = statement_start + source.len() + 1;
+        if self.body.as_bytes().get(statement_start..expression_start)
+            != Some(format!("{source}=").as_bytes())
+        {
+            return false;
+        }
+        let expression = self.body[expression_start..statement_end].to_string();
+        self.body.truncate(statement_start);
+        write!(self.body, "return {expression};").unwrap();
+        true
+    }
+
+    fn assign_values(&mut self, targets: &[Value], values: &[Value]) {
+        let retargeted = if let ([target], [value]) = (targets, values) {
+            self.retarget_last_temp_assignment(target, value)
+        } else {
+            false
+        };
+        if !retargeted {
+            for (target, value) in targets.iter().zip(values) {
+                self.assign(target, value);
+            }
+        }
+    }
+
     fn assign(&mut self, target: &Value, value: &Value) {
         for (a, b) in target.components().iter().zip(value.components()) {
             write!(
                 self.body,
                 "{a}={};",
-                coerce(value_component_type(value, b), b)
+                coerce_assignment(value_component_type(value, b), b)
             )
             .unwrap();
         }
@@ -3042,6 +3160,402 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             ),
         )
     }
+}
+
+fn rename_module_functions(source: &str, function_names: &[String]) -> String {
+    let mut counts = function_names
+        .iter()
+        .map(|name| (name.as_str(), 0usize))
+        .collect::<BTreeMap<_, _>>();
+    visit_javascript_identifiers(source, |start, end| {
+        if let Some(count) = counts.get_mut(&source[start..end]) {
+            *count += 1;
+        }
+    });
+    let mut ranked = function_names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| counts[name.as_str()] != 0)
+        .collect::<Vec<_>>();
+    ranked.sort_by(|(left_index, left), (right_index, right)| {
+        counts[right.as_str()]
+            .cmp(&counts[left.as_str()])
+            .then_with(|| left_index.cmp(right_index))
+    });
+    let replacements = ranked
+        .into_iter()
+        .enumerate()
+        .map(|(rank, (_, name))| (name.as_str(), function_ident(rank)))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut output = String::with_capacity(source.len());
+    let mut copied = 0usize;
+    visit_javascript_identifiers(source, |start, end| {
+        if let Some(replacement) = replacements.get(&source[start..end]) {
+            output.push_str(&source[copied..start]);
+            output.push_str(replacement);
+            copied = end;
+        }
+    });
+    if copied == 0 {
+        return source.into();
+    }
+    output.push_str(&source[copied..]);
+    output
+}
+
+fn visit_javascript_identifiers(source: &str, mut visit: impl FnMut(usize, usize)) {
+    let bytes = source.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if matches!(bytes[index], b'\'' | b'"') {
+            let quote = bytes[index];
+            index += 1;
+            while index < bytes.len() && bytes[index] != quote {
+                index += if bytes[index] == b'\\' { 2 } else { 1 };
+            }
+            index = index.saturating_add(1).min(bytes.len());
+            continue;
+        }
+        if !bytes[index].is_ascii_alphabetic() && !matches!(bytes[index], b'_' | b'$') {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while bytes
+            .get(index)
+            .is_some_and(|byte| is_js_identifier_byte(*byte))
+        {
+            index += 1;
+        }
+        visit(start, index);
+    }
+}
+fn optimize_labeled_early_exits(source: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut copied = 0usize;
+    while let Some((label_start, label_end, open, close)) = find_labeled_block(source, copied) {
+        output.push_str(&source[copied..label_start]);
+        let label = &source[label_start..label_end];
+        let mut body = optimize_labeled_early_exits(&source[open + 1..close]);
+        while let Some((start, replacement)) = best_early_exit_rewrite(&body, label) {
+            body.truncate(start);
+            body.push_str(&replacement);
+        }
+        if label_is_referenced(&body, label) {
+            output.push_str(label);
+            output.push(':');
+        }
+        output.push('{');
+        output.push_str(&body);
+        output.push('}');
+        copied = close + 1;
+    }
+    if copied == 0 {
+        return source.into();
+    }
+    output.push_str(&source[copied..]);
+    output
+}
+
+fn find_labeled_block(source: &str, from: usize) -> Option<(usize, usize, usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut index = from;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_alphabetic() && !matches!(bytes[index], b'_' | b'$') {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while bytes
+            .get(index)
+            .is_some_and(|byte| is_js_identifier_byte(*byte))
+        {
+            index += 1;
+        }
+        if bytes.get(index..index + 2) == Some(b":{")
+            && (start == 0
+                || bytes
+                    .get(start - 1)
+                    .is_some_and(|byte| matches!(byte, b'{' | b'}' | b';')))
+        {
+            let open = index + 1;
+            if let Some(close) = matching_delimiter(source, open, b'{', b'}') {
+                return Some((start, index, open, close));
+            }
+        }
+    }
+    None
+}
+
+fn matching_delimiter(source: &str, open: usize, opening: u8, closing: u8) -> Option<usize> {
+    let bytes = source.as_bytes();
+    let mut depth = 0usize;
+    let mut index = open;
+    while index < bytes.len() {
+        if matches!(bytes[index], b'\'' | b'"') {
+            let quote = bytes[index];
+            index += 1;
+            while index < bytes.len() && bytes[index] != quote {
+                index += if bytes[index] == b'\\' { 2 } else { 1 };
+            }
+        } else if bytes[index] == opening {
+            depth += 1;
+        } else if bytes[index] == closing {
+            depth -= 1;
+            if depth == 0 {
+                return Some(index);
+            }
+        }
+        index += 1;
+    }
+    None
+}
+
+fn top_level_conditional_breaks(source: &str, label: &str) -> Vec<(usize, usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut found = Vec::new();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            b'i' if depth == 0 && source[index..].starts_with("if(") => {
+                let Some(condition_end) = matching_delimiter(source, index + 2, b'(', b')') else {
+                    break;
+                };
+                let statement = format!("break {label};");
+                let statement_start = condition_end + 1;
+                if source[statement_start..].starts_with(&statement) {
+                    found.push((index, condition_end, statement_start + statement.len()));
+                    index = statement_start + statement.len();
+                    continue;
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    found
+}
+
+fn top_level_conditional_block_breaks(
+    source: &str,
+    label: &str,
+) -> Vec<(usize, usize, usize, usize)> {
+    let bytes = source.as_bytes();
+    let mut found = Vec::new();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'{' => depth += 1,
+            b'}' => depth -= 1,
+            b'i' if depth == 0 && source[index..].starts_with("if(") => {
+                let Some(condition_end) = matching_delimiter(source, index + 2, b'(', b')') else {
+                    break;
+                };
+                let block_open = condition_end + 1;
+                if bytes.get(block_open) != Some(&b'{') {
+                    index = condition_end + 1;
+                    continue;
+                }
+                let Some(block_close) = matching_delimiter(source, block_open, b'{', b'}') else {
+                    break;
+                };
+                if source[block_close + 1..].starts_with("else") {
+                    index = block_close + 1;
+                    continue;
+                }
+                let body_start = block_open + 1;
+                let mut body_end = block_close;
+                if bytes.get(body_end.wrapping_sub(1)) == Some(&b';') {
+                    body_end -= 1;
+                }
+                let statement = format!("break {label}");
+                if source[body_start..body_end].ends_with(&statement) {
+                    let break_start = body_end - statement.len();
+                    if break_start == body_start
+                        || bytes
+                            .get(break_start - 1)
+                            .is_some_and(|byte| matches!(byte, b';' | b'{' | b'}'))
+                    {
+                        found.push((index, condition_end, block_close + 1, break_start));
+                    }
+                }
+                index = block_close + 1;
+                continue;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    found
+}
+
+fn best_early_exit_rewrite(source: &str, label: &str) -> Option<(usize, String)> {
+    let mut best = None;
+    for (start, condition_end, end) in top_level_conditional_breaks(source, label) {
+        let suffix = &source[end..];
+        if suffix.is_empty() {
+            continue;
+        }
+        let condition = &source[start + 3..condition_end];
+        let replacement = format!("if({}){{{suffix}}}", negate_condition(condition));
+        if replacement.len() < source.len() - start {
+            best = Some((start, replacement));
+        }
+    }
+    for (start, condition_end, end, break_start) in
+        top_level_conditional_block_breaks(source, label)
+    {
+        let condition = &source[start + 3..condition_end];
+        let body_start = condition_end + 2;
+        let prefix = &source[body_start..break_start];
+        let suffix = &source[end..];
+        let replacement = if suffix.is_empty() {
+            format!("if({condition}){{{prefix}}}")
+        } else if prefix.is_empty() {
+            format!("if({}){{{suffix}}}", negate_condition(condition))
+        } else {
+            format!("if({condition}){{{prefix}}}else{{{suffix}}}")
+        };
+        if replacement.len() < source.len() - start
+            && best
+                .as_ref()
+                .is_none_or(|(best_start, _)| start > *best_start)
+        {
+            best = Some((start, replacement));
+        }
+    }
+    best
+}
+
+fn negate_condition(condition: &str) -> String {
+    if let Some(value) = condition.strip_prefix('!')
+        && (is_js_atom(value) || is_fully_parenthesized(value))
+    {
+        return value.into();
+    }
+    if is_js_atom(condition) || is_fully_parenthesized(condition) {
+        return format!("!{condition}");
+    }
+    format!("!({condition})")
+}
+
+fn label_is_referenced(source: &str, label: &str) -> bool {
+    let mut referenced = false;
+    visit_generated_identifiers(source, |start, end| {
+        if &source[start..end] == label && label_reference_context(source, start) {
+            referenced = true;
+        }
+    });
+    referenced
+}
+
+fn rename_function_labels(source: &str) -> String {
+    let mut labels = Vec::new();
+    visit_generated_identifiers(source, |start, end| {
+        if label_declaration_context(source, start, end) {
+            labels.push(source[start..end].to_string());
+        }
+    });
+    if labels.is_empty() {
+        return source.into();
+    }
+
+    let label_set = labels.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut counts = labels
+        .iter()
+        .cloned()
+        .map(|label| (label, 0usize))
+        .collect::<BTreeMap<_, _>>();
+    visit_generated_identifiers(source, |start, end| {
+        let label = &source[start..end];
+        if label_set.contains(label)
+            && (label_declaration_context(source, start, end)
+                || label_reference_context(source, start))
+        {
+            *counts.get_mut(label).unwrap() += 1;
+        }
+    });
+    labels.sort_by(|left, right| counts[right].cmp(&counts[left]));
+    let replacements = labels
+        .iter()
+        .enumerate()
+        .map(|(index, label)| (label.as_str(), label_ident(index)))
+        .collect::<BTreeMap<_, _>>();
+
+    let mut output = String::with_capacity(source.len());
+    let mut copied = 0usize;
+    visit_generated_identifiers(source, |start, end| {
+        let label = &source[start..end];
+        if let Some(replacement) = replacements.get(label)
+            && (label_declaration_context(source, start, end)
+                || label_reference_context(source, start))
+        {
+            output.push_str(&source[copied..start]);
+            output.push_str(replacement);
+            copied = end;
+        }
+    });
+    if copied == 0 {
+        return source.into();
+    }
+    output.push_str(&source[copied..]);
+    output
+}
+
+fn visit_generated_identifiers(source: &str, mut visit: impl FnMut(usize, usize)) {
+    let bytes = source.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_alphabetic() && !matches!(bytes[index], b'_' | b'$') {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        index += 1;
+        while bytes
+            .get(index)
+            .is_some_and(|byte| is_js_identifier_byte(*byte))
+        {
+            index += 1;
+        }
+        visit(start, index);
+    }
+}
+
+fn label_declaration_context(source: &str, start: usize, end: usize) -> bool {
+    let bytes = source.as_bytes();
+    let previous = start
+        .checked_sub(1)
+        .and_then(|index| bytes.get(index))
+        .copied();
+    if !previous.is_some_and(|byte| matches!(byte, b'{' | b'}' | b';'))
+        || bytes.get(end) != Some(&b':')
+    {
+        return false;
+    }
+    matches!(bytes.get(end + 1), Some(b'{'))
+        || source[end + 1..].starts_with("for(")
+        || source[end + 1..].starts_with("if(")
+}
+
+fn label_reference_context(source: &str, start: usize) -> bool {
+    let bytes = source.as_bytes();
+    let mut end = start;
+    while end != 0 && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    let mut begin = end;
+    while begin != 0 && is_js_identifier_byte(bytes[begin - 1]) {
+        begin -= 1;
+    }
+    matches!(&source[begin..end], "break" | "continue")
 }
 
 fn rename_function_locals(source: &str, identifiers: &[String], reserved: &[String]) -> String {
@@ -3221,6 +3735,15 @@ fn optimize_static_memory_accesses(compiled: &mut [CompiledFunction]) -> String 
             }
         }
     }
+
+    let mut load_counts = load_counts.into_iter().collect::<Vec<_>>();
+    load_counts.sort_by(|(left_key, left_count), (right_key, right_count)| {
+        right_count.cmp(left_count).then(left_key.cmp(right_key))
+    });
+    let mut store_counts = store_counts.into_iter().collect::<Vec<_>>();
+    store_counts.sort_by(|(left_key, left_count), (right_key, right_count)| {
+        right_count.cmp(left_count).then(left_key.cmp(right_key))
+    });
 
     let mut definitions = String::new();
     let mut load_helpers = BTreeMap::new();
@@ -3574,6 +4097,23 @@ fn coerce(ty: ValType, value: &str) -> String {
         }
     }
 }
+fn coerce_assignment(ty: ValType, value: &str) -> String {
+    let value = strip_redundant_atom_parentheses(value.trim());
+    if is_js_identifier(value) {
+        return value.into();
+    }
+    if matches!(
+        ty,
+        ValType::I32 | ValType::I64 | ValType::FuncRef(_) | ValType::V128
+    ) && let Some(value) = value.strip_suffix("|0")
+    {
+        let value = strip_redundant_atom_parentheses(value);
+        if is_js_identifier(value) || value.parse::<i32>().is_ok() {
+            return value.into();
+        }
+    }
+    coerce(ty, value)
+}
 fn emit_param_coercions(out: &mut String, values: &[Value]) {
     for value in values {
         for component in value.components() {
@@ -3610,10 +4150,18 @@ fn emit_var_value_from_value(out: &mut String, target: &Value, value: &Value) {
 }
 fn emit_return_value(out: &mut String, value: &Value) {
     match value {
-        Value::I64(lo, hi) => write!(out, "$q0={hi}|0;return {lo}|0;").unwrap(),
+        Value::I64(lo, hi) => write!(
+            out,
+            "$q0={};return {};",
+            coerce(ValType::I32, hi),
+            coerce(ValType::I32, lo)
+        )
+        .unwrap(),
         Value::F32(x) => write!(out, "return {};", coerce(ValType::F32, x)).unwrap(),
         Value::F64(x) => write!(out, "return {};", coerce(ValType::F64, x)).unwrap(),
-        Value::I32(x) | Value::Ref(x) => write!(out, "return {x}|0;").unwrap(),
+        Value::I32(x) | Value::Ref(x) => {
+            write!(out, "return {};", coerce(ValType::I32, x)).unwrap()
+        }
         Value::V128(_) => out.push_str("X();"),
     }
 }
@@ -3816,11 +4364,15 @@ fn emit_return_abi(out: &mut String, values: &[Value], slots: &[Value]) {
         }
     }
     match &values[0] {
-        Value::I32(x) | Value::Ref(x) => write!(out, "return {x}|0;").unwrap(),
-        Value::I64(lo, _) => write!(out, "return {lo}|0;").unwrap(),
+        Value::I32(x) | Value::Ref(x) => {
+            write!(out, "return {};", coerce(ValType::I32, x)).unwrap()
+        }
+        Value::I64(lo, _) => write!(out, "return {};", coerce(ValType::I32, lo)).unwrap(),
         Value::F32(x) => write!(out, "return {};", coerce(ValType::F32, x)).unwrap(),
         Value::F64(x) => write!(out, "return {};", coerce(ValType::F64, x)).unwrap(),
-        Value::V128(components) => write!(out, "return {}|0;", components[0]).unwrap(),
+        Value::V128(components) => {
+            write!(out, "return {};", coerce(ValType::I32, &components[0])).unwrap()
+        }
     }
 }
 fn call_result_values(
@@ -4204,7 +4756,7 @@ fn compact_condition_literals(value: &str) -> String {
 }
 fn compact_compare_operand(value: &str, unsigned: bool) -> String {
     if unsigned {
-        format!("({}>>>0)", compact_unsigned_i32_operand(value))
+        format!("{}>>>0", compact_unsigned_i32_operand(value))
     } else {
         format!("({})", compact_i32(value))
     }
@@ -4386,11 +4938,19 @@ fn store_code(op: StoreOp) -> u8 {
         I64_32 => 8,
     }
 }
+fn label_ident(index: usize) -> String {
+    match index {
+        0 => "$".into(),
+        1 => "_".into(),
+        _ => compact_index(index - 2),
+    }
+}
+
 fn function_ident(index: usize) -> String {
     let mut candidate = 0;
     let mut remaining = index;
     loop {
-        let name = js_ident(candidate, true);
+        let name = function_name_candidate(candidate);
         if !is_reserved_function(&name) {
             if remaining == 0 {
                 return name;
@@ -4400,10 +4960,44 @@ fn function_ident(index: usize) -> String {
         candidate += 1;
     }
 }
+
+fn function_name_candidate(mut index: usize) -> String {
+    const FIRST: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ";
+    const REST: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789$_";
+    if index == 0 {
+        return "$".into();
+    }
+    if index == 1 {
+        return "_".into();
+    }
+    index -= 2;
+    if index < FIRST.len() {
+        return char::from(FIRST[index]).into();
+    }
+    index -= FIRST.len();
+    let mut suffix_len = 1usize;
+    let mut suffix_space = REST.len();
+    while index >= FIRST.len() * suffix_space {
+        index -= FIRST.len() * suffix_space;
+        suffix_len += 1;
+        suffix_space *= REST.len();
+    }
+    let mut name = String::with_capacity(suffix_len + 1);
+    name.push(char::from(FIRST[index / suffix_space]));
+    let mut suffix = index % suffix_space;
+    let mut divisor = suffix_space;
+    for _ in 0..suffix_len {
+        divisor /= REST.len();
+        name.push(char::from(REST[suffix / divisor]));
+        suffix %= divisor;
+    }
+    name
+}
 fn is_reserved_function(name: &str) -> bool {
     matches!(
         name,
         "AA" | "AB"
+            | "B0"
             | "AC"
             | "C"
             | "DD"
@@ -4413,12 +5007,18 @@ fn is_reserved_function(name: &str) -> bool {
             | "GH"
             | "IC"
             | "IG"
+            | "In"
             | "K"
             | "L"
             | "LI"
             | "LF"
+            | "Ma"
+            | "Mc"
+            | "Mf"
+            | "Ms"
             | "MS"
             | "N"
+            | "Na"
             | "O"
             | "P"
             | "Q"
@@ -4434,7 +5034,12 @@ fn is_reserved_function(name: &str) -> bool {
             | "W"
             | "X"
             | "Y"
-    )
+    ) || name
+        .strip_prefix('I')
+        .or_else(|| name.strip_prefix('J'))
+        .is_some_and(|suffix| {
+            !suffix.is_empty() && suffix.bytes().all(|byte| byte.is_ascii_lowercase())
+        })
 }
 fn js_ident(index: usize, upper: bool) -> String {
     let mut n = index;
