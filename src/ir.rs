@@ -1,5 +1,9 @@
 use wasmparser::BlockType;
 
+#[cfg(test)]
+#[path = "ir/tests.rs"]
+mod tests;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ValType {
     I32,

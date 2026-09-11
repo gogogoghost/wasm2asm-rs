@@ -6,6 +6,10 @@ use wasmparser::{
     Parser, Payload, TableInit, TypeRef, Validator, WasmFeatures,
 };
 
+#[cfg(test)]
+#[path = "parser/tests.rs"]
+mod tests;
+
 pub fn parse_module(input: &[u8], options: &CompileOptions) -> Result<Module, CompileError> {
     if options.limits.max_input_bytes != 0 && input.len() > options.limits.max_input_bytes {
         return Err(CompileError::limit(

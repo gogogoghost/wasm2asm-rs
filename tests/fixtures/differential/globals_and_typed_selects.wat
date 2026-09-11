@@ -1,0 +1,23 @@
+(module
+  (type $unary (func (param i32) (result i32)))
+  (import "env" "base" (global i32))
+  (import "env" "wide" (global i64))
+  (import "env" "single" (global f32))
+  (import "env" "double" (global f64))
+  (func $id (type $unary) (param i32) (result i32) local.get 0)
+  (elem declare func $id)
+  (global (export "integer") i32 (global.get 0))
+  (global (export "wide") i64 (global.get 1))
+  (global (export "single") f32 (global.get 2))
+  (global (export "double") f64 (global.get 3))
+  (func (export "selects") (param i32) (result f32 f64 i64 i32 i32)
+    (select (result f32) (f32.const 1.25) (f32.const 2.5) (local.get 0))
+    (select (result f64) (f64.const 3.5) (f64.const 4.75) (local.get 0))
+    (select (result i64) (i64.const -1) (i64.const 4294967296) (local.get 0))
+    (ref.is_null
+      (select (result funcref) (ref.null func) (ref.func $id) (local.get 0)))
+    (i32x4.extract_lane 2
+      (select (result v128)
+        (v128.const i32x4 1 2 3 4)
+        (v128.const i32x4 5 6 7 8)
+        (local.get 0)))))

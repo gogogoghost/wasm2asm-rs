@@ -4,6 +4,10 @@ use crate::options::{CompileOptions, OutputFormat};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
 
+#[cfg(test)]
+#[path = "emitter/tests.rs"]
+mod tests;
+
 pub fn emit(module: &Module, options: &CompileOptions) -> Result<Vec<u8>, CompileError> {
     validate_boundaries(module)?;
     let mut cx = ModuleCx::new(module, options)?;
@@ -218,7 +222,7 @@ struct ModuleCx<'a> {
     import_function_names: Vec<String>,
     global_names: Vec<Value>,
     return_slots: Vec<Value>,
-    max_return_slots: usize,
+    return_slot_counts: [usize; 3],
     indirect_types: BTreeSet<u32>,
     live_functions: Vec<bool>,
 }
@@ -236,15 +240,7 @@ impl<'a> ModuleCx<'a> {
             global_names.push(named_value(ty.ty, &format!("$g{}", short_index(index))));
         }
         let (live_functions, indirect_types) = reachable_functions(module);
-        let max_return_slots = module
-            .types
-            .iter()
-            .map(|ty| return_slot_types(&ty.results).len())
-            .max()
-            .unwrap_or(0);
-        let return_slots = (0..max_return_slots)
-            .map(|index| Value::I32(format!("q{}", short_index(index))))
-            .collect();
+        let (return_slot_counts, return_slots) = return_slot_layout(module);
         Ok(Self {
             module,
             options,
@@ -252,10 +248,21 @@ impl<'a> ModuleCx<'a> {
             import_function_names,
             global_names,
             return_slots,
-            max_return_slots,
+            return_slot_counts,
             indirect_types,
             live_functions,
         })
+    }
+
+    fn return_slot_indices(&self, results: &[ValType]) -> Vec<usize> {
+        return_slot_indices(results, self.return_slot_counts)
+    }
+
+    fn return_slots_for(&self, results: &[ValType]) -> Vec<Value> {
+        self.return_slot_indices(results)
+            .into_iter()
+            .map(|index| self.return_slots[index].clone())
+            .collect()
     }
 
     fn emit_module(&mut self) -> Result<String, CompileError> {
@@ -428,7 +435,7 @@ impl<'a> ModuleCx<'a> {
             out.push_str("x.$start();delete x.$start;");
         }
         out.push_str("q=[");
-        for index in 0..self.max_return_slots {
+        for index in 0..self.return_slots.len() {
             if index != 0 {
                 out.push(',');
             }
@@ -453,8 +460,14 @@ impl<'a> ModuleCx<'a> {
                     )
                     .unwrap();
                     if ty.results.len() > 1 {
+                        let slot_indices = self.return_slot_indices(&ty.results);
                         write!(out, "x[{key}]=(function(h){{return function(){{var a=h.apply(null,arguments),v=[").unwrap();
-                        emit_primary_export_value(out, ty.results.first().copied(), "a");
+                        emit_primary_export_value(
+                            out,
+                            ty.results.first().copied(),
+                            "a",
+                            slot_indices.first().copied(),
+                        );
                         let mut slot = if matches!(ty.results.first(), Some(ValType::I64)) {
                             1
                         } else {
@@ -464,11 +477,17 @@ impl<'a> ModuleCx<'a> {
                             out.push(',');
                             match result {
                                 ValType::I64 => {
-                                    write!(out, "[q[{slot}](),q[{}]() ]", slot + 1).unwrap();
+                                    write!(
+                                        out,
+                                        "[q[{}](),q[{}]() ]",
+                                        slot_indices[slot],
+                                        slot_indices[slot + 1]
+                                    )
+                                    .unwrap();
                                     slot += 2;
                                 }
                                 _ => {
-                                    write!(out, "q[{slot}]()").unwrap();
+                                    write!(out, "q[{}]()", slot_indices[slot]).unwrap();
                                     slot += 1;
                                 }
                             }
@@ -516,10 +535,10 @@ impl<'a> ModuleCx<'a> {
                 ExportKind::Table | ExportKind::Tag => {}
             }
         }
-        if self.module.features.i64 && self.max_return_slots != 0 {
+        if self.module.features.i64 && !self.return_slots.is_empty() {
             out.push_str("x.getTempRet0=q[0];");
         }
-        for index in 0..self.max_return_slots {
+        for index in 0..self.return_slots.len() {
             write!(out, "delete x.$q{};", short_index(index)).unwrap();
         }
         for index in 0..self.module.global_types.len() {
@@ -549,14 +568,15 @@ impl<'a> ModuleCx<'a> {
 
     fn emit_core(&mut self, out: &mut String) -> Result<(), CompileError> {
         out.push_str("function asmModule(stdlib,foreign){'use asm';var F=stdlib.Math.fround,U=stdlib.Math.imul,C=stdlib.Math.clz32,Ma=stdlib.Math.abs,Mc=stdlib.Math.ceil,Mf=stdlib.Math.floor,Ms=stdlib.Math.sqrt,Na=stdlib.NaN,In=stdlib.Infinity,X=foreign.X,ct=foreign.ct,pc=foreign.pc,tr=foreign.tr,ne=foreign.ne,mn=foreign.mn,mx=foreign.mx,cs=foreign.cs,rf=foreign.rf,ri=foreign.ri,rd=foreign.rd,wr=foreign.wr,Y=foreign.Y,y=foreign.y,W=foreign.W,GH=foreign.GH,IC=foreign.IC,AA=foreign.AA,LI=foreign.LI,l=foreign.l,LF=foreign.LF,lf=foreign.lf,SI=foreign.SI,st=foreign.st,SF=foreign.SF,sf=foreign.sf,VL=foreign.VL,vl=foreign.vl,VS=foreign.VS,vs=foreign.vs,MS=foreign.MS,DD=foreign.DD,ED=foreign.ED,TS=foreign.TS,RS=foreign.RS,IG=foreign.IG,G=foreign.G,AB=foreign.AB,AC=foreign.AC,K=foreign.K,N=foreign.N,O=foreign.O,P=foreign.P,Q=foreign.Q,R=foreign.R,L=foreign.L,");
-        if self.max_return_slots == 0 {
-            out.push_str("q0=0;");
+        if self.return_slots.is_empty() {
+            out.push_str("$q0=0;");
         } else {
-            for index in 0..self.max_return_slots {
+            for (index, slot) in self.return_slots.iter().enumerate() {
                 if index != 0 {
                     out.push(',');
                 }
-                write!(out, "q{}=0", short_index(index)).unwrap();
+                let name = slot.components()[0];
+                write!(out, "{name}={}", zero_literal(slot.ty())).unwrap();
             }
             out.push(';');
         }
@@ -805,7 +825,26 @@ impl<'a> ModuleCx<'a> {
         }
         for (defined, global) in self.module.globals.iter().enumerate() {
             let index = self.module.imported_global_count as usize + defined;
-            let value = const_value(&global.init, &self.global_names)?;
+            let value = match global.init {
+                ConstExpr::GlobalGet(source) if source < self.module.imported_global_count => {
+                    let suffix = short_index(source as usize);
+                    match global.ty.ty {
+                        ValType::I32 | ValType::FuncRef(_) => {
+                            Value::I32(format!("foreign.g{suffix}|0"))
+                        }
+                        ValType::I64 => Value::I64(
+                            format!("foreign.g{suffix}|0"),
+                            format!("foreign.h{suffix}|0"),
+                        ),
+                        ValType::F32 => Value::F32(format!("F(foreign.g{suffix})")),
+                        ValType::F64 => Value::F64(format!("+foreign.g{suffix}")),
+                        ValType::V128 => {
+                            unreachable!("SIMD globals cannot cross the host boundary")
+                        }
+                    }
+                }
+                _ => const_value(&global.init, &self.global_names)?,
+            };
             emit_var_value_from_value(out, &self.global_names[index], &value);
         }
         Ok(())
@@ -868,7 +907,9 @@ impl<'a> ModuleCx<'a> {
                 if function_index < self.module.imported_function_count as usize
                     && ty.results.first() == Some(&ValType::I64)
                 {
-                    write!(out, "y={call}|0;q0=gh()|0;return y|0;").unwrap();
+                    let slots = self.return_slots_for(&ty.results);
+                    let slot = slots[0].components()[0];
+                    write!(out, "y={call}|0;{slot}=(gh())|0;return y|0;").unwrap();
                 } else {
                     emit_direct_js_return(
                         out,
@@ -946,14 +987,10 @@ impl<'a> ModuleCx<'a> {
     }
 
     fn emit_export_object(&self, out: &mut String) -> Result<(), CompileError> {
-        for index in 0..self.max_return_slots {
-            write!(
-                out,
-                "function $Q{}(){{return q{}|0}}",
-                short_index(index),
-                short_index(index)
-            )
-            .unwrap();
+        for (index, slot) in self.return_slots.iter().enumerate() {
+            write!(out, "function $Q{}(){{", short_index(index)).unwrap();
+            emit_return_value(out, slot);
+            out.push('}');
         }
         for (index, value) in self.global_names.iter().enumerate() {
             let suffix = short_index(index);
@@ -1012,7 +1049,7 @@ impl<'a> ModuleCx<'a> {
             first = false;
             write!(out, "$start:{}", self.function_names[start as usize]).unwrap();
         }
-        for index in 0..self.max_return_slots {
+        for index in 0..self.return_slots.len() {
             if !first {
                 out.push(',');
             }
@@ -1133,7 +1170,6 @@ enum ControlKind {
     Block,
     Loop,
     If,
-    Try,
 }
 
 #[derive(Debug, Clone)]
@@ -1148,7 +1184,6 @@ struct Control {
     end_reachable: bool,
     then_reachable: bool,
     seen_else: bool,
-    catches: Vec<CatchClause>,
 }
 
 struct CompiledFunction {
@@ -1295,23 +1330,18 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 self.reachable = false;
             }
             Nop => {}
-            Block(sig) => self.begin_control(ControlKind::Block, sig.clone(), Vec::new())?,
-            Loop(sig) => self.begin_control(ControlKind::Loop, sig.clone(), Vec::new())?,
+            Block(sig) => self.begin_control(ControlKind::Block, sig.clone())?,
+            Loop(sig) => self.begin_control(ControlKind::Loop, sig.clone())?,
             If(sig) => {
                 let condition = if self.reachable {
                     self.pop_i32()?.to_string()
                 } else {
                     "0".into()
                 };
-                self.begin_control_with_condition(
-                    ControlKind::If,
-                    sig.clone(),
-                    condition,
-                    Vec::new(),
-                )?;
+                self.begin_control_with_condition(ControlKind::If, sig.clone(), condition)?;
             }
-            TryTable { sig, catches } => {
-                self.begin_control(ControlKind::Try, sig.clone(), catches.clone())?
+            TryTable { .. } | Throw(_) => {
+                return Err(self.internal("exception operation reached the asm.js emitter"));
             }
             Else => self.emit_else()?,
             End => self.end_control()?,
@@ -1530,7 +1560,6 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 self.stack.push(value);
             }
             Simd(op) => self.emit_simd(op)?,
-            Throw(tag) => self.emit_throw(*tag)?,
             Unsupported {
                 feature,
                 instruction,
@@ -1545,18 +1574,8 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         Ok(())
     }
 
-    fn begin_control(
-        &mut self,
-        kind: ControlKind,
-        sig: BlockSig,
-        catches: Vec<CatchClause>,
-    ) -> Result<(), CompileError> {
-        let condition = if kind == ControlKind::Try {
-            Some("try".to_string())
-        } else {
-            None
-        };
-        self.begin_control_impl(kind, sig, condition, catches)
+    fn begin_control(&mut self, kind: ControlKind, sig: BlockSig) -> Result<(), CompileError> {
+        self.begin_control_impl(kind, sig, None)
     }
 
     fn begin_control_with_condition(
@@ -1564,9 +1583,8 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         kind: ControlKind,
         sig: BlockSig,
         condition: String,
-        catches: Vec<CatchClause>,
     ) -> Result<(), CompileError> {
-        self.begin_control_impl(kind, sig, Some(condition), catches)
+        self.begin_control_impl(kind, sig, Some(condition))
     }
 
     fn begin_control_impl(
@@ -1574,7 +1592,6 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         kind: ControlKind,
         sig: BlockSig,
         condition: Option<String>,
-        catches: Vec<CatchClause>,
     ) -> Result<(), CompileError> {
         let params = if self.reachable {
             self.pop_types(&sig.params)?
@@ -1601,7 +1618,6 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 condition.as_deref().unwrap_or("0")
             )
             .unwrap(),
-            ControlKind::Try => write!(self.body, "{label}:try{{").unwrap(),
         }
         self.controls.push(Control {
             kind,
@@ -1614,7 +1630,6 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             end_reachable: false,
             then_reachable: false,
             seen_else: false,
-            catches,
         });
         Ok(())
     }
@@ -1666,13 +1681,6 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 }
                 self.body.push('}');
             }
-            ControlKind::Try => {
-                self.body.push_str("}catch(ex){");
-                for catch in &control.catches {
-                    self.emit_catch(catch)?;
-                }
-                self.body.push_str("throw ex}");
-            }
             _ => self.body.push('}'),
         }
         let after = match control.kind {
@@ -1687,84 +1695,6 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             self.stack.append(&mut control.result_values);
         }
         self.reachable = after;
-        Ok(())
-    }
-
-    fn emit_catch(&mut self, catch: &CatchClause) -> Result<(), CompileError> {
-        let (condition, label, tag) = match *catch {
-            CatchClause::Tag { tag, label } => (format!("ex&&ex.t=={tag}"), label, Some(tag)),
-            CatchClause::All { label } => ("ex&&ex.w==1".into(), label, None),
-        };
-        write!(self.body, "if({condition}){{").unwrap();
-        let target_index = self
-            .controls
-            .len()
-            .checked_sub(1 + label as usize)
-            .ok_or_else(|| self.internal("invalid catch target"))?;
-        let branch_types = if self.controls[target_index].kind == ControlKind::Loop {
-            self.controls[target_index]
-                .params
-                .iter()
-                .map(Value::ty)
-                .collect::<Vec<_>>()
-        } else {
-            self.controls[target_index].results.clone()
-        };
-        let mut values = Vec::new();
-        if let Some(tag) = tag {
-            let type_index = *self
-                .module
-                .module
-                .tags
-                .get(tag as usize)
-                .ok_or_else(|| self.internal("invalid tag index"))?;
-            let tag_ty = self
-                .module
-                .module
-                .types
-                .get(type_index as usize)
-                .ok_or_else(|| self.internal("invalid tag type"))?;
-            let mut component = 0usize;
-            for &ty in &tag_ty.params {
-                values.push(match ty {
-                    ValType::I64 => {
-                        let v = Value::I64(
-                            format!("ex.v[{component}]|0"),
-                            format!("ex.v[{}]|0", component + 1),
-                        );
-                        component += 2;
-                        v
-                    }
-                    ValType::F32 => {
-                        let v = Value::F32(format!("F(ex.v[{component}])"));
-                        component += 1;
-                        v
-                    }
-                    ValType::F64 => {
-                        let v = Value::F64(format!("+ex.v[{component}]"));
-                        component += 1;
-                        v
-                    }
-                    ValType::I32 => {
-                        let v = Value::I32(format!("ex.v[{component}]|0"));
-                        component += 1;
-                        v
-                    }
-                    _ => {
-                        return Err(CompileError::unsupported(
-                            "exception payload",
-                            None,
-                            "only scalar numeric exception payloads are supported",
-                        ));
-                    }
-                });
-            }
-        }
-        if values.len() != branch_types.len() {
-            return Err(self.internal("exception payload does not match catch label"));
-        }
-        self.emit_branch_to_index(target_index, &values)?;
-        self.body.push('}');
         Ok(())
     }
 
@@ -1846,7 +1776,8 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         } else {
             self.pop_types(&results)?
         };
-        emit_return_abi(&mut self.body, &values, &self.module.return_slots);
+        let slots = self.module.return_slots_for(&results);
+        emit_return_abi(&mut self.body, &values, &slots);
         self.reachable = false;
         Ok(())
     }
@@ -1980,19 +1911,14 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             ValType::I64 | ValType::V128 => ValType::I32,
             other => other,
         });
-        let values = call_result_values(
-            results,
-            &call,
-            &self.module.return_slots,
-            &mut self.body,
-            primary,
-            imported,
-        )?;
+        let slots = self.module.return_slots_for(results);
+        let values = call_result_values(results, &call, &slots, &mut self.body, primary, imported)?;
         if imported && results.first() == Some(&ValType::I64) {
-            self.body.push_str("qa=gh()|0;");
+            let slot = slots[0].components()[0];
+            write!(self.body, "{slot}=(gh())|0;").unwrap();
         }
         if tail {
-            emit_return_abi(&mut self.body, &values, &self.module.return_slots);
+            emit_return_abi(&mut self.body, &values, &slots);
             self.reachable = false;
         } else {
             self.stack.extend(values);
@@ -2165,13 +2091,13 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 let (lo, hi) = expect_i64(value)?;
                 let lo = compact_i32(&lo);
                 let hi = compact_i32(&hi);
-                Value::F32(format!("F(+({hi})*4294967296.0+(+({lo}>>>0)))"))
+                Value::F32(format!("F(+({hi})*4294967296.0+(+(({lo})>>>0)))"))
             }
             F32ConvertI64U => {
                 let (lo, hi) = expect_i64(value)?;
                 let lo = compact_i32(&lo);
                 let hi = compact_i32(&hi);
-                Value::F32(format!("F(+({hi}>>>0)*4294967296.0+(+({lo}>>>0)))"))
+                Value::F32(format!("F(+(({hi})>>>0)*4294967296.0+(+(({lo})>>>0)))"))
             }
             F32DemoteF64 => Value::F32(format!("F({})", expect_f64(value)?)),
             F64ConvertI32S => Value::F64(format!("+({})", compact_i32(value.i32_expr()?))),
@@ -2180,13 +2106,13 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 let (lo, hi) = expect_i64(value)?;
                 let lo = compact_i32(&lo);
                 let hi = compact_i32(&hi);
-                Value::F64(format!("+(+({hi})*4294967296.0+(+({lo}>>>0)))"))
+                Value::F64(format!("+(+({hi})*4294967296.0+(+(({lo})>>>0)))"))
             }
             F64ConvertI64U => {
                 let (lo, hi) = expect_i64(value)?;
                 let lo = compact_i32(&lo);
                 let hi = compact_i32(&hi);
-                Value::F64(format!("+(+({hi}>>>0)*4294967296.0+(+({lo}>>>0)))"))
+                Value::F64(format!("+(+(({hi})>>>0)*4294967296.0+(+(({lo})>>>0)))"))
             }
             F64PromoteF32 => Value::F64(format!("+({})", expect_f32(value)?)),
             I32ReinterpretF32 => Value::I32(format!(
@@ -2215,12 +2141,18 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             I32Extend8S => Value::I32(format!("(({})<<24)>>24", value.i32_expr()?)),
             I32Extend16S => Value::I32(format!("(({})<<16)>>16", value.i32_expr()?)),
             I64Extend8S => {
-                let x = value.i32_expr()?;
-                Value::I64(format!("(({x})<<24)>>24"), format!("((({x})<<24)>>24)>>31"))
+                let (lo, _) = expect_i64(value)?;
+                Value::I64(
+                    format!("(({lo})<<24)>>24"),
+                    format!("((({lo})<<24)>>24)>>31"),
+                )
             }
             I64Extend16S => {
-                let x = value.i32_expr()?;
-                Value::I64(format!("(({x})<<16)>>16"), format!("((({x})<<16)>>16)>>31"))
+                let (lo, _) = expect_i64(value)?;
+                Value::I64(
+                    format!("(({lo})<<16)>>16"),
+                    format!("((({lo})<<16)>>16)>>31"),
+                )
             }
             I64Extend32S => {
                 let (lo, _) = expect_i64(value)?;
@@ -2812,34 +2744,6 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         Ok(())
     }
 
-    fn emit_throw(&mut self, tag: u32) -> Result<(), CompileError> {
-        let type_index = *self
-            .module
-            .module
-            .tags
-            .get(tag as usize)
-            .ok_or_else(|| self.internal("invalid tag index"))?;
-        let ty = self
-            .module
-            .module
-            .types
-            .get(type_index as usize)
-            .ok_or_else(|| self.internal("invalid tag type"))?
-            .clone();
-        if ty.params.iter().any(|t| !t.is_scalar()) {
-            return Err(CompileError::unsupported(
-                "exception payload",
-                None,
-                "only numeric scalar payloads are supported",
-            ));
-        }
-        let values = self.pop_types(&ty.params)?;
-        let flat = flatten_names(&values);
-        write!(self.body, "throw{{w:1,t:{tag},v:[{}]}};", flat.join(",")).unwrap();
-        self.reachable = false;
-        Ok(())
-    }
-
     fn pop_address(&mut self, memory64: bool) -> Result<(String, String), CompileError> {
         if memory64 {
             let (lo, hi) = expect_i64(self.pop()?)?;
@@ -3011,7 +2915,11 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
 fn compiled_function_body(code: &str) -> Option<&str> {
     let open = code.find('{')?;
     let close = code.rfind('}')?;
-    (open < close).then_some(&code[open + 1..close])
+    if open < close {
+        Some(&code[open + 1..close])
+    } else {
+        None
+    }
 }
 fn call_name_before(body: &str, open: usize) -> Option<&str> {
     let bytes = body.as_bytes();
@@ -3291,7 +3199,7 @@ fn emit_var_value_from_value(out: &mut String, target: &Value, value: &Value) {
 }
 fn emit_return_value(out: &mut String, value: &Value) {
     match value {
-        Value::I64(lo, hi) => write!(out, "q0={hi}|0;return {lo}|0;").unwrap(),
+        Value::I64(lo, hi) => write!(out, "$q0={hi}|0;return {lo}|0;").unwrap(),
         Value::F32(x) => write!(out, "return {};", coerce(ValType::F32, x)).unwrap(),
         Value::F64(x) => write!(out, "return {};", coerce(ValType::F64, x)).unwrap(),
         Value::I32(x) | Value::Ref(x) => write!(out, "return {x}|0;").unwrap(),
@@ -3319,9 +3227,14 @@ fn emit_direct_js_return(out: &mut String, results: &[ValType], call: &str, exte
         }
     }
 }
-fn emit_primary_export_value(out: &mut String, ty: Option<ValType>, name: &str) {
+fn emit_primary_export_value(
+    out: &mut String,
+    ty: Option<ValType>,
+    name: &str,
+    high_slot: Option<usize>,
+) {
     match ty {
-        Some(ValType::I64) => write!(out, "[{name},q[0]()]").unwrap(),
+        Some(ValType::I64) => write!(out, "[{name},q[{}]()]", high_slot.unwrap()).unwrap(),
         _ => out.push_str(name),
     }
 }
@@ -3390,11 +3303,82 @@ fn return_slot_types(results: &[ValType]) -> Vec<ValType> {
                 out.push(ValType::I32)
             }
             ValType::V128 => out.extend([ValType::I32; 4]),
-            other => out.push(other),
+            other => out.push(component_decl_type(other, "")),
         }
     }
     out
 }
+
+fn return_slot_class(ty: ValType) -> usize {
+    match ty {
+        ValType::I32 => 0,
+        ValType::F32 => 1,
+        ValType::F64 => 2,
+        _ => unreachable!("return slot components are scalar asm.js types"),
+    }
+}
+
+fn return_slot_layout(module: &Module) -> ([usize; 3], Vec<Value>) {
+    let mut counts = [0; 3];
+    for ty in &module.types {
+        let mut signature_counts = [0; 3];
+        for slot_ty in return_slot_types(&ty.results) {
+            signature_counts[return_slot_class(slot_ty)] += 1;
+        }
+        for class in 0..3 {
+            counts[class] = counts[class].max(signature_counts[class]);
+        }
+    }
+
+    let mut slots = Vec::with_capacity(counts.iter().sum());
+    for (class, (ty, prefix)) in [
+        (ValType::I32, "$i"),
+        (ValType::F32, "$f"),
+        (ValType::F64, "$d"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for index in 0..counts[class] {
+            slots.push(named_value(ty, &format!("{prefix}{}", short_index(index))));
+        }
+    }
+    (counts, slots)
+}
+
+fn return_slot_indices(results: &[ValType], counts: [usize; 3]) -> Vec<usize> {
+    let bases = [0, counts[0], counts[0] + counts[1]];
+    let mut used = [0; 3];
+    return_slot_types(results)
+        .into_iter()
+        .map(|ty| {
+            let class = return_slot_class(ty);
+            let index = bases[class] + used[class];
+            used[class] += 1;
+            index
+        })
+        .collect()
+}
+fn emit_return_slot_assignment(out: &mut String, slot: &Value, value: &Value, component: &str) {
+    let target = slot.components()[0];
+    let expression = match (
+        value_component_type(slot, target),
+        value_component_type(value, component),
+    ) {
+        (ValType::F64, ValType::I32) => format!("+(({component})|0)"),
+        (ValType::F64, _) => format!("+({component})"),
+        (target_type, _) => coerce(target_type, &format!("({component})")),
+    };
+    write!(out, "{target}={expression};").unwrap();
+}
+
+fn return_slot_expression(slot: &Value, ty: ValType) -> String {
+    coerce(
+        component_decl_type(ty, slot.components()[0]),
+        slot.components()[0],
+    )
+}
+
 fn emit_return_abi(out: &mut String, values: &[Value], slots: &[Value]) {
     if values.is_empty() {
         out.push_str("return;");
@@ -3403,12 +3387,12 @@ fn emit_return_abi(out: &mut String, values: &[Value], slots: &[Value]) {
     let mut slot = 0usize;
     match &values[0] {
         Value::I64(_, hi) => {
-            write!(out, "{}={hi}|0;", slots[slot].i32_expr().unwrap()).unwrap();
+            emit_return_slot_assignment(out, &slots[slot], &values[0], hi);
             slot += 1
         }
-        Value::V128(a) => {
-            for component in a.iter().skip(1) {
-                write!(out, "{}={component}|0;", slots[slot].i32_expr().unwrap()).unwrap();
+        Value::V128(components) => {
+            for component in components.iter().skip(1) {
+                emit_return_slot_assignment(out, &slots[slot], &values[0], component);
                 slot += 1
             }
         }
@@ -3416,13 +3400,7 @@ fn emit_return_abi(out: &mut String, values: &[Value], slots: &[Value]) {
     }
     for value in values.iter().skip(1) {
         for component in value.components() {
-            write!(
-                out,
-                "{}={};",
-                slots[slot].i32_expr().unwrap(),
-                coerce(value_component_type(value, component), component)
-            )
-            .unwrap();
+            emit_return_slot_assignment(out, &slots[slot], value, component);
             slot += 1;
         }
     }
@@ -3431,7 +3409,7 @@ fn emit_return_abi(out: &mut String, values: &[Value], slots: &[Value]) {
         Value::I64(lo, _) => write!(out, "return {lo}|0;").unwrap(),
         Value::F32(x) => write!(out, "return {};", coerce(ValType::F32, x)).unwrap(),
         Value::F64(x) => write!(out, "return {};", coerce(ValType::F64, x)).unwrap(),
-        Value::V128(a) => write!(out, "return {}|0;", a[0]).unwrap(),
+        Value::V128(components) => write!(out, "return {}|0;", components[0]).unwrap(),
     }
 }
 fn call_result_values(
@@ -3458,15 +3436,18 @@ fn call_result_values(
     let mut slot = 0usize;
     match results[0] {
         ValType::I64 => {
-            out.push(Value::I64(name, slots[0].i32_expr()?.into()));
+            out.push(Value::I64(
+                name,
+                return_slot_expression(&slots[0], ValType::I32),
+            ));
             slot = 1
         }
         ValType::V128 => {
             out.push(Value::V128([
                 name,
-                slots[0].i32_expr()?.into(),
-                slots[1].i32_expr()?.into(),
-                slots[2].i32_expr()?.into(),
+                return_slot_expression(&slots[0], ValType::I32),
+                return_slot_expression(&slots[1], ValType::I32),
+                return_slot_expression(&slots[2], ValType::I32),
             ]));
             slot = 3
         }
@@ -3475,39 +3456,39 @@ fn call_result_values(
     for &ty in results.iter().skip(1) {
         let value = match ty {
             ValType::I64 => {
-                let v = Value::I64(
-                    slots[slot].i32_expr()?.into(),
-                    slots[slot + 1].i32_expr()?.into(),
+                let value = Value::I64(
+                    return_slot_expression(&slots[slot], ValType::I32),
+                    return_slot_expression(&slots[slot + 1], ValType::I32),
                 );
                 slot += 2;
-                v
+                value
             }
             ValType::V128 => {
-                let v = Value::V128(std::array::from_fn(|i| {
-                    slots[slot + i].i32_expr().unwrap().into()
+                let value = Value::V128(std::array::from_fn(|index| {
+                    return_slot_expression(&slots[slot + index], ValType::I32)
                 }));
                 slot += 4;
-                v
+                value
             }
             ValType::I32 => {
-                let v = Value::I32(slots[slot].i32_expr()?.into());
+                let value = Value::I32(return_slot_expression(&slots[slot], ValType::I32));
                 slot += 1;
-                v
+                value
             }
             ValType::FuncRef(_) => {
-                let v = Value::Ref(slots[slot].i32_expr()?.into());
+                let value = Value::Ref(return_slot_expression(&slots[slot], ValType::I32));
                 slot += 1;
-                v
+                value
             }
             ValType::F32 => {
-                let v = Value::F32(slots[slot].i32_expr()?.into());
+                let value = Value::F32(return_slot_expression(&slots[slot], ValType::F32));
                 slot += 1;
-                v
+                value
             }
             ValType::F64 => {
-                let v = Value::F64(slots[slot].i32_expr()?.into());
+                let value = Value::F64(return_slot_expression(&slots[slot], ValType::F64));
                 slot += 1;
-                v
+                value
             }
         };
         out.push(value)

@@ -1,0 +1,2 @@
+[alias]
+coverage = 'llvm-cov --all-targets --ignore-filename-regex src/(main|cli)\.rs --fail-under-lines 90'

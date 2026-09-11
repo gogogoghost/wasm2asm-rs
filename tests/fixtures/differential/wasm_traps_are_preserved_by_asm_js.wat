@@ -1,0 +1,11 @@
+(module
+      (memory 1)
+      (func (export "unreachable") unreachable)
+      (func (export "divideByZero") (result i32)
+        i32.const 1 i32.const 0 i32.div_s)
+      (func (export "overflow") (result i32)
+        i32.const -2147483648 i32.const -1 i32.div_s)
+      (func (export "outOfBounds") (result i32)
+        i32.const 65535 i32.load)
+      (func (export "invalidConversion") (result i32)
+        f64.const nan i32.trunc_f64_s))

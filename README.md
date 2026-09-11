@@ -29,6 +29,26 @@ The executable is written to:
 target/release/wasm2asm
 ```
 
+## Testing
+
+The end-to-end differential suite compiles each standalone WAT fixture under `tests/fixtures/differential/` to both native WebAssembly and generated asm.js, executes both in SpiderMonkey, normalizes JavaScript and i64 results, and requires exact equality. Install the SpiderMonkey shell as `js140`, or set `SPIDERMONKEY_JS` to another compatible shell path. Node.js is also required for the ES module and UMD wrapper checks.
+
+Run the complete test suite:
+
+```bash
+cargo test --locked
+```
+
+Install the Rust coverage tooling once, then run the enforced coverage command:
+
+```bash
+rustup component add llvm-tools-preview
+cargo install cargo-llvm-cov --locked
+cargo coverage --locked
+```
+
+`cargo coverage` executes all test targets, excludes the CLI argument/wiring files from the conversion-logic metric, and fails when line coverage is below 90%.
+
 ## Quick start
 
 The default output format is an ES module suitable for Vite, Rollup, webpack, and other modern build systems:
