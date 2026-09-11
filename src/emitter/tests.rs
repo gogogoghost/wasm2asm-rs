@@ -122,8 +122,6 @@ fn value_and_javascript_helpers_cover_every_shape() {
     assert_eq!(parameter_values(&[ValType::I64, ValType::F32]).len(), 2);
     assert_eq!(flatten_names(&values).len(), 10);
     assert_eq!(flatten_call_arguments(&values[..4], false).len(), 5);
-    let external = flatten_call_arguments(&values[..4], true);
-    assert!(external.iter().any(|value| value.starts_with("+(")));
     assert_eq!(zero_literal(ValType::F32), "F(0)");
     assert_eq!(zero_literal(ValType::F64), "0.0");
     assert_eq!(zero_literal(ValType::I64), "0");

@@ -12,15 +12,15 @@ pub fn emit(module: &Module, options: &CompileOptions) -> Result<Vec<u8>, Compil
     validate_boundaries(module)?;
     let mut cx = ModuleCx::new(module, options)?;
     let bare = cx.emit_module()?;
-    let javascript = format_output(bare, options)?;
-    if options.limits.max_js_bytes != 0 && javascript.len() > options.limits.max_js_bytes {
+    let output = format_output(bare, options)?.into_bytes();
+    if options.limits.max_js_bytes != 0 && output.len() > options.limits.max_js_bytes {
         return Err(CompileError::limit(
             "generated JavaScript bytes",
-            javascript.len(),
+            output.len(),
             options.limits.max_js_bytes,
         ));
     }
-    Ok(javascript.into_bytes())
+    Ok(output)
 }
 
 fn format_output(mut bare: String, options: &CompileOptions) -> Result<String, CompileError> {
@@ -317,6 +317,7 @@ impl<'a> ModuleCx<'a> {
     fn emit_module(&mut self) -> Result<String, CompileError> {
         let mut out = String::new();
         self.emit_core(&mut out)?;
+        out = out.replace(";}", "}");
         self.emit_wrapper_prefix(&mut out)?;
         self.emit_wrapper_suffix(&mut out)?;
         Ok(out)
@@ -1400,7 +1401,9 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             }
         }
         out.push('}');
-        Ok(out)
+        let mut identifiers = all_components[param_components..].to_vec();
+        identifiers.extend(self.declarations.iter().map(|(name, _)| name.clone()));
+        Ok(rename_function_locals(&out, &identifiers, &flat_params))
     }
 
     fn emit_instruction(&mut self, instruction: &Instr) -> Result<(), CompileError> {
@@ -1628,7 +1631,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             RefIsNull => {
                 let value = self.pop()?;
                 self.stack
-                    .push(Value::I32(format!("((({})|0)==0)|0", value.i32_expr()?)));
+                    .push(Value::I32(format!("(({})|0)==0|0", value.i32_expr()?)));
             }
             RefFunc(index) => self.stack.push(Value::Ref((index + 1).to_string())),
             RefTest(type_index) => {
@@ -1705,8 +1708,8 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             ControlKind::Loop => write!(self.body, "{label}:for(;;){{").unwrap(),
             ControlKind::If => write!(
                 self.body,
-                "{label}:if({}){{",
-                condition.as_deref().unwrap_or("0")
+                "{label}:if{}{{",
+                condition_syntax(condition.as_deref().unwrap_or("0"))
             )
             .unwrap(),
         }
@@ -1816,11 +1819,12 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let condition = compact_condition(&self.pop_i32()?);
         let target = self.target_index(depth)?;
         let values = self.peek_types(&self.branch_types(target))?;
+        let condition = condition_syntax(&condition);
         if values.is_empty() {
-            write!(self.body, "if({condition})").unwrap();
+            write!(self.body, "if{condition}").unwrap();
             self.emit_branch_to_index(target, &values)?;
         } else {
-            write!(self.body, "if({condition}){{").unwrap();
+            write!(self.body, "if{condition}{{").unwrap();
             self.emit_branch_to_index(target, &values)?;
             self.body.push('}');
         }
@@ -2058,7 +2062,12 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             )),
             (left, right) => {
                 let result = self.temp(left.ty());
-                write!(self.body, "if({}){{", compact_i32(&condition)).unwrap();
+                write!(
+                    self.body,
+                    "if{}{{",
+                    condition_syntax(&compact_i32(&condition))
+                )
+                .unwrap();
                 self.assign(&result, &left);
                 self.body.push_str("}else{");
                 self.assign(&result, &right);
@@ -2075,19 +2084,15 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let value = self.pop()?;
         let result = match op {
             I32Eqz => Value::I32(format!(
-                "({}==0)|0",
+                "{}==0|0",
                 compact_compare_operand(value.i32_expr()?, false)
             )),
-            I32Clz => Value::I32(format!("C({})|0", compact_i32(value.i32_expr()?))),
+            I32Clz => Value::I32(format!("C({})", compact_i32(value.i32_expr()?))),
             I32Ctz => Value::I32(format!("ct({})|0", compact_i32(value.i32_expr()?))),
             I32Popcnt => Value::I32(format!("pc({})|0", compact_i32(value.i32_expr()?))),
             I64Eqz => {
                 let (lo, hi) = expect_i64(value)?;
-                Value::I32(format!(
-                    "(({}|{})==0)|0",
-                    compact_i32(&lo),
-                    compact_i32(&hi)
-                ))
+                Value::I32(format!("({}|{})==0|0", compact_i32(&lo), compact_i32(&hi)))
             }
             I64Clz => {
                 let (lo, hi) = expect_i64(value)?;
@@ -2305,7 +2310,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             I32Sub => i32_bin(left, right, "-")?,
             I32Mul => {
                 let (a, b) = expect_i32_pair(left, right)?;
-                Value::I32(format!("U({a},{b})|0"))
+                Value::I32(format!("U({a},{b})"))
             }
             I32DivS | I32DivU | I32RemS | I32RemU => self.i32_divrem(left, right, op)?,
             I32And => i32_bin(left, right, "&")?,
@@ -2315,21 +2320,21 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             I32ShrS => i32_bin(left, right, ">>")?,
             I32ShrU => {
                 let (a, b) = expect_i32_pair(left, right)?;
-                let a = compact_operand(&a);
+                let a = compact_unsigned_i32_operand(&a);
                 let b = compact_operand(&b);
-                Value::I32(format!("({a}>>>({b}&31))|0"))
+                Value::I32(format!("({a}>>>{b})|0"))
             }
             I32Rotl => {
                 let (a, b) = expect_i32_pair(left, right)?;
                 let a = compact_operand(&a);
                 let b = compact_operand(&b);
-                Value::I32(format!("(({a}<<({b}&31))|({a}>>>(32-({b}&31))))|0"))
+                Value::I32(format!("({a}<<{b})|({a}>>>(-{b}))"))
             }
             I32Rotr => {
                 let (a, b) = expect_i32_pair(left, right)?;
                 let a = compact_operand(&a);
                 let b = compact_operand(&b);
-                Value::I32(format!("(({a}>>>({b}&31))|({a}<<(32-({b}&31))))|0"))
+                Value::I32(format!("({a}>>>{b})|({a}<<(-{b}))"))
             }
             I64Eq | I64Ne | I64LtS | I64LtU | I64GtS | I64GtU | I64LeS | I64LeU | I64GeS
             | I64GeU => i64_compare(left, right, op)?,
@@ -2376,10 +2381,18 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             }
         }
         let expr = match op {
-            BinaryOp::I32DivS => format!("(({a_i32})/({b_i32}))|0"),
-            BinaryOp::I32DivU => format!("((({a_i32})>>>0)/(({b_i32})>>>0))>>>0|0"),
-            BinaryOp::I32RemS => format!("(({a_i32})%({b_i32}))|0"),
-            BinaryOp::I32RemU => format!("((({a_i32})>>>0)%(({b_i32})>>>0))>>>0|0"),
+            BinaryOp::I32DivS => format!("({a_i32})/({b_i32})|0"),
+            BinaryOp::I32DivU => format!(
+                "({}>>>0)/({}>>>0)>>>0|0",
+                compact_unsigned_i32_operand(&a),
+                compact_unsigned_i32_operand(&b)
+            ),
+            BinaryOp::I32RemS => format!("({a_i32})%({b_i32})|0"),
+            BinaryOp::I32RemU => format!(
+                "({}>>>0)%({}>>>0)>>>0|0",
+                compact_unsigned_i32_operand(&a),
+                compact_unsigned_i32_operand(&b)
+            ),
             _ => unreachable!(),
         };
         Ok(Value::I32(expr))
@@ -3031,6 +3044,110 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     }
 }
 
+fn rename_function_locals(source: &str, identifiers: &[String], reserved: &[String]) -> String {
+    if identifiers.len() < 2 {
+        return source.into();
+    }
+    let mut counts = identifiers
+        .iter()
+        .cloned()
+        .map(|identifier| (identifier, 0usize))
+        .collect::<BTreeMap<_, _>>();
+    visit_local_identifiers(source, |identifier| {
+        if let Some(count) = counts.get_mut(identifier) {
+            *count += 1;
+        }
+    });
+    let mut ranked = identifiers.iter().enumerate().collect::<Vec<_>>();
+    ranked.sort_by(|(left_index, left), (right_index, right)| {
+        counts[*right]
+            .cmp(&counts[*left])
+            .then_with(|| left_index.cmp(right_index))
+    });
+    let reserved = reserved.iter().map(String::as_str).collect::<BTreeSet<_>>();
+    let mut replacements = BTreeMap::new();
+    let mut candidate = 0usize;
+    for (_, identifier) in ranked {
+        let replacement = loop {
+            let replacement = compact_index(candidate);
+            candidate += 1;
+            if !reserved.contains(replacement.as_str()) {
+                break replacement;
+            }
+        };
+        replacements.insert(identifier.as_str(), replacement);
+    }
+
+    let mut output = String::with_capacity(source.len());
+    let mut copied = 0usize;
+    visit_local_identifier_spans(source, |start, end| {
+        if let Some(replacement) = replacements.get(&source[start..end]) {
+            output.push_str(&source[copied..start]);
+            output.push_str(replacement);
+            copied = end;
+        }
+    });
+    if copied == 0 {
+        return source.into();
+    }
+    output.push_str(&source[copied..]);
+    output
+}
+
+fn visit_local_identifiers<'a>(source: &'a str, mut visit: impl FnMut(&'a str)) {
+    visit_local_identifier_spans(source, |start, end| visit(&source[start..end]));
+}
+
+fn visit_local_identifier_spans(source: &str, mut visit: impl FnMut(usize, usize)) {
+    let bytes = source.as_bytes();
+    let mut index = 0usize;
+    while index < bytes.len() {
+        if !bytes[index].is_ascii_alphabetic() && !matches!(bytes[index], b'_' | b'$') {
+            index += 1;
+            continue;
+        }
+        let start = index;
+        if index != 0 && (bytes[index - 1].is_ascii_digit() || bytes[index - 1] == b'.') {
+            index += 1;
+            continue;
+        }
+        index += 1;
+        while bytes
+            .get(index)
+            .is_some_and(|byte| is_js_identifier_byte(*byte))
+        {
+            index += 1;
+        }
+        if local_identifier_context_is_eligible(source, start, index) {
+            visit(start, index);
+        }
+    }
+}
+
+fn local_identifier_context_is_eligible(source: &str, start: usize, end: usize) -> bool {
+    let bytes = source.as_bytes();
+    let previous = (0..start)
+        .rev()
+        .find(|&index| !bytes[index].is_ascii_whitespace())
+        .map(|index| bytes[index]);
+    let next = (end..bytes.len())
+        .find(|&index| !bytes[index].is_ascii_whitespace())
+        .map(|index| bytes[index]);
+    let key_or_label =
+        next == Some(b':') && previous.is_none_or(|byte| matches!(byte, b'{' | b'}' | b';' | b','));
+    if previous == Some(b'.') || key_or_label {
+        return false;
+    }
+    let mut previous_end = start;
+    while previous_end != 0 && bytes[previous_end - 1].is_ascii_whitespace() {
+        previous_end -= 1;
+    }
+    let mut previous_start = previous_end;
+    while previous_start != 0 && is_js_identifier_byte(bytes[previous_start - 1]) {
+        previous_start -= 1;
+    }
+    !matches!(&source[previous_start..previous_end], "break" | "continue")
+}
 fn generated_call_arguments<'a>(
     source: &'a str,
     start: usize,
@@ -3403,13 +3520,24 @@ fn flatten_call_arguments(values: &[Value], external: bool) -> Vec<String> {
                     return component.to_string();
                 }
                 match value_component_type(value, component) {
-                    ValType::F32 | ValType::F64 => format!("+({component})"),
-                    _ => format!("({component})|0"),
+                    ValType::F32 | ValType::F64 => compact_float_argument(component),
+                    _ => compact_external_i32_argument(component),
                 }
             })
         })
         .collect()
 }
+fn compact_external_i32_argument(value: &str) -> String {
+    let value = strip_redundant_atom_parentheses(value.trim());
+    if value.ends_with("|0") {
+        value.into()
+    } else if is_js_atom(value) {
+        format!("{value}|0")
+    } else {
+        format!("({value})|0")
+    }
+}
+
 fn zero_literal(ty: ValType) -> &'static str {
     match ty {
         ValType::F32 => "F(0)",
@@ -3418,9 +3546,13 @@ fn zero_literal(ty: ValType) -> &'static str {
     }
 }
 fn coerce(ty: ValType, value: &str) -> String {
+    let value = strip_redundant_atom_parentheses(value.trim());
     match ty {
         ValType::I32 | ValType::I64 | ValType::FuncRef(_) | ValType::V128 => {
-            if value.parse::<i32>().is_ok() || value.ends_with("|0") {
+            if value.parse::<i32>().is_ok()
+                || value.ends_with("|0")
+                || is_signed_i32_expression(value)
+            {
                 value.to_string()
             } else {
                 format!("{value}|0")
@@ -3890,8 +4022,19 @@ fn is_js_atom(value: &str) -> bool {
             .chars()
             .all(|value| value.is_ascii_digit() || matches!(value, '.' | 'e' | 'E'))
 }
+fn strip_redundant_atom_parentheses(mut value: &str) -> &str {
+    while is_fully_parenthesized(value) {
+        let inner = &value[1..value.len() - 1];
+        if !is_js_atom(inner) {
+            break;
+        }
+        value = inner;
+    }
+    value
+}
+
 fn compact_operand(value: &str) -> String {
-    let value = value.trim();
+    let value = strip_redundant_atom_parentheses(value.trim());
     if value.starts_with(['+', '-']) {
         format!("({value})")
     } else if is_js_atom(value) {
@@ -3901,8 +4044,8 @@ fn compact_operand(value: &str) -> String {
     }
 }
 fn compact_i32(value: &str) -> String {
-    let value = value.trim();
-    if value.ends_with("|0") {
+    let value = strip_redundant_atom_parentheses(value.trim());
+    if value.ends_with("|0") || is_signed_i32_expression(value) {
         value.into()
     } else if is_js_atom(value) {
         format!("{value}|0")
@@ -3910,23 +4053,80 @@ fn compact_i32(value: &str) -> String {
         format!("({value})|0")
     }
 }
+
+fn is_signed_i32_expression(value: &str) -> bool {
+    let value = value.trim();
+    if (value.starts_with("U(") || value.starts_with("C(")) && is_js_call(value) {
+        return true;
+    }
+    let value = if is_fully_parenthesized(value) {
+        &value[1..value.len() - 1]
+    } else {
+        value
+    };
+    let bytes = value.as_bytes();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'&' | b'^' if depth == 0 => return true,
+            b'|' if depth == 0
+                && bytes.get(index.wrapping_sub(1)) != Some(&b'|')
+                && bytes.get(index + 1) != Some(&b'|') =>
+            {
+                return true;
+            }
+            b'<' if depth == 0 && bytes.get(index + 1) == Some(&b'<') => return true,
+            b'>' if depth == 0
+                && bytes.get(index + 1) == Some(&b'>')
+                && bytes.get(index + 2) != Some(&b'>') =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
+}
+
+fn condition_syntax(value: &str) -> String {
+    if is_fully_parenthesized(value) {
+        value.into()
+    } else {
+        format!("({value})")
+    }
+}
 fn compact_condition(value: &str) -> String {
     let value = value.trim();
     let Some(parenthesized) = value.strip_suffix("|0") else {
         return value.into();
     };
-    if !is_fully_parenthesized(parenthesized) {
-        return value.into();
-    }
-    let inner = &parenthesized[1..parenthesized.len() - 1];
-    for (operator, negate) in [("==0", true), ("!=0", false)] {
-        if let Some(operand) = inner.strip_suffix(operator)
-            && let Some(identifier) = coerced_identifier(operand)
-        {
+    let inner = if is_fully_parenthesized(parenthesized) {
+        &parenthesized[1..parenthesized.len() - 1]
+    } else {
+        parenthesized
+    };
+    for (operator, negate) in [
+        ("==0", true),
+        ("!=0", false),
+        ("==(0|0)", true),
+        ("!=(0|0)", false),
+    ] {
+        if let Some(operand) = inner.strip_suffix(operator) {
+            if let Some(identifier) = condition_identifier(operand) {
+                return if negate {
+                    format!("!{identifier}")
+                } else {
+                    identifier.into()
+                };
+            }
             return if negate {
-                format!("!{identifier}")
+                format!("!{}", condition_syntax(operand))
             } else {
-                identifier.into()
+                operand.into()
             };
         }
     }
@@ -3956,6 +4156,12 @@ fn compact_condition(value: &str) -> String {
 fn coerced_identifier(value: &str) -> Option<&str> {
     let identifier = value.strip_prefix('(')?.strip_suffix("|0)")?;
     is_js_identifier(identifier).then_some(identifier)
+}
+
+fn condition_identifier(value: &str) -> Option<&str> {
+    is_js_identifier(value)
+        .then_some(value)
+        .or_else(|| coerced_identifier(value))
 }
 
 fn compact_condition_literals(value: &str) -> String {
@@ -3997,15 +4203,27 @@ fn compact_condition_literals(value: &str) -> String {
     output
 }
 fn compact_compare_operand(value: &str, unsigned: bool) -> String {
-    let value = compact_i32(value);
     if unsigned {
-        format!("(({value})>>>0)")
+        format!("({}>>>0)", compact_unsigned_i32_operand(value))
     } else {
-        format!("({value})")
+        format!("({})", compact_i32(value))
     }
 }
+
+fn compact_unsigned_i32_operand(value: &str) -> String {
+    let value = strip_redundant_atom_parentheses(value.trim());
+    if is_js_identifier(value) {
+        return value.into();
+    }
+    if let Some(parenthesized) = value.strip_suffix("|0")
+        && is_fully_parenthesized(parenthesized)
+    {
+        return parenthesized.into();
+    }
+    compact_operand(value)
+}
 fn compact_float_argument(value: &str) -> String {
-    let value = value.trim();
+    let value = strip_redundant_atom_parentheses(value.trim());
     if value.starts_with('+') {
         value.into()
     } else if is_js_atom(value) {
@@ -4014,25 +4232,70 @@ fn compact_float_argument(value: &str) -> String {
         format!("+({value})")
     }
 }
+
 fn i32_bin(a: Value, b: Value, op: &str) -> Result<Value, CompileError> {
     let (a, b) = expect_i32_pair(a, b)?;
-    Ok(Value::I32(format!(
-        "({}{op}{})|0",
-        compact_operand(&a),
-        compact_operand(&b)
-    )))
+    let bitwise = matches!(op, "&" | "|" | "^" | "<<" | ">>");
+    let a = compact_nested_i32_operand(&a, bitwise);
+    let b = compact_nested_i32_operand(&b, bitwise);
+    let expression = format!("{a}{op}{b}");
+    Ok(Value::I32(if bitwise {
+        expression
+    } else {
+        format!("{expression}|0")
+    }))
+}
+
+fn compact_nested_i32_operand(value: &str, bitwise: bool) -> String {
+    let value = value.trim();
+    let Some(parenthesized) = value.strip_suffix("|0") else {
+        return compact_operand(value);
+    };
+    if !is_fully_parenthesized(parenthesized) {
+        return compact_operand(value);
+    }
+    let inner = &parenthesized[1..parenthesized.len() - 1];
+    if nested_i32_coercion_is_redundant(inner, bitwise) {
+        parenthesized.into()
+    } else {
+        compact_operand(value)
+    }
+}
+
+fn nested_i32_coercion_is_redundant(value: &str, bitwise: bool) -> bool {
+    let bytes = value.as_bytes();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'+' if depth == 0 => return true,
+            b'-' if depth == 0 && index != 0 => return true,
+            b'>' if bitwise
+                && depth == 0
+                && bytes.get(index + 1) == Some(&b'>')
+                && bytes.get(index + 2) == Some(&b'>') =>
+            {
+                return true;
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    false
 }
 fn cmp_i32(a: Value, b: Value, op: &str, unsigned: bool) -> Result<Value, CompileError> {
     let (a, b) = expect_i32_pair(a, b)?;
     Ok(Value::I32(format!(
-        "({}{op}{})|0",
+        "{}{op}{}|0",
         compact_compare_operand(&a, unsigned),
         compact_compare_operand(&b, unsigned)
     )))
 }
 fn cmp_float(a: Value, b: Value, op: &str) -> Result<Value, CompileError> {
     Ok(Value::I32(format!(
-        "({}{op}{})|0",
+        "{}{op}{}|0",
         compact_operand(&expect_float(a)?),
         compact_operand(&expect_float(b)?)
     )))
@@ -4082,7 +4345,11 @@ fn i64_compare(a: Value, b: Value, op: BinaryOp) -> Result<Value, CompileError> 
         _ => unreachable!(),
     };
     Ok(Value::I32(format!(
-        "IC(({al})|0,({ah})|0,({bl})|0,({bh})|0,{opcode}|0)|0"
+        "IC({},{},{},{},{opcode}|0)|0",
+        compact_external_i32_argument(&al),
+        compact_external_i32_argument(&ah),
+        compact_external_i32_argument(&bl),
+        compact_external_i32_argument(&bh)
     )))
 }
 
