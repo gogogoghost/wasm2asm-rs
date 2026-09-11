@@ -22,6 +22,9 @@ pub struct ResourceLimits {
     pub max_input_bytes: usize,
     pub max_functions: usize,
     pub max_module_elements: usize,
+    /// Maximum expanded local values in one function; zero disables the limit.
+    pub max_function_locals: usize,
+    /// Maximum decoded IR instructions in one function; zero disables the limit.
     pub max_function_ir: usize,
     pub max_total_ir: usize,
     pub max_memory_pages: u64,
@@ -37,7 +40,8 @@ impl Default for ResourceLimits {
             max_input_bytes: 256 * 1024 * 1024,
             max_functions: 100_000,
             max_module_elements: 250_000,
-            max_function_ir: 100_000,
+            max_function_locals: 100_000,
+            max_function_ir: 250_000,
             max_total_ir: 2_000_000,
             max_memory_pages: 32_768,
             max_table_elements: 1_000_000,

@@ -58,7 +58,11 @@ pub struct Cli {
     pub max_functions: usize,
     #[arg(long, default_value_t = 250_000)]
     pub max_module_elements: usize,
+    /// Maximum expanded local values in one function; 0 disables the limit.
     #[arg(long, default_value_t = 100_000)]
+    pub max_function_locals: usize,
+    /// Maximum decoded IR instructions in one function; 0 disables the limit.
+    #[arg(long, default_value_t = 250_000)]
     pub max_function_ir: usize,
     #[arg(long, default_value_t = 2_000_000)]
     pub max_total_ir: usize,

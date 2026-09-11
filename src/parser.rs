@@ -268,13 +268,13 @@ pub fn parse_module(input: &[u8], options: &CompileOptions) -> Result<Module, Co
                     record_type_feature(ty, &mut module.features);
                     let count = usize::try_from(count)
                         .map_err(|_| CompileError::limit("function locals", count, usize::MAX))?;
-                    if options.limits.max_function_ir != 0
-                        && locals.len().saturating_add(count) > options.limits.max_function_ir
+                    if options.limits.max_function_locals != 0
+                        && locals.len().saturating_add(count) > options.limits.max_function_locals
                     {
                         return Err(CompileError::limit(
                             "function locals",
                             locals.len().saturating_add(count),
-                            options.limits.max_function_ir,
+                            options.limits.max_function_locals,
                         ));
                     }
                     locals.resize(locals.len() + count, ty);

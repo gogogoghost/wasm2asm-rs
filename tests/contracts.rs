@@ -113,7 +113,7 @@ fn every_resource_budget_rejects_oversized_modules() {
     );
     assert_resource_limit(
         "(module (func (local i32 i32)))",
-        |l| l.max_function_ir = 1,
+        |l| l.max_function_locals = 1,
         "function locals",
     );
     assert_resource_limit(

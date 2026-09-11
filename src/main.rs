@@ -35,6 +35,7 @@ fn run() -> Result<(), String> {
             max_input_bytes: cli.max_input_bytes,
             max_functions: cli.max_functions,
             max_module_elements: cli.max_module_elements,
+            max_function_locals: cli.max_function_locals,
             max_function_ir: cli.max_function_ir,
             max_total_ir: cli.max_total_ir,
             max_memory_pages: cli.max_memory_pages,

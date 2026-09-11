@@ -77,6 +77,16 @@ The factory is available as both a default and named export:
 import instantiate, { instantiate as createInstance } from "./input.asm.mjs";
 ```
 
+## Resource limits
+
+The converter bounds decoded resources before JavaScript generation so malformed or untrusted modules cannot force unbounded IR, local-variable, memory, or output allocation. The per-function limits are independent:
+
+- `--max-function-locals` limits expanded local values in one function; default `100000`.
+- `--max-function-ir` limits decoded instructions in one function; default `250000`.
+- `--max-total-ir` limits decoded instructions across the module; default `2000000`.
+
+Set an individual limit to `0` only to disable that check for trusted input.
+
 ## Output formats
 
 ### ES module
