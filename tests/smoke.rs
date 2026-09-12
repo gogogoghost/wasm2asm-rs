@@ -108,6 +108,12 @@ fn local_get_preserves_evaluation_order() {
 }
 
 #[test]
+fn local_tee_preserves_popped_temporary() {
+    let wat = include_str!("fixtures/smoke/local_tee_preserves_popped_temporary.wat");
+    assert_eq!(run(wat, "instantiate({}).snapshot()"), "42");
+}
+
+#[test]
 fn acyclic_tail_call_needs_no_switch() {
     let wat = include_str!("fixtures/smoke/acyclic_tail_call_needs_no_switch.wat");
     assert_eq!(run(wat, "instantiate({}).call(41)"), "42");

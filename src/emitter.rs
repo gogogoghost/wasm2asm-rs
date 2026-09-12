@@ -1277,10 +1277,10 @@ enum ControlKind {
 struct Control {
     kind: ControlKind,
     label: String,
-    base: usize,
     label_start: usize,
     label_used: bool,
     params: Vec<Value>,
+    preserved_stack: Vec<Value>,
     results: Vec<ValType>,
     result_values: Vec<Value>,
     entry_reachable: bool,
@@ -1729,7 +1729,15 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         } else {
             sig.params.iter().map(|&t| self.temp(t)).collect()
         };
-        let base = self.stack.len();
+        if self.reachable {
+            // Values below the block parameters survive the control body. Snapshot them before
+            // nested instructions can mutate locals referenced by their deferred expressions.
+            for index in 0..self.stack.len() {
+                let value = self.stack[index].clone();
+                self.stack[index] = self.materialize(&value);
+            }
+        }
+        let preserved_stack = self.stack.clone();
         let stored_params: Vec<Value> = sig.params.iter().map(|&t| self.temp(t)).collect();
         if self.reachable {
             self.assign_values(&stored_params, &params);
@@ -1754,7 +1762,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             label,
             label_start,
             label_used: false,
-            base,
+            preserved_stack,
             params: stored_params,
             results: sig.results,
             result_values,
@@ -1783,8 +1791,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         self.controls[index].then_reachable = self.reachable;
         self.controls[index].seen_else = true;
         self.body.push_str("}else{");
-        let base = self.controls[index].base;
-        self.stack.truncate(base);
+        self.stack = self.controls[index].preserved_stack.clone();
         self.stack.extend(self.controls[index].params.clone());
         self.reachable = self.controls[index].entry_reachable;
         Ok(())
@@ -1824,7 +1831,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             ControlKind::If => control.entry_reachable || self.reachable || control.end_reachable,
             _ => self.reachable || control.end_reachable,
         };
-        self.stack.truncate(control.base);
+        self.stack = std::mem::take(&mut control.preserved_stack);
         if after {
             self.stack.append(&mut control.result_values);
         }
@@ -2939,9 +2946,24 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         }
     }
     fn pop(&mut self) -> Result<Value, CompileError> {
-        self.stack
+        let value = self
+            .stack
             .pop()
-            .ok_or_else(|| self.internal("operand stack underflow"))
+            .ok_or_else(|| self.internal("operand stack underflow"))?;
+        for (index, (base, ty)) in self.temp_slots.iter().enumerate() {
+            if self.instruction_temps.contains(&index) {
+                continue;
+            }
+            let candidate = named_value(*ty, base);
+            if candidate
+                .components()
+                .into_iter()
+                .any(|name| value.mentions_identifier(name))
+            {
+                self.instruction_temps.push(index);
+            }
+        }
+        Ok(value)
     }
     fn pop_i32(&mut self) -> Result<String, CompileError> {
         let value = self.pop()?;
@@ -3035,6 +3057,10 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 .controls
                 .iter()
                 .any(|control| control.params.iter().any(uses_candidate))
+            || self
+                .controls
+                .iter()
+                .any(|control| control.preserved_stack.iter().any(uses_candidate))
             || self
                 .controls
                 .iter()
