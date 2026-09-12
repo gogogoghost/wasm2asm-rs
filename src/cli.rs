@@ -1,6 +1,11 @@
 use clap::{Parser, ValueEnum};
 use std::path::PathBuf;
 
+const CLI_VERSION: &str = match option_env!("WASM2ASM_VERSION") {
+    Some(version) => version,
+    None => env!("CARGO_PKG_VERSION"),
+};
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 pub enum OutputFormatArg {
     Esm,
@@ -21,7 +26,7 @@ impl From<OutputFormatArg> for wasm2asm::OutputFormat {
 #[derive(Debug, Parser)]
 #[command(
     name = "wasm2asm",
-    version,
+    version = CLI_VERSION,
     about = "Convert WebAssembly binaries to strictly validated asm.js"
 )]
 pub struct Cli {

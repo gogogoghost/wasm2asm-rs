@@ -39,6 +39,8 @@ jobs:
             target: aarch64-unknown-linux-gnu
             asset_arch: linux-arm64
     runs-on: ${{ matrix.runner }}
+    env:
+      WASM2ASM_VERSION: ${{ github.ref_name }}
     steps:
       - name: Check out source
         uses: actions/checkout@v4
@@ -55,7 +57,11 @@ jobs:
 
       - name: Smoke test binary
         shell: bash
-        run: "target/${{ matrix.target }}/release/wasm2asm --version"
+        run: |
+          binary="target/${{ matrix.target }}/release/wasm2asm"
+          actual="$($binary --version)"
+          echo "$actual"
+          test "$actual" = "wasm2asm ${GITHUB_REF_NAME}"
 
       - name: Package binary
         shell: bash
