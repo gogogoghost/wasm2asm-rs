@@ -1318,6 +1318,7 @@ struct FunctionCompiler<'a, 'm> {
     temp_slots: Vec<(String, ValType)>,
     instruction_temps: Vec<usize>,
     declarations: Vec<(String, ValType)>,
+    f64_bits: BTreeMap<String, (String, String)>,
     body: String,
     temp_index: usize,
     label_index: usize,
@@ -1349,6 +1350,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             declarations: Vec::new(),
             temp_slots: Vec::new(),
             instruction_temps: Vec::new(),
+            f64_bits: BTreeMap::new(),
             body: String::new(),
             temp_index: next_local,
             label_index: 0,
@@ -1542,7 +1544,19 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             I32Const(value) => self.stack.push(Value::I32(value.to_string())),
             I64Const(value) => self.stack.push(i64_const(*value)),
             F32Const(bits) => self.stack.push(Value::F32(float32_literal(*bits))),
-            F64Const(bits) => self.stack.push(Value::F64(float64_literal(*bits))),
+            F64Const(bits) => {
+                const EXPONENT: u64 = 0x7ff0_0000_0000_0000;
+                const MANTISSA: u64 = 0x000f_ffff_ffff_ffff;
+                if bits & EXPONENT == EXPONENT && bits & MANTISSA != 0 {
+                    let low = (*bits as u32 as i32).to_string();
+                    let high = ((*bits >> 32) as u32 as i32).to_string();
+                    let expression = format!("+wr({low},{high})");
+                    self.f64_bits.insert(expression.clone(), (low, high));
+                    self.stack.push(Value::F64(expression));
+                } else {
+                    self.stack.push(Value::F64(float64_literal(*bits)));
+                }
+            }
             Unary(op) => self.emit_unary(*op)?,
             Binary(op) => self.emit_binary(*op)?,
             Load(op, memarg) => self.emit_load(*op, *memarg)?,
@@ -2057,6 +2071,12 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         });
         let slots = self.module.return_slots_for(results);
         let values = call_result_values(results, &call, &slots, &mut self.body, primary, imported)?;
+        for value in &values {
+            if let Value::F64(expression) = value {
+                let (low, high) = self.ensure_f64_bits(expression);
+                write!(self.body, "{low}=rd(+({expression}))|0;{high}=GH()|0;").unwrap();
+            }
+        }
         if imported && results.first() == Some(&ValType::I64) {
             let slot = slots[0].components()[0];
             write!(self.body, "{slot}=(gh())|0;").unwrap();
@@ -2096,11 +2116,22 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 compact_operand(&a),
                 compact_operand(&b)
             )),
-            (Value::F64(a), Value::F64(b)) => Value::F64(format!(
-                "+({condition}?{}:{})",
-                compact_operand(&a),
-                compact_operand(&b)
-            )),
+            (Value::F64(a), Value::F64(b)) => {
+                let left = Value::F64(a);
+                let right = Value::F64(b);
+                let result = self.temp(ValType::F64);
+                write!(
+                    self.body,
+                    "if{}{{",
+                    condition_syntax(&compact_i32(&condition))
+                )
+                .unwrap();
+                self.assign(&result, &left);
+                self.body.push_str("}else{");
+                self.assign(&result, &right);
+                self.body.push('}');
+                result
+            }
             (left, right) => {
                 let result = self.temp(left.ty());
                 write!(
@@ -2268,22 +2299,30 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             )),
             F32ReinterpretI32 => Value::F32(format!("F(+ri({}))", compact_i32(value.i32_expr()?))),
             I64ReinterpretF64 => {
-                let x = compact_float_argument(&expect_f64(value)?);
-                let lo = self.temp(ValType::I32);
-                let high = self.temp(ValType::I32);
-                write!(
-                    self.body,
-                    "{}=rd({})|0;{}=GH()|0;",
-                    lo.i32_expr()?,
-                    x,
-                    high.i32_expr()?
-                )
-                .unwrap();
-                Value::I64(lo.i32_expr()?.into(), high.i32_expr()?.into())
+                if let Some((low, high)) = self.f64_bits_for(&value) {
+                    Value::I64(low, high)
+                } else {
+                    let x = compact_float_argument(&expect_f64(value)?);
+                    let low = self.temp(ValType::I32);
+                    let high = self.temp(ValType::I32);
+                    write!(
+                        self.body,
+                        "{}=rd({})|0;{}=GH()|0;",
+                        low.i32_expr()?,
+                        x,
+                        high.i32_expr()?
+                    )
+                    .unwrap();
+                    Value::I64(low.i32_expr()?.into(), high.i32_expr()?.into())
+                }
             }
             F64ReinterpretI64 => {
-                let (lo, hi) = expect_i64(value)?;
-                Value::F64(format!("+wr({},{})", compact_i32(&lo), compact_i32(&hi)))
+                let (low, high) = expect_i64(value)?;
+                let low = compact_i32(&low);
+                let high = compact_i32(&high);
+                let expression = format!("+wr({low},{high})");
+                self.f64_bits.insert(expression.clone(), (low, high));
+                Value::F64(expression)
             }
             I32Extend8S => Value::I32(format!("(({})<<24)>>24", value.i32_expr()?)),
             I32Extend16S => Value::I32(format!("(({})<<16)>>16", value.i32_expr()?)),
@@ -2608,19 +2647,28 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             }
             LoadOp::F64 => {
                 let value = self.temp(ValType::F64);
+                let value_name = value.components()[0].to_string();
+                let (raw_low, raw_high) = self.ensure_f64_bits(&value_name);
                 if let Some(call) = &float_call {
-                    write!(self.body, "{}=+{call};", value.components()[0]).unwrap();
+                    write!(self.body, "{value_name}=+{call};").unwrap();
                 } else {
                     write!(
                         self.body,
-                        "{}=+LF({}|0,{lo_i32},{hi_i32},+{},{}|0);",
-                        value.components()[0],
-                        arg.memory,
-                        arg.offset,
-                        code
+                        "{value_name}=+LF({}|0,{lo_i32},{hi_i32},+{},{}|0);",
+                        arg.memory, arg.offset, code
                     )
                     .unwrap();
                 }
+                let raw_call = if let Some(address) = &compact_address {
+                    if arg.offset == 0 {
+                        format!("l({address},1)")
+                    } else {
+                        format!("l2({address},{},1)", arg.offset)
+                    }
+                } else {
+                    format!("LI({}|0,{lo_i32},{hi_i32},+{},1|0)", arg.memory, arg.offset)
+                };
+                write!(self.body, "{raw_low}={raw_call}|0;{raw_high}=GH()|0;").unwrap();
                 self.stack.push(value);
             }
             _ => {
@@ -2634,6 +2682,11 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
 
     fn emit_store(&mut self, op: StoreOp, arg: MemArg) -> Result<(), CompileError> {
         let value = self.pop()?;
+        let f64_bits = if matches!(op, StoreOp::F64) {
+            self.f64_bits_for(&value)
+        } else {
+            None
+        };
         let memory = self
             .module
             .module
@@ -2649,6 +2702,30 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let hi_i32 = compact_i32(&hi);
         let code = store_code(op);
         let offset_helper = self.module.store_offset_helpers.get(&(arg.offset, code));
+        if let Some((value_low, value_high)) = f64_bits {
+            let value_low = compact_i32(&value_low);
+            let value_high = compact_i32(&value_high);
+            if let Some(address) = compact.then(|| compact_memory_address(&lo, arg.offset)) {
+                if arg.offset == 0 {
+                    write!(self.body, "st({address},1,{value_low},{value_high});").unwrap();
+                } else {
+                    write!(
+                        self.body,
+                        "st2({address},{},1,{value_low},{value_high});",
+                        arg.offset
+                    )
+                    .unwrap();
+                }
+            } else {
+                write!(
+                    self.body,
+                    "SI({}|0,{lo_i32},{hi_i32},+{},1|0,{value_low},{value_high});",
+                    arg.memory, arg.offset
+                )
+                .unwrap();
+            }
+            return Ok(());
+        }
         if let Some(address) = compact.then(|| compact_memory_address(&lo, arg.offset)) {
             match op {
                 StoreOp::F32 | StoreOp::F64 => {
@@ -3066,7 +3143,32 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 .iter()
                 .any(|control| control.result_values.iter().any(uses_candidate))
     }
+    fn f64_bits_for(&self, value: &Value) -> Option<(String, String)> {
+        let Value::F64(expression) = value else {
+            return None;
+        };
+        self.f64_bits.get(expression).cloned()
+    }
+
+    fn ensure_f64_bits(&mut self, expression: &str) -> (String, String) {
+        if let Some(bits) = self.f64_bits.get(expression) {
+            return bits.clone();
+        }
+        let low = local_ident(self.temp_index);
+        self.temp_index += 1;
+        let high = local_ident(self.temp_index);
+        self.temp_index += 1;
+        self.declarations.push((low.clone(), ValType::I32));
+        self.declarations.push((high.clone(), ValType::I32));
+        self.f64_bits
+            .insert(expression.to_string(), (low.clone(), high.clone()));
+        (low, high)
+    }
+
     fn retarget_last_temp_assignment(&mut self, target: &Value, value: &Value) -> bool {
+        if matches!(target, Value::F64(_)) || matches!(value, Value::F64(_)) {
+            return false;
+        }
         let value_components = value.components();
         let target_components = target.components();
         let (Some(source), Some(target)) = (value_components.first(), target_components.first())
@@ -3151,6 +3253,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     }
 
     fn assign(&mut self, target: &Value, value: &Value) {
+        let source_bits = self.f64_bits_for(value);
         for (a, b) in target.components().iter().zip(value.components()) {
             write!(
                 self.body,
@@ -3159,6 +3262,24 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             )
             .unwrap();
         }
+        if let Value::F64(target_expression) = target {
+            let (target_low, target_high) = self.ensure_f64_bits(target_expression);
+            if let Some((source_low, source_high)) = source_bits {
+                write!(
+                    self.body,
+                    "{target_low}={};{target_high}={};",
+                    coerce_assignment(ValType::I32, &source_low),
+                    coerce_assignment(ValType::I32, &source_high)
+                )
+                .unwrap();
+            } else {
+                write!(
+                    self.body,
+                    "{target_low}=rd(+({target_expression}))|0;{target_high}=GH()|0;"
+                )
+                .unwrap();
+            }
+        }
     }
     fn materialize(&mut self, value: &Value) -> Value {
         let snapshot = self.temp(value.ty());
@@ -3166,7 +3287,15 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         snapshot
     }
     fn preserve_local_values(&mut self, target: &Value) {
-        let names = target.components();
+        let mut names = target
+            .components()
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        if let Some((low, high)) = self.f64_bits_for(target) {
+            names.push(low);
+            names.push(high);
+        }
         for index in 0..self.stack.len() {
             if names
                 .iter()

@@ -108,6 +108,18 @@ fn local_get_preserves_evaluation_order() {
 }
 
 #[test]
+fn f64_nan_payload_survives_local_round_trip() {
+    let wat = include_str!("fixtures/smoke/f64_nan_payload_survives_local_round_trip.wat");
+    assert_eq!(
+        run(
+            wat,
+            "(()=>{let m=instantiate({});let direct=m.bits(),directHigh=m.getTempRet0(),selected=m.selected_bits(1),selectedHigh=m.getTempRet0(),zero=m.selected_bits(0),zeroHigh=m.getTempRet0();return [direct,directHigh,selected,selectedHigh,zero,zeroHigh]})()"
+        ),
+        "269,2146959360,269,2146959360,0,0"
+    );
+}
+
+#[test]
 fn local_tee_preserves_popped_temporary() {
     let wat = include_str!("fixtures/smoke/local_tee_preserves_popped_temporary.wat");
     assert_eq!(run(wat, "instantiate({}).snapshot()"), "42");
