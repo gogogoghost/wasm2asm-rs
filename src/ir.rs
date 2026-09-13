@@ -253,13 +253,14 @@ impl BlockSig {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MemArg {
     pub offset: u64,
     pub memory: u32,
+    pub align: u8,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LoadOp {
     I32,
     I64,
@@ -277,7 +278,7 @@ pub enum LoadOp {
     I64_32U,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StoreOp {
     I32,
     I64,
@@ -290,7 +291,7 @@ pub enum StoreOp {
     I64_32,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum UnaryOp {
     I32Eqz,
     I32Clz,
@@ -354,7 +355,7 @@ pub enum UnaryOp {
     I64TruncSatF64U,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BinaryOp {
     I32Eq,
     I32Ne,

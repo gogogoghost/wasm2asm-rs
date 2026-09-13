@@ -8,6 +8,7 @@ A standalone WebAssembly-to-asm.js ahead-of-time converter written in Rust.
 
 - Standalone Rust implementation with no Binaryen dependency
 - Strict asm.js-compatible code generation
+- Verified typed MIR with CFG, value graph, and ordered optimization passes
 - ES module, UMD/CommonJS, and bare output formats
 - Complete import, export, memory, table, global, data-segment, and start-function glue
 - Scalar Wasm operations and the JavaScript i64 low/high ABI

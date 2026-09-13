@@ -2,6 +2,7 @@ mod diagnostics;
 mod emitter;
 #[allow(dead_code)]
 mod ir;
+mod mir;
 mod options;
 mod parser;
 

@@ -30,6 +30,18 @@ fn repeated_offset_loads_preserve_aligned_and_unaligned_accesses() {
 }
 
 #[test]
+fn mir_switch_and_constant_branch_optimizations_preserve_behavior() {
+    let wat = include_str!("fixtures/smoke/mir_optimizations_run.wat");
+    assert_eq!(
+        run(
+            wat,
+            "(()=>{let m=instantiate({});return [m.classify(0),m.classify(2),m.classify(4),m.classify(6),m.classify(1),m.never(),m.always()]})()"
+        ),
+        "10,20,30,40,40,42,42"
+    );
+}
+
+#[test]
 fn nested_float_additions_generate_valid_javascript() {
     let wat = include_str!("fixtures/smoke/nested_float_additions_generate_valid_javascript.wat");
     assert_eq!(run(wat, "instantiate({}).sum()"), "10");

@@ -1,5 +1,6 @@
 use crate::diagnostics::{CompileError, ErrorKind};
 use crate::ir::*;
+use crate::mir::{BranchDecision, FunctionPlan, SwitchDecision, optimize_function};
 use crate::options::{CompileOptions, OutputFormat};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Write as _;
@@ -1553,6 +1554,7 @@ struct FunctionCompiler<'a, 'm> {
     instruction_temps: Vec<usize>,
     declarations: Vec<(String, ValType)>,
     f64_bits: BTreeMap<String, (String, String)>,
+    plan: FunctionPlan,
     body: String,
     temp_index: usize,
     label_index: usize,
@@ -1573,6 +1575,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             next_local += value.components().len();
             locals.push(value);
         }
+        let plan = optimize_function(module.module, function_index, function)?;
         Ok(Self {
             module,
             function_index,
@@ -1585,6 +1588,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             temp_slots: Vec::new(),
             instruction_temps: Vec::new(),
             f64_bits: BTreeMap::new(),
+            plan,
             body: String::new(),
             temp_index: next_local,
             label_index: 0,
@@ -1593,8 +1597,8 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     }
 
     fn compile(mut self) -> Result<String, CompileError> {
-        for instruction in &self.function.body {
-            self.emit_instruction(instruction)?;
+        for (instruction_index, instruction) in self.function.body.iter().enumerate() {
+            self.emit_instruction(instruction_index, instruction)?;
         }
         self.body = eliminate_write_only_i64_high_multiply(&self.body);
         let name = &self.module.function_names[self.function_index];
@@ -1669,7 +1673,11 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         Ok(optimize_labeled_early_exits(&out))
     }
 
-    fn emit_instruction(&mut self, instruction: &Instr) -> Result<(), CompileError> {
+    fn emit_instruction(
+        &mut self,
+        instruction_index: usize,
+        instruction: &Instr,
+    ) -> Result<(), CompileError> {
         use Op::*;
         self.instruction_temps.clear();
         if !self.reachable
@@ -1702,8 +1710,19 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             Else => self.emit_else()?,
             End => self.end_control()?,
             Br(depth) => self.emit_br(*depth, true)?,
-            BrIf(depth) => self.emit_br_if(*depth)?,
-            BrTable { targets, default } => self.emit_br_table(targets, *default)?,
+            BrIf(depth) => match self.plan.branch(instruction_index) {
+                Some(BranchDecision::Always) => {
+                    self.pop_i32()?;
+                    self.emit_br(*depth, true)?;
+                }
+                Some(BranchDecision::Never) => {
+                    self.pop_i32()?;
+                }
+                None => self.emit_br_if(*depth)?,
+            },
+            BrTable { targets, default } => {
+                self.emit_br_table(targets, *default, self.plan.switch(instruction_index))?
+            }
             Return => self.emit_function_return(true)?,
             Call(index) => self.emit_call(*index, false)?,
             ReturnCall(index) => self.emit_call(*index, true)?,
@@ -2122,10 +2141,28 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         Ok(())
     }
 
-    fn emit_br_table(&mut self, targets: &[u32], default: u32) -> Result<(), CompileError> {
-        let selector = compact_i32(&self.pop_i32()?.to_string());
-        let (selector, rotate_cases) =
-            simplify_rotated_u8_br_table(&selector, targets.len()).unwrap_or((selector, 0));
+    fn emit_br_table(
+        &mut self,
+        targets: &[u32],
+        default: u32,
+        decision: Option<SwitchDecision>,
+    ) -> Result<(), CompileError> {
+        let selector_value = self.pop_i32()?;
+        if let Some(SwitchDecision::Constant(index)) = decision {
+            let depth = targets.get(index as usize).copied().unwrap_or(default);
+            let target = self.target_index(depth)?;
+            let values = self.pop_types(&self.branch_types(target))?;
+            self.emit_branch_to_index(target, &values)?;
+            self.reachable = false;
+            return Ok(());
+        }
+        let (selector, rotate_cases) = match decision {
+            Some(SwitchDecision::RotateLocal { local, left }) => (
+                format!("{}&255", compact_operand(self.local(local)?.i32_expr()?)),
+                left,
+            ),
+            _ => (compact_i32(&selector_value.to_string()), 0),
+        };
         let default_target = self.target_index(default)?;
         let values = self.pop_types(&self.branch_types(default_target))?;
         let mut groups = Vec::<(usize, Vec<usize>)>::new();
@@ -5360,34 +5397,6 @@ fn compact_i32(value: &str) -> String {
     } else {
         format!("({value})|0")
     }
-}
-
-fn simplify_rotated_u8_br_table(selector: &str, cases: usize) -> Option<(String, u32)> {
-    if cases > 256 {
-        return None;
-    }
-    let selector = selector.strip_suffix("|0").unwrap_or(selector);
-    let rotated = selector.strip_suffix("&255")?;
-    let rotated = rotated.strip_prefix('(')?.strip_suffix(')')?;
-    for right in 1..8 {
-        let left = 8 - right;
-        let mask = (255u32 << right) & 255;
-        let infix = format!("<<{left})|((");
-        let suffix = format!("&{mask})>>>{right})");
-        let Some(rotated) = rotated.strip_prefix('(') else {
-            continue;
-        };
-        let Some((base, remainder)) = rotated.split_once(&infix) else {
-            continue;
-        };
-        let Some(other) = remainder.strip_suffix(&suffix) else {
-            continue;
-        };
-        if base == other && is_js_identifier(base) {
-            return Some((format!("{}&255", compact_operand(base)), right));
-        }
-    }
-    None
 }
 
 fn rotate_u8(value: usize, left: u32) -> usize {

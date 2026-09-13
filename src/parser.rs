@@ -615,6 +615,7 @@ fn memarg(value: wasmparser::MemArg) -> MemArg {
     MemArg {
         offset: value.offset,
         memory: value.memory,
+        align: value.align,
     }
 }
 

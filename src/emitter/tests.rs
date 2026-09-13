@@ -470,24 +470,3 @@ fn module_context_reports_invalid_synthetic_layouts() {
             .is_err()
     );
 }
-
-#[test]
-fn rotated_byte_br_table_selectors_preserve_case_mapping() {
-    let selector = "((opcode<<7)|((opcode&254)>>>1))&255";
-    assert_eq!(
-        simplify_rotated_u8_br_table(selector, 18),
-        Some(("opcode&255".into(), 1))
-    );
-    assert_eq!(rotate_u8(2, 1), 4);
-    assert_eq!(rotate_u8(17, 1), 34);
-
-    let selector = "((opcode<<6)|((opcode&252)>>>2))&255";
-    assert_eq!(
-        simplify_rotated_u8_br_table(selector, 5),
-        Some(("opcode&255".into(), 2))
-    );
-    assert_eq!(rotate_u8(4, 2), 16);
-    assert_eq!(simplify_rotated_u8_br_table(selector, 257), None);
-    let impure = "((next()<<7)|((next()&254)>>>1))&255";
-    assert_eq!(simplify_rotated_u8_br_table(impure, 18), None);
-}
