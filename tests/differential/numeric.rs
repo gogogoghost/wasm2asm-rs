@@ -28,6 +28,24 @@ fn fast_numeric_operations_match_native_wasm_for_valid_inputs() {
         options,
     });
 }
+
+#[test]
+fn fast_numeric_boundaries_match_native_wasm_for_valid_inputs() {
+    let wat = include_str!("../fixtures/differential/fast_valid_numeric_boundaries.wat");
+    let options = CompileOptions {
+        preserve_traps: false,
+        ..CompileOptions::default()
+    };
+    assert_differential(DifferentialCase {
+        name: "fast numeric boundaries",
+        wat,
+        native_expression: "m.run()",
+        asm_expression: "m.run()",
+        native_imports: "{}",
+        asm_imports: "{}",
+        options,
+    });
+}
 #[test]
 fn i64_numeric_operations_match_native_wasm() {
     let wat = include_str!("../fixtures/differential/i64_numeric_operations.wat");

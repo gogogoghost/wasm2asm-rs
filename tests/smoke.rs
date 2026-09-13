@@ -102,23 +102,6 @@ fn memory_offset_overflow_traps() {
 }
 
 #[test]
-fn fast_mode_relaxes_selected_traps_but_preserves_unaligned_accesses() {
-    let wat = include_str!("fixtures/smoke/fast_mode_relaxes_selected_traps.wat");
-    let options = CompileOptions {
-        preserve_traps: false,
-        ..CompileOptions::default()
-    };
-    assert_eq!(
-        run_with_options(
-            wat,
-            "(()=>{let memory={buffer:new ArrayBuffer(33554432)},bytes=new Uint8Array(memory.buffer);bytes.set([1,2,3,4,5]);let m=instantiate({env:{memory}});return [m.outOfBounds(),m.trustedAlignedHint(),m.explicitUnalignedHint(),m.invalidConversion()]})()",
-            &options
-        ),
-        "0,84148994,84148994,0"
-    );
-}
-
-#[test]
 fn local_get_preserves_evaluation_order() {
     let wat = include_str!("fixtures/smoke/local_get_preserves_evaluation_order.wat");
     assert_eq!(run(wat, "instantiate({}).snapshot(42)"), "42");

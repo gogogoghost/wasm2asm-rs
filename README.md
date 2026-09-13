@@ -182,7 +182,7 @@ wasm2asm --help
 
 SIMD and typed function references are high-cost lowerings and are disabled by default.
 
-`--fast` favors valid-program throughput over exact WebAssembly failure semantics. It omits integer division, non-saturating f32/f64-to-i32, and memory bounds/offset-overflow guards. Use standard mode for untrusted input or workloads that require exact traps.
+`--fast` removes selected trap checks while preserving the result of every execution that is valid in WebAssembly. Only paths that WebAssembly would trap may differ: i32 division by zero or signed overflow, invalid non-saturating f32/f64-to-i32 conversion, out-of-bounds or overflowing memory access, and invalid indirect calls. f64 load/store/reinterpret bit patterns, signed zero, and unaligned memory accesses remain unchanged. Use standard mode when exact trap behavior is required.
 
 ## Compatibility
 

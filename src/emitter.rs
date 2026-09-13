@@ -6028,7 +6028,8 @@ function W(o,al,ah,bl,bh){o=o|0;al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;var l=0,h=0,n=0,
 "#;
 
 const CHECKED_ADDRESS_HELPER: &str = r#"function AA(k,l,h,o,w){k=k|0;l=l|0;h=h|0;o=+o;w=w|0;var x=0;if(h||o>4294967295)X();x=(l>>>0)+o;if(x<0||x+w>s[k])X();return (a[k]+x)|0}"#;
-const FAST_ADDRESS_HELPER: &str = r#"function AA(k,l,h,o,w){return (a[k|0]+(l>>>0)+o)|0}"#;
+const FAST_ADDRESS_HELPER: &str =
+    r#"function AA(k,l,h,o,w){k=k|0;l=l|0;h=h|0;o=+o;w=w|0;var x=0;x=(l>>>0)+o;return (a[k]+x)|0}"#;
 
 const RUNTIME_HELPERS_SUFFIX: &str = r#"
 function l(a,t){a=a|0;t=t|0;var x=AA(0,a,0,0,t==1?8:t==6||t==7||t==10||t==11?2:t==4||t==5||t==8||t==9?1:4);if(t==1){hi=V.getInt32(x+4,true);return V.getUint32(x,true)|0}if(t==4||t==8)return V.getInt8(x)|0;if(t==5||t==9)return V.getUint8(x)|0;if(t==6||t==10)return V.getInt16(x,true)|0;if(t==7||t==11)return V.getUint16(x,true)|0;if(t==12)return V.getInt32(x,true)|0;if(t==13)return V.getUint32(x,true)|0;return V.getInt32(x,true)|0}
@@ -6063,4 +6064,4 @@ function RS(v,t){return (v!=0&&Z[v]==t)|0}
 
 const CHECKED_INDIRECT_HELPER: &str =
     r#"function IG(x,t){x=x>>>0;if(x>=T.length||!T[x]||S[x]!=t)X();return T[x]|0}"#;
-const FAST_INDIRECT_HELPER: &str = r#"function IG(x,t){return T[x>>>0]|0}"#;
+const FAST_INDIRECT_HELPER: &str = r#"function IG(x,t){x=x>>>0;return T[x]|0}"#;

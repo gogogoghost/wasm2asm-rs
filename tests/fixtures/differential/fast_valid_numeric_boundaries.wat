@@ -1,0 +1,21 @@
+(module
+  (func (export "run")
+    (result
+      i32 i32 i32 i32 i32 i32 i32 i32
+      i32 i32 i32 i32 i32 i32 i32 i32)
+    (i32.trunc_f64_s (f64.const -0x1p+31))
+    (i32.trunc_f64_s (f64.const 0x1.fffffffffffffp+30))
+    (i32.trunc_f64_s (f64.const -0x1.fffffffffffffp-1))
+    (i32.trunc_f64_u (f64.const -0x1.fffffffffffffp-1))
+    (i32.trunc_f64_u (f64.const 0x1p+31))
+    (i32.trunc_f64_u (f64.const 0x1.fffffffffffffp+31))
+    (i32.trunc_f32_s (f32.const 0x1.fffffep+30))
+    (i32.trunc_f32_u (f32.const 0x1.fffffep+31))
+    (i32.div_s (i32.const -2147483648) (i32.const 1))
+    (i32.div_s (i32.const 2147483647) (i32.const -1))
+    (i32.div_s (i32.const -7) (i32.const 3))
+    (i32.rem_s (i32.const -7) (i32.const 3))
+    (i32.div_u (i32.const -1) (i32.const 1))
+    (i32.div_u (i32.const -1) (i32.const -1))
+    (i32.rem_u (i32.const -1) (i32.const 10))
+    (i32.div_u (i32.const -2147483648) (i32.const 2))))

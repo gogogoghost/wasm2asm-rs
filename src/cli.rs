@@ -53,7 +53,7 @@ pub struct Cli {
     #[arg(long)]
     pub enable_all_lowerings: bool,
 
-    /// Permit JavaScript behavior where WebAssembly would trap.
+    /// Omit checks only on paths that would trap in WebAssembly.
     #[arg(long)]
     pub fast: bool,
 

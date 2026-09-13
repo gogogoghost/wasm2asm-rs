@@ -1,4 +1,6 @@
 use crate::common::{DifferentialCase, assert_differential};
+use wasm2asm::CompileOptions;
+
 #[test]
 fn memory_access_and_growth_match_native_wasm() {
     let wat = include_str!("../fixtures/differential/memory_access_and_growth.wat");
@@ -13,6 +15,24 @@ fn memory_access_and_growth_match_native_wasm() {
     });
 }
 #[test]
+fn fast_memory_access_and_growth_match_native_wasm_for_valid_inputs() {
+    let wat = include_str!("../fixtures/differential/memory_access_and_growth.wat");
+    let options = CompileOptions {
+        preserve_traps: false,
+        ..CompileOptions::default()
+    };
+    assert_differential(DifferentialCase {
+        name: "fast memory access and growth",
+        wat,
+        native_expression: "(()=>{m.setup();var before=[m.i32loads(),m.i64loads().map(i64Pair),m.floats(),Array.from(new Uint8Array(m.memory.buffer,0,64))];var old=m.grow(1);return [before,old,m.memory.buffer.byteLength]})()",
+        asm_expression: "(()=>{m.setup();var before=[m.i32loads(),m.i64loads(),m.floats(),Array.from(new Uint8Array(m.memory.buffer,0,64))];var old=m.grow(1);return [before,old,m.memory.buffer.byteLength]})()",
+        native_imports: "{}",
+        asm_imports: "{}",
+        options,
+    });
+}
+
+#[test]
 fn bulk_memory_operations_match_native_wasm() {
     let wat = include_str!("../fixtures/differential/bulk_memory_operations.wat");
     assert_differential(DifferentialCase::same(
@@ -20,6 +40,24 @@ fn bulk_memory_operations_match_native_wasm() {
         wat,
         "(()=>{m.run();return Array.from(new Uint8Array(m.memory.buffer,0,40))})()",
     ));
+}
+
+#[test]
+fn fast_bulk_memory_operations_match_native_wasm_for_valid_inputs() {
+    let wat = include_str!("../fixtures/differential/bulk_memory_operations.wat");
+    let options = CompileOptions {
+        preserve_traps: false,
+        ..CompileOptions::default()
+    };
+    assert_differential(DifferentialCase {
+        name: "fast bulk memory operations",
+        wat,
+        native_expression: "(()=>{m.run();return Array.from(new Uint8Array(m.memory.buffer,0,40))})()",
+        asm_expression: "(()=>{m.run();return Array.from(new Uint8Array(m.memory.buffer,0,40))})()",
+        native_imports: "{}",
+        asm_imports: "{}",
+        options,
+    });
 }
 #[test]
 fn imported_memory_matches_native_wasm() {
@@ -46,6 +84,24 @@ fn direct_fixed_memory_access_matches_native_wasm() {
 }
 
 #[test]
+fn fast_direct_fixed_memory_matches_native_wasm_for_valid_inputs() {
+    let wat = include_str!("../fixtures/differential/direct_fixed_memory_access.wat");
+    let options = CompileOptions {
+        preserve_traps: false,
+        ..CompileOptions::default()
+    };
+    assert_differential(DifferentialCase {
+        name: "fast direct fixed memory access",
+        wat,
+        native_expression: "m.run()",
+        asm_expression: "m.run()",
+        native_imports: "{}",
+        asm_imports: "{}",
+        options,
+    });
+}
+
+#[test]
 fn memory64_access_and_growth_match_native_wasm() {
     let wat = include_str!("../fixtures/differential/memory64_access_and_growth.wat");
     assert_differential(DifferentialCase {
@@ -60,6 +116,24 @@ fn memory64_access_and_growth_match_native_wasm() {
 }
 
 #[test]
+fn fast_memory64_matches_native_wasm_for_valid_inputs() {
+    let wat = include_str!("../fixtures/differential/memory64_access_and_growth.wat");
+    let options = CompileOptions {
+        preserve_traps: false,
+        ..CompileOptions::default()
+    };
+    assert_differential(DifferentialCase {
+        name: "fast memory64 access and growth",
+        wat,
+        native_expression: "(()=>{m.store(8n,305419896);var q=m.roundTrip(),before=m.load(8n),old=m.grow(1n),size=m.size();return [[q[0],i64Pair(q[1]),q[2],q[3]],before,i64Pair(old),i64Pair(size),m.memory.buffer.byteLength]})()",
+        asm_expression: "(()=>{m.store(8,0,305419896);var q=m.roundTrip(),before=m.load(8,0),old=m.grow(1,0),oldHigh=m.getTempRet0(),size=m.size(),sizeHigh=m.getTempRet0();return [q,before,[old,oldHigh],[size,sizeHigh],m.memory.buffer.byteLength]})()",
+        native_imports: "{}",
+        asm_imports: "{}",
+        options,
+    });
+}
+
+#[test]
 fn multiple_memories_match_native_wasm() {
     let wat = include_str!("../fixtures/differential/multiple_memories.wat");
     assert_differential(DifferentialCase {
@@ -70,5 +144,23 @@ fn multiple_memories_match_native_wasm() {
         native_imports: "{}",
         asm_imports: "{}",
         options: Default::default(),
+    });
+}
+
+#[test]
+fn fast_multiple_memories_match_native_wasm_for_valid_inputs() {
+    let wat = include_str!("../fixtures/differential/multiple_memories.wat");
+    let options = CompileOptions {
+        preserve_traps: false,
+        ..CompileOptions::default()
+    };
+    assert_differential(DifferentialCase {
+        name: "fast multiple memories",
+        wat,
+        native_expression: "(()=>{var r=m.run();return [[r[0],i64Pair(r[1]),r[2],r[3],r[4],r[5]],Array.from(new Uint8Array(m.memory.buffer,0,56))]})()",
+        asm_expression: "(()=>{return [m.run(),Array.from(new Uint8Array(m.memory.buffer,0,56))]})()",
+        native_imports: "{}",
+        asm_imports: "{}",
+        options,
     });
 }

@@ -9,6 +9,24 @@ fn table_and_indirect_call_operations_match_native_wasm() {
         "[m.apply(0,41),m.apply(1,21),m.mutate()]",
     ));
 }
+
+#[test]
+fn fast_indirect_calls_match_native_wasm_for_valid_inputs() {
+    let wat = include_str!("../fixtures/differential/table_and_indirect_call_operations.wat");
+    let options = CompileOptions {
+        preserve_traps: false,
+        ..CompileOptions::default()
+    };
+    assert_differential(DifferentialCase {
+        name: "fast table and indirect calls",
+        wat,
+        native_expression: "[m.apply(0,41),m.apply(1,21),m.mutate()]",
+        asm_expression: "[m.apply(0,41),m.apply(1,21),m.mutate()]",
+        native_imports: "{}",
+        asm_imports: "{}",
+        options,
+    });
+}
 #[test]
 fn typed_function_reference_calls_match_native_wasm() {
     let wat = include_str!("../fixtures/differential/typed_function_reference_calls.wat");
