@@ -102,8 +102,8 @@ fn memory_offset_overflow_traps() {
 }
 
 #[test]
-fn fast_mode_uses_unchecked_direct_memory() {
-    let wat = include_str!("fixtures/smoke/fast_mode_uses_unchecked_direct_memory.wat");
+fn fast_mode_relaxes_selected_traps_but_preserves_unaligned_accesses() {
+    let wat = include_str!("fixtures/smoke/fast_mode_relaxes_selected_traps.wat");
     let options = CompileOptions {
         preserve_traps: false,
         ..CompileOptions::default()
@@ -111,10 +111,10 @@ fn fast_mode_uses_unchecked_direct_memory() {
     assert_eq!(
         run_with_options(
             wat,
-            "instantiate({env:{memory:{buffer:new ArrayBuffer(33554432)}}}).outOfBounds()",
+            "(()=>{let memory={buffer:new ArrayBuffer(33554432)},bytes=new Uint8Array(memory.buffer);bytes.set([1,2,3,4,5]);let m=instantiate({env:{memory}});return [m.outOfBounds(),m.trustedAlignedHint(),m.explicitUnalignedHint(),m.invalidConversion()]})()",
             &options
         ),
-        "0"
+        "0,84148994,84148994,0"
     );
 }
 

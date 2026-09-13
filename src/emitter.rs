@@ -557,7 +557,18 @@ impl<'a> ModuleCx<'a> {
             write!(out, "Z[{}]={type_index};", function_index + 1).unwrap();
         }
         out.push_str("B=r.b;V=new DataView(B);H=new Uint8Array(B);");
-        out.push_str(RUNTIME_HELPERS);
+        out.push_str(RUNTIME_HELPERS_PREFIX);
+        out.push_str(if self.options.preserve_traps {
+            CHECKED_ADDRESS_HELPER
+        } else {
+            FAST_ADDRESS_HELPER
+        });
+        out.push_str(RUNTIME_HELPERS_SUFFIX);
+        out.push_str(if self.options.preserve_traps {
+            CHECKED_INDIRECT_HELPER
+        } else {
+            FAST_INDIRECT_HELPER
+        });
         out.push_str("f.X=X;f.ct=ct;f.pc=pc;f.tr=tr;f.ne=ne;f.mn=mn;f.mx=mx;f.cs=cs;f.rf=rf;f.ri=ri;f.rd=rd;f.wr=wr;f.Y=Y;f.y=y;f.W=W;f.GH=function(){return hi|0};f.AA=AA;f.LI=LI;f.l=l;f.LF=LF;f.lf=lf;f.SI=SI;f.st=st;f.SF=SF;f.sf=sf;f.VL=VL;f.vl=vl;f.VS=VS;f.vs=vs;f.MS=MS;f.DD=DD;f.ED=ED;f.TS=TS;f.RS=RS;f.IG=IG;f.G=G;f.AB=AB;f.AC=AC;f.K=K;f.N=N;f.O=O;f.P=P;f.Q=Q;f.R=R;f.L=L;");
         self.emit_outer_initializers(out)?;
         if self.direct_memory_size.is_some() {
@@ -2879,14 +2890,18 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         saturating: bool,
     ) -> Result<Value, CompileError> {
         let temp = self.temp(ValType::I32);
-        write!(
-            self.body,
-            "{}=Y(+({value}),{}|0,{}|0)|0;",
-            temp.i32_expr()?,
-            unsigned as u8,
-            saturating as u8
-        )
-        .unwrap();
+        if !self.module.options.preserve_traps && !saturating {
+            write!(self.body, "{}=tr(+({value}))|0;", temp.i32_expr()?).unwrap();
+        } else {
+            write!(
+                self.body,
+                "{}=Y(+({value}),{}|0,{}|0)|0;",
+                temp.i32_expr()?,
+                unsigned as u8,
+                saturating as u8
+            )
+            .unwrap();
+        }
         Ok(temp)
     }
 
@@ -5989,7 +6004,7 @@ fn instruction_offset(_: &str, _: &str) -> usize {
     0
 }
 
-const RUNTIME_HELPERS: &str = r#"
+const RUNTIME_HELPERS_PREFIX: &str = r#"
 function X(){throw Error('wasm trap')}
 function ct(x){x=x|0;if(!x)return 32;return 32-C((x&-x)-1)|0}
 function pc(x){x=x|0;x=x-((x>>>1)&1431655765)|0;x=(x&858993459)+((x>>>2)&858993459)|0;return U((x+(x>>>4)&252645135),16843009)>>>24}
@@ -6010,7 +6025,12 @@ function ge(al,ah,bl,bh){al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;return ((ah>>>0)>(bh>>>
 function dv(al,ah,bl,bh,sg,rm){al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;sg=sg|0;rm=rm|0;var nq=0,nr=0,i=0,ql=0,qh=0,rl=0,rh=0,bit=0,t=0;if(!(bl|bh))X();if(sg&&ah==-2147483648&&!al&&bh==-1&&bl==-1&&!rm)X();if(sg){nq=(ah<0)^(bh<0);nr=ah<0;if(ah<0){al=ng(al,ah)|0;ah=hi|0}if(bh<0){bl=ng(bl,bh)|0;bh=hi|0}}for(i=63;i>=0;i--){bit=i<32?(al>>>i)&1:(ah>>>(i-32))&1;rh=(rh<<1)|(rl>>>31);rl=(rl<<1)|bit;if(ge(rl,rh,bl,bh)){t=rl-bl|0;rh=(rh-bh-((rl>>>0)<(bl>>>0)))|0;rl=t;if(i<32)ql=ql|(1<<i);else qh=qh|(1<<(i-32))}}if(rm){if(nr){rl=ng(rl,rh)|0;rh=hi|0}hi=rh;return rl}if(nq){ql=ng(ql,qh)|0;qh=hi|0}hi=qh;return ql}
 
 function W(o,al,ah,bl,bh){o=o|0;al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;var l=0,h=0,n=0,a0=0,a1=0,a2=0,a3=0,b0=0,b1=0,b2=0,b3=0,c0=0,c1=0,c2=0,c3=0;if(o==0){l=al+bl|0;hi=ah+bh+((l>>>0)<(al>>>0))|0;return l}if(o==1){l=al-bl|0;hi=ah-bh-((al>>>0)<(bl>>>0))|0;return l}if(o==2){a0=al&65535;a1=al>>>16;a2=ah&65535;a3=ah>>>16;b0=bl&65535;b1=bl>>>16;b2=bh&65535;b3=bh>>>16;c0=a0*b0;c1=a1*b0+a0*b1+M.floor(c0/65536);c2=a2*b0+a1*b1+a0*b2+M.floor(c1/65536);c3=a3*b0+a2*b1+a1*b2+a0*b3+M.floor(c2/65536);l=(c0&65535)|((c1&65535)<<16);hi=(c2&65535)|((c3&65535)<<16);return l}if(o==3){hi=ah&bh;return al&bl}if(o==4){hi=ah|bh;return al|bl}if(o==5){hi=ah^bh;return al^bl}if(o>=11)return dv(al,ah,bl,bh,(o==11||o==13)|0,(o==13||o==14)|0)|0;n=bl&63;if(!n){hi=ah;return al}if(o==6){if(n<32){hi=(ah<<n)|(al>>>(32-n));return al<<n}hi=al<<(n-32);return 0}if(o==7){if(n<32){hi=ah>>n;return (al>>>n)|(ah<<(32-n))}hi=ah>>31;return ah>>(n-32)}if(o==8){if(n<32){hi=ah>>>n;return (al>>>n)|(ah<<(32-n))}hi=0;return ah>>>(n-32)}if(o==9){if(n<32){hi=(ah<<n)|(al>>>(32-n));return (al<<n)|(ah>>>(32-n))}n=n-32;hi=(al<<n)|(ah>>>(32-n));return (ah<<n)|(al>>>(32-n))}if(n<32){hi=(ah>>>n)|(al<<(32-n));return (al>>>n)|(ah<<(32-n))}n=n-32;hi=(al>>>n)|(ah<<(32-n));return (ah>>>n)|(al<<(32-n))}
-function AA(k,l,h,o,w){k=k|0;l=l|0;h=h|0;o=+o;w=w|0;var x=0;if(h||o>4294967295)X();x=(l>>>0)+o;if(x<0||x+w>s[k])X();return (a[k]+x)|0}
+"#;
+
+const CHECKED_ADDRESS_HELPER: &str = r#"function AA(k,l,h,o,w){k=k|0;l=l|0;h=h|0;o=+o;w=w|0;var x=0;if(h||o>4294967295)X();x=(l>>>0)+o;if(x<0||x+w>s[k])X();return (a[k]+x)|0}"#;
+const FAST_ADDRESS_HELPER: &str = r#"function AA(k,l,h,o,w){return (a[k|0]+(l>>>0)+o)|0}"#;
+
+const RUNTIME_HELPERS_SUFFIX: &str = r#"
 function l(a,t){a=a|0;t=t|0;var x=AA(0,a,0,0,t==1?8:t==6||t==7||t==10||t==11?2:t==4||t==5||t==8||t==9?1:4);if(t==1){hi=V.getInt32(x+4,true);return V.getUint32(x,true)|0}if(t==4||t==8)return V.getInt8(x)|0;if(t==5||t==9)return V.getUint8(x)|0;if(t==6||t==10)return V.getInt16(x,true)|0;if(t==7||t==11)return V.getUint16(x,true)|0;if(t==12)return V.getInt32(x,true)|0;if(t==13)return V.getUint32(x,true)|0;return V.getInt32(x,true)|0}
 function lf(a,t){a=a|0;t=t|0;var x=AA(0,a,0,0,t==3?8:4);return t==3?V.getFloat64(x,true):V.getFloat32(x,true)}
 function st(a,t,v,w){a=a|0;t=t|0;v=v|0;w=w|0;var x=AA(0,a,0,0,t==1?8:t==5||t==7?2:t==4||t==6?1:4);if(t==1){V.setInt32(x,v,true);V.setInt32(x+4,w,true)}else if(t==4||t==6)V.setInt8(x,v);else if(t==5||t==7)V.setInt16(x,v,true);else V.setInt32(x,v,true)}
@@ -6039,5 +6059,8 @@ function DD(i){D[i].x=1}
 function ED(i){E[i].x=1}
 function TS(){return T.length|0}
 function RS(v,t){return (v!=0&&Z[v]==t)|0}
-function IG(x,t){x=x>>>0;if(x>=T.length||!T[x]||S[x]!=t)X();return T[x]|0}
 "#;
+
+const CHECKED_INDIRECT_HELPER: &str =
+    r#"function IG(x,t){x=x>>>0;if(x>=T.length||!T[x]||S[x]!=t)X();return T[x]|0}"#;
+const FAST_INDIRECT_HELPER: &str = r#"function IG(x,t){return T[x>>>0]|0}"#;
