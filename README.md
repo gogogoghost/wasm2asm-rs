@@ -182,7 +182,7 @@ wasm2asm --help
 
 SIMD and typed function references are high-cost lowerings and are disabled by default.
 
-`--fast` disables parts of WebAssembly trap preservation. Do not use it when exact WebAssembly failure semantics are required.
+`--fast` omits selected WebAssembly trap checks, including integer division guards and fixed-memory bounds/offset-overflow guards. Do not use it when exact WebAssembly failure semantics are required.
 
 ## Compatibility
 

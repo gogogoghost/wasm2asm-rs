@@ -36,6 +36,16 @@ fn imported_memory_matches_native_wasm() {
     });
 }
 #[test]
+fn direct_fixed_memory_access_matches_native_wasm() {
+    let wat = include_str!("../fixtures/differential/direct_fixed_memory_access.wat");
+    assert_differential(DifferentialCase::same(
+        "direct fixed memory access",
+        wat,
+        "[m.run(),trapped(()=>m.oob())]",
+    ));
+}
+
+#[test]
 fn memory64_access_and_growth_match_native_wasm() {
     let wat = include_str!("../fixtures/differential/memory64_access_and_growth.wat");
     assert_differential(DifferentialCase {

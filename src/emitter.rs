@@ -270,6 +270,71 @@ fn memory_offset_helpers(
     (loads, stores)
 }
 
+fn direct_memory_size(module: &Module, live_functions: &[bool]) -> Option<u32> {
+    let [memory] = module.memories.as_slice() else {
+        return None;
+    };
+    if memory.memory64
+        || memory.shared
+        || memory.page_size_log2 != 16
+        || module
+            .exports
+            .iter()
+            .any(|export| export.kind == ExportKind::Memory)
+    {
+        return None;
+    }
+    let grows = module
+        .functions
+        .iter()
+        .enumerate()
+        .any(|(defined, function)| {
+            let index = module.imported_function_count as usize + defined;
+            live_functions[index]
+                && function
+                    .body
+                    .iter()
+                    .any(|instruction| matches!(&instruction.op, Op::MemoryGrow(_)))
+        });
+    if grows {
+        return None;
+    }
+    let bytes = memory.initial.checked_shl(memory.page_size_log2)?;
+    let conventional_asm_heap =
+        bytes.is_power_of_two() || bytes >= 16 * 1024 * 1024 && bytes % (16 * 1024 * 1024) == 0;
+    if bytes < 16 * 1024 * 1024 || bytes > 2 * 1024 * 1024 * 1024 || !conventional_asm_heap {
+        return None;
+    }
+    u32::try_from(bytes).ok()
+}
+
+fn uses_inline_i64_helpers(module: &Module, live_functions: &[bool]) -> bool {
+    module
+        .functions
+        .iter()
+        .enumerate()
+        .any(|(defined, function)| {
+            let index = module.imported_function_count as usize + defined;
+            live_functions[index]
+                && function.body.iter().any(|instruction| {
+                    matches!(
+                        &instruction.op,
+                        Op::Binary(
+                            BinaryOp::I64Add
+                                | BinaryOp::I64Sub
+                                | BinaryOp::I64Mul
+                                | BinaryOp::I64And
+                                | BinaryOp::I64Or
+                                | BinaryOp::I64Xor
+                                | BinaryOp::I64Shl
+                                | BinaryOp::I64ShrS
+                                | BinaryOp::I64ShrU
+                        )
+                    )
+                })
+        })
+}
+
 struct ModuleCx<'a> {
     module: &'a Module,
     options: &'a CompileOptions,
@@ -282,6 +347,8 @@ struct ModuleCx<'a> {
     live_functions: Vec<bool>,
     load_offset_helpers: OffsetHelpers,
     store_offset_helpers: OffsetHelpers,
+    direct_memory_size: Option<u32>,
+    inline_i64_helpers: bool,
 }
 
 impl<'a> ModuleCx<'a> {
@@ -299,6 +366,8 @@ impl<'a> ModuleCx<'a> {
         let (live_functions, indirect_types) = reachable_functions(module);
         let (load_offset_helpers, store_offset_helpers) =
             memory_offset_helpers(module, &live_functions);
+        let direct_memory_size = direct_memory_size(module, &live_functions);
+        let inline_i64_helpers = uses_inline_i64_helpers(module, &live_functions);
         let (return_slot_counts, return_slots) = return_slot_layout(module);
         Ok(Self {
             module,
@@ -312,6 +381,8 @@ impl<'a> ModuleCx<'a> {
             live_functions,
             load_offset_helpers,
             store_offset_helpers,
+            direct_memory_size,
+            inline_i64_helpers,
         })
     }
 
@@ -487,9 +558,13 @@ impl<'a> ModuleCx<'a> {
         }
         out.push_str("B=r.b;V=new DataView(B);H=new Uint8Array(B);");
         out.push_str(RUNTIME_HELPERS);
-        out.push_str("f.X=X;f.ct=ct;f.pc=pc;f.tr=tr;f.ne=ne;f.mn=mn;f.mx=mx;f.cs=cs;f.rf=rf;f.ri=ri;f.rd=rd;f.wr=wr;f.Y=Y;f.y=y;f.W=W;f.GH=function(){return hi|0};f.IC=IC;f.AA=AA;f.LI=LI;f.l=l;f.LF=LF;f.lf=lf;f.SI=SI;f.st=st;f.SF=SF;f.sf=sf;f.VL=VL;f.vl=vl;f.VS=VS;f.vs=vs;f.MS=MS;f.DD=DD;f.ED=ED;f.TS=TS;f.RS=RS;f.IG=IG;f.G=G;f.AB=AB;f.AC=AC;f.K=K;f.N=N;f.O=O;f.P=P;f.Q=Q;f.R=R;f.L=L;");
+        out.push_str("f.X=X;f.ct=ct;f.pc=pc;f.tr=tr;f.ne=ne;f.mn=mn;f.mx=mx;f.cs=cs;f.rf=rf;f.ri=ri;f.rd=rd;f.wr=wr;f.Y=Y;f.y=y;f.W=W;f.GH=function(){return hi|0};f.AA=AA;f.LI=LI;f.l=l;f.LF=LF;f.lf=lf;f.SI=SI;f.st=st;f.SF=SF;f.sf=sf;f.VL=VL;f.vl=vl;f.VS=VS;f.vs=vs;f.MS=MS;f.DD=DD;f.ED=ED;f.TS=TS;f.RS=RS;f.IG=IG;f.G=G;f.AB=AB;f.AC=AC;f.K=K;f.N=N;f.O=O;f.P=P;f.Q=Q;f.R=R;f.L=L;");
         self.emit_outer_initializers(out)?;
-        out.push_str("var x=asmModule({Math:M,NaN:NaN,Infinity:Infinity},f);");
+        if self.direct_memory_size.is_some() {
+            out.push_str("var x=asmModule({Math:M,NaN:NaN,Infinity:Infinity,Int8Array:Int8Array,Uint8Array:Uint8Array,Int16Array:Int16Array,Uint16Array:Uint16Array,Int32Array:Int32Array,Uint32Array:Uint32Array,Float32Array:Float32Array,Float64Array:Float64Array},f,B);");
+        } else {
+            out.push_str("var x=asmModule({Math:M,NaN:NaN,Infinity:Infinity},f);");
+        }
         if self.module.start.is_some() {
             out.push_str("x.$start();delete x.$start;");
         }
@@ -626,7 +701,16 @@ impl<'a> ModuleCx<'a> {
     }
 
     fn emit_core(&mut self, out: &mut String) -> Result<(), CompileError> {
-        out.push_str("function asmModule(stdlib,foreign){'use asm';var F=stdlib.Math.fround,U=stdlib.Math.imul,C=stdlib.Math.clz32,Ma=stdlib.Math.abs,Mc=stdlib.Math.ceil,Mf=stdlib.Math.floor,Ms=stdlib.Math.sqrt,Na=stdlib.NaN,In=stdlib.Infinity,X=foreign.X,ct=foreign.ct,pc=foreign.pc,tr=foreign.tr,ne=foreign.ne,mn=foreign.mn,mx=foreign.mx,cs=foreign.cs,rf=foreign.rf,ri=foreign.ri,rd=foreign.rd,wr=foreign.wr,Y=foreign.Y,y=foreign.y,W=foreign.W,GH=foreign.GH,IC=foreign.IC,AA=foreign.AA,LI=foreign.LI,l=foreign.l,LF=foreign.LF,lf=foreign.lf,SI=foreign.SI,st=foreign.st,SF=foreign.SF,sf=foreign.sf,VL=foreign.VL,vl=foreign.vl,VS=foreign.VS,vs=foreign.vs,MS=foreign.MS,DD=foreign.DD,ED=foreign.ED,TS=foreign.TS,RS=foreign.RS,IG=foreign.IG,G=foreign.G,AB=foreign.AB,AC=foreign.AC,K=foreign.K,N=foreign.N,O=foreign.O,P=foreign.P,Q=foreign.Q,R=foreign.R,L=foreign.L,");
+        out.push_str("function asmModule(stdlib,foreign");
+        if self.direct_memory_size.is_some() {
+            out.push_str(",heap");
+        }
+        out.push_str("){\'use asm\';var F=stdlib.Math.fround,U=stdlib.Math.imul,C=stdlib.Math.clz32,Ma=stdlib.Math.abs,Mc=stdlib.Math.ceil,Mf=stdlib.Math.floor,Ms=stdlib.Math.sqrt,Na=stdlib.NaN,In=stdlib.Infinity,X=foreign.X,ct=foreign.ct,pc=foreign.pc,tr=foreign.tr,ne=foreign.ne,mn=foreign.mn,mx=foreign.mx,cs=foreign.cs,rf=foreign.rf,ri=foreign.ri,rd=foreign.rd,wr=foreign.wr,Y=foreign.Y,y=foreign.y,W=foreign.W,GH=foreign.GH,AA=foreign.AA,LI=foreign.LI,l=foreign.l,LF=foreign.LF,lf=foreign.lf,SI=foreign.SI,st=foreign.st,SF=foreign.SF,sf=foreign.sf,VL=foreign.VL,vl=foreign.vl,VS=foreign.VS,vs=foreign.vs,MS=foreign.MS,DD=foreign.DD,ED=foreign.ED,TS=foreign.TS,RS=foreign.RS,IG=foreign.IG,G=foreign.G,AB=foreign.AB,AC=foreign.AC,K=foreign.K,N=foreign.N,O=foreign.O,P=foreign.P,Q=foreign.Q,R=foreign.R,L=foreign.L,");
+        if self.direct_memory_size.is_some() {
+            out.push_str("$h8=new stdlib.Int8Array(heap),$u8=new stdlib.Uint8Array(heap),$h16=new stdlib.Int16Array(heap),$u16=new stdlib.Uint16Array(heap),$h32=new stdlib.Int32Array(heap),$u32=new stdlib.Uint32Array(heap),$f32=new stdlib.Float32Array(heap),$f64=new stdlib.Float64Array(heap),$ih=0,$rl=0,$rh=0,");
+        } else if self.inline_i64_helpers {
+            out.push_str("$ih=0,");
+        }
         if self.return_slots.is_empty() {
             out.push_str("$q0=0;");
         } else {
@@ -642,8 +726,14 @@ impl<'a> ModuleCx<'a> {
         self.emit_import_aliases(out);
         self.emit_globals(out)?;
         if self.module.memories.iter().any(|memory| !memory.memory64) {
-            out.push_str("function B0(a,o){a=a|0;o=o|0;if((a>>>0)>=((-o)>>>0))X();return (a+o)|0}function l2(a,o,t){a=a|0;o=o|0;t=t|0;return l(B0(a,o)|0,t|0)|0}function lf2(a,o,t){a=a|0;o=o|0;t=t|0;return +lf(B0(a,o)|0,t|0)}function st2(a,o,t,v,w){a=a|0;o=o|0;t=t|0;v=v|0;w=w|0;st(B0(a,o)|0,t|0,v|0,w|0)}function sf2(a,o,t,v){a=a|0;o=o|0;t=t|0;v=+v;sf(B0(a,o)|0,t|0,+v)}");
+            if self.options.preserve_traps {
+                out.push_str("function B0(a,o){a=a|0;o=o|0;if((a>>>0)>=((-o)>>>0))X();return (a+o)|0}function l2(a,o,t){a=a|0;o=o|0;t=t|0;return l(B0(a,o)|0,t|0)|0}function lf2(a,o,t){a=a|0;o=o|0;t=t|0;return +lf(B0(a,o)|0,t|0)}function st2(a,o,t,v,w){a=a|0;o=o|0;t=t|0;v=v|0;w=w|0;st(B0(a,o)|0,t|0,v|0,w|0)}function sf2(a,o,t,v){a=a|0;o=o|0;t=t|0;v=+v;sf(B0(a,o)|0,t|0,+v)}");
+            } else {
+                out.push_str("function B0(a,o){a=a|0;o=o|0;return (a+o)|0}function l2(a,o,t){a=a|0;o=o|0;t=t|0;return l(B0(a,o)|0,t|0)|0}function lf2(a,o,t){a=a|0;o=o|0;t=t|0;return +lf(B0(a,o)|0,t|0)}function st2(a,o,t,v,w){a=a|0;o=o|0;t=t|0;v=v|0;w=w|0;st(B0(a,o)|0,t|0,v|0,w|0)}function sf2(a,o,t,v){a=a|0;o=o|0;t=t|0;v=+v;sf(B0(a,o)|0,t|0,+v)}");
+            }
         }
+        self.emit_i64_helpers(out);
+        self.emit_direct_memory_helpers(out);
         self.emit_memory_offset_helpers(out);
         self.emit_dispatchers(out)?;
         let mut compiled = Vec::new();
@@ -666,7 +756,133 @@ impl<'a> ModuleCx<'a> {
         Ok(())
     }
 
+    fn emit_i64_helpers(&self, out: &mut String) {
+        if !self.inline_i64_helpers {
+            return;
+        }
+        out.push_str("function $m(a,b,c,d){a=a|0;b=b|0;c=c|0;d=d|0;var w0=0,t=0,w1=0,w2=0,h=0;w0=U(a&65535,c&65535)|0;t=U(a>>>16,c&65535)+(w0>>>16)|0;w0=w0&65535;w1=t&65535;w2=t>>>16;w1=U(a&65535,c>>>16)+w1|0;h=U(a>>>16,c>>>16)+w2|0;h=h+(w1>>>16)|0;h=h+U(b,c)|0;h=h+U(a,d)|0;return h|0}");
+        out.push_str("function $g(a,b,c,d){a=a|0;b=b|0;c=c|0;d=d|0;var n=0;n=c&63;if(!n){$ih=b;return a|0}if((n|0)<32){$ih=(b<<n)|(a>>>(32-n));return a<<n}$ih=a<<(n-32);return 0}");
+        out.push_str("function $h(a,b,c,d){a=a|0;b=b|0;c=c|0;d=d|0;var n=0;n=c&63;if(!n){$ih=b;return a|0}if((n|0)<32){$ih=b>>n;return (a>>>n)|(b<<(32-n))}$ih=b>>31;return b>>(n-32)}");
+        out.push_str("function $i(a,b,c,d){a=a|0;b=b|0;c=c|0;d=d|0;var n=0;n=c&63;if(!n){$ih=b;return a|0}if((n|0)<32){$ih=b>>>n;return (a>>>n)|(b<<(32-n))}$ih=0;return (b>>>(n-32))|0}");
+    }
+
+    fn emit_direct_memory_helpers(&self, out: &mut String) {
+        let Some(size) = self.direct_memory_size else {
+            return;
+        };
+        let byte_limit = size - 1;
+        let half_limit = size - 2;
+        let word_limit = size - 4;
+        let double_limit = size - 8;
+        let check = |limit| {
+            self.options
+                .preserve_traps
+                .then(|| format!("if((a>>>0)>{limit})X();"))
+                .unwrap_or_default()
+        };
+        let byte_check = check(byte_limit);
+        let half_check = check(half_limit);
+        let word_check = check(word_limit);
+        let double_check = check(double_limit);
+        write!(
+            out,
+            "function $L0(a){{a=a|0;{word_check}if(a&3)return l(a|0,0|0)|0;return $h32[a>>2]|0}}"
+        )
+        .unwrap();
+        write!(out, "function $L1(a){{a=a|0;var v=0;{double_check}if(a&3){{v=l(a|0,1|0)|0;$ih=GH()|0;return v|0}}$ih=$h32[(a+4)>>2]|0;return $h32[a>>2]|0}}").unwrap();
+        write!(
+            out,
+            "function $F2(a){{a=a|0;{word_check}if(a&3)return +lf(a|0,2|0);return +F($f32[a>>2])}}"
+        )
+        .unwrap();
+        write!(out, "function $F3(a){{a=a|0;var v=0.0;{double_check}if(a&7){{v=+lf(a|0,3|0);$rl=l(a|0,1|0)|0;$rh=GH()|0;return +v}}$rl=$h32[a>>2]|0;$rh=$h32[(a+4)>>2]|0;return +$f64[a>>3]}}").unwrap();
+        for code in [4, 8] {
+            write!(
+                out,
+                "function $L{code}(a){{a=a|0;{byte_check}return $h8[a>>0]|0}}"
+            )
+            .unwrap();
+        }
+        for code in [5, 9] {
+            write!(
+                out,
+                "function $L{code}(a){{a=a|0;{byte_check}return $u8[a>>0]|0}}"
+            )
+            .unwrap();
+        }
+        for code in [6, 10] {
+            write!(out, "function $L{code}(a){{a=a|0;{half_check}if(a&1)return l(a|0,{code}|0)|0;return $h16[a>>1]|0}}").unwrap();
+        }
+        for code in [7, 11] {
+            write!(out, "function $L{code}(a){{a=a|0;{half_check}if(a&1)return l(a|0,{code}|0)|0;return $u16[a>>1]|0}}").unwrap();
+        }
+        write!(
+            out,
+            "function $L12(a){{a=a|0;{word_check}if(a&3)return l(a|0,12|0)|0;return $h32[a>>2]|0}}"
+        )
+        .unwrap();
+        write!(
+            out,
+            "function $L13(a){{a=a|0;{word_check}if(a&3)return l(a|0,13|0)|0;return $u32[a>>2]|0}}"
+        )
+        .unwrap();
+        write!(out, "function $S0(a,v){{a=a|0;v=v|0;{word_check}if(a&3){{st(a|0,0|0,v|0,0|0);return}}$h32[a>>2]=v}}").unwrap();
+        write!(out, "function $S1(a,v,w){{a=a|0;v=v|0;w=w|0;{double_check}if(a&3){{st(a|0,1|0,v|0,w|0);return}}$h32[a>>2]=v;$h32[(a+4)>>2]=w}}").unwrap();
+        write!(out, "function $D2(a,v){{a=a|0;v=+v;{word_check}if(a&3){{sf(a|0,2|0,+v);return}}$f32[a>>2]=F(v)}}").unwrap();
+        write!(out, "function $D3(a,v){{a=a|0;v=+v;{double_check}if(a&7){{sf(a|0,3|0,+v);return}}$f64[a>>3]=v}}").unwrap();
+        for code in [4, 6] {
+            write!(
+                out,
+                "function $S{code}(a,v){{a=a|0;v=v|0;{byte_check}$h8[a>>0]=v}}"
+            )
+            .unwrap();
+        }
+        for code in [5, 7] {
+            write!(out, "function $S{code}(a,v){{a=a|0;v=v|0;{half_check}if(a&1){{st(a|0,{code}|0,v|0,0|0);return}}$h16[a>>1]=v}}").unwrap();
+        }
+        write!(out, "function $S8(a,v){{a=a|0;v=v|0;{word_check}if(a&3){{st(a|0,8|0,v|0,0|0);return}}$h32[a>>2]=v}}").unwrap();
+    }
+
     fn emit_memory_offset_helpers(&self, out: &mut String) {
+        if self.direct_memory_size.is_some() {
+            for (&(offset, code), name) in &self.load_offset_helpers {
+                if matches!(code, 2 | 3) {
+                    write!(
+                        out,
+                        "function {name}(a){{a=a|0;return +$F{code}(B0(a,{offset})|0)}}"
+                    )
+                    .unwrap();
+                } else {
+                    write!(
+                        out,
+                        "function {name}(a){{a=a|0;return $L{code}(B0(a,{offset})|0)|0}}"
+                    )
+                    .unwrap();
+                }
+            }
+            for (&(offset, code), name) in &self.store_offset_helpers {
+                if matches!(code, 2 | 3) {
+                    write!(
+                        out,
+                        "function {name}(a,v){{a=a|0;v=+v;$D{code}(B0(a,{offset})|0,+v)}}"
+                    )
+                    .unwrap();
+                } else if code == 1 {
+                    write!(
+                        out,
+                        "function {name}(a,v,w){{a=a|0;v=v|0;w=w|0;$S1(B0(a,{offset})|0,v|0,w|0)}}"
+                    )
+                    .unwrap();
+                } else {
+                    write!(
+                        out,
+                        "function {name}(a,v){{a=a|0;v=v|0;$S{code}(B0(a,{offset})|0,v|0)}}"
+                    )
+                    .unwrap();
+                }
+            }
+            return;
+        }
         for (&(offset, code), name) in &self.load_offset_helpers {
             if matches!(code, 2 | 3) {
                 write!(
@@ -1362,6 +1578,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         for instruction in &self.function.body {
             self.emit_instruction(instruction)?;
         }
+        self.body = eliminate_write_only_i64_high_multiply(&self.body);
         let name = &self.module.function_names[self.function_index];
         let params = &self.locals[..self.ty.params.len()];
         let flat_params = flatten_names(params);
@@ -1511,6 +1728,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 let target = self.local(*index)?.clone();
                 let before_preserve = self.body.len();
                 self.preserve_local_values(&target);
+                let value = self.preserve_assignment_source(&target, value);
                 if self.body.len() != before_preserve
                     || !self.retarget_last_temp_assignment(&target, &value)
                 {
@@ -1522,6 +1740,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 let target = self.local(*index)?.clone();
                 let before_preserve = self.body.len();
                 self.preserve_local_values(&target);
+                let value = self.preserve_assignment_source(&target, value);
                 if self.body.len() != before_preserve
                     || !self.retarget_last_temp_assignment(&target, &value)
                 {
@@ -1537,6 +1756,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     .get(*index as usize)
                     .ok_or_else(|| self.internal("invalid global index"))?
                     .clone();
+                let value = self.preserve_assignment_source(&target, value);
                 if !self.retarget_last_temp_assignment(&target, &value) {
                     self.assign(&target, &value);
                 }
@@ -1886,16 +2106,29 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
 
     fn emit_br_table(&mut self, targets: &[u32], default: u32) -> Result<(), CompileError> {
         let selector = compact_i32(&self.pop_i32()?.to_string());
-        let target = self.target_index(default)?;
-        let values = self.pop_types(&self.branch_types(target))?;
-        write!(self.body, "switch({selector}){{").unwrap();
+        let default_target = self.target_index(default)?;
+        let values = self.pop_types(&self.branch_types(default_target))?;
+        let mut groups = Vec::<(usize, Vec<usize>)>::new();
         for (case, depth) in targets.iter().enumerate() {
-            let index = self.target_index(*depth)?;
-            write!(self.body, "case {case}:").unwrap();
-            self.emit_branch_to_index(index, &values)?;
+            let target = self.target_index(*depth)?;
+            if target == default_target {
+                continue;
+            }
+            if let Some((_, cases)) = groups.iter_mut().find(|(group, _)| *group == target) {
+                cases.push(case);
+            } else {
+                groups.push((target, vec![case]));
+            }
+        }
+        write!(self.body, "switch({selector}){{").unwrap();
+        for (target, cases) in groups {
+            for case in cases {
+                write!(self.body, "case {case}:").unwrap();
+            }
+            self.emit_branch_to_index(target, &values)?;
         }
         self.body.push_str("default:");
-        self.emit_branch_to_index(target, &values)?;
+        self.emit_branch_to_index(default_target, &values)?;
         self.body.push('}');
         self.reachable = false;
         Ok(())
@@ -2450,24 +2683,45 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let (a, b) = expect_i32_pair(left, right)?;
         let a_i32 = compact_i32(&a);
         let b_i32 = compact_i32(&b);
+        let b_literal = i32_literal(&b);
         if self.module.options.preserve_traps {
-            write!(self.body, "if(({b_i32})==0)X();").unwrap();
+            if b_literal.is_none_or(|value| value == 0)
+                && !nonzero_guard_dominates(&self.body, &b_i32)
+            {
+                write!(self.body, "if(({b_i32})==0)X();").unwrap();
+            }
             if matches!(op, BinaryOp::I32DivS) {
-                write!(
-                    self.body,
-                    "if(({a_i32})==(-2147483648|0)){{if(({b_i32})==(-1|0))X();}}"
-                )
-                .unwrap();
+                match b_literal {
+                    Some(-1) => write!(self.body, "if(({a_i32})==(-2147483648|0))X();").unwrap(),
+                    None => write!(
+                        self.body,
+                        "if(({a_i32})==(-2147483648|0)){{if(({b_i32})==(-1|0))X();}}"
+                    )
+                    .unwrap(),
+                    _ => {}
+                }
             }
         }
+        let unsigned_divisor = b_literal.map(|value| value as u32);
         let expr = match op {
             BinaryOp::I32DivS => format!("({a_i32})/({b_i32})|0"),
+            BinaryOp::I32DivU if unsigned_divisor == Some(255) && is_unsigned_u16(&a) => {
+                format!("U({},32897)>>>23", compact_i32(&a))
+            }
+            BinaryOp::I32DivU if unsigned_divisor.is_some_and(u32::is_power_of_two) => format!(
+                "{}>>>{}",
+                compact_unsigned_i32_operand(&a),
+                unsigned_divisor.unwrap().trailing_zeros()
+            ),
             BinaryOp::I32DivU => format!(
                 "({}>>>0)/({}>>>0)>>>0|0",
                 compact_unsigned_i32_operand(&a),
                 compact_unsigned_i32_operand(&b)
             ),
             BinaryOp::I32RemS => format!("({a_i32})%({b_i32})|0"),
+            BinaryOp::I32RemU if unsigned_divisor.is_some_and(u32::is_power_of_two) => {
+                format!("({})&{}", compact_i32(&a), unsigned_divisor.unwrap() - 1)
+            }
             BinaryOp::I32RemU => format!(
                 "({}>>>0)%({}>>>0)>>>0|0",
                 compact_unsigned_i32_operand(&a),
@@ -2486,38 +2740,136 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     ) -> Result<Value, CompileError> {
         let (al, ah) = expect_i64(left)?;
         let (bl, bh) = expect_i64(right)?;
-        let code = match op {
-            BinaryOp::I64Add => 0,
-            BinaryOp::I64Sub => 1,
-            BinaryOp::I64Mul => 2,
-            BinaryOp::I64And => 3,
-            BinaryOp::I64Or => 4,
-            BinaryOp::I64Xor => 5,
-            BinaryOp::I64Shl => 6,
-            BinaryOp::I64ShrS => 7,
-            BinaryOp::I64ShrU => 8,
-            BinaryOp::I64Rotl => 9,
-            BinaryOp::I64Rotr => 10,
-            BinaryOp::I64DivS => 11,
-            BinaryOp::I64DivU => 12,
-            BinaryOp::I64RemS => 13,
-            BinaryOp::I64RemU => 14,
-            _ => unreachable!(),
+        let al_low_zero = is_i32_zero(&al);
+        let bl_low_zero = is_i32_zero(&bl);
+        let add_carry = if reusable_i32_expression(&al) || !reusable_i32_expression(&bl) {
+            al.clone()
+        } else {
+            bl.clone()
         };
         let al = compact_i32(&al);
         let ah = compact_i32(&ah);
         let bl = compact_i32(&bl);
         let bh = compact_i32(&bh);
+        let add_carry = compact_i32(&add_carry);
+        let ah_zero = is_i32_zero(&ah);
+        let bh_zero = is_i32_zero(&bh);
         let low = self.temp(ValType::I32);
-        let high = self.temp(ValType::I32);
-        write!(
-            self.body,
-            "{}=W({code}|0,{al},{ah},{bl},{bh})|0;{}=GH()|0;",
-            low.i32_expr()?,
-            high.i32_expr()?
-        )
-        .unwrap();
-        Ok(Value::I64(low.i32_expr()?.into(), high.i32_expr()?.into()))
+        let low_name = low.i32_expr()?.to_string();
+        let lazy_high = match op {
+            BinaryOp::I64Add => {
+                if al_low_zero {
+                    write!(self.body, "{low_name}={bl}|0;").unwrap();
+                } else if bl_low_zero {
+                    write!(self.body, "{low_name}={al}|0;").unwrap();
+                } else {
+                    write!(self.body, "{low_name}=({al})+({bl})|0;").unwrap();
+                }
+                if al_low_zero || bl_low_zero {
+                    match (ah_zero, bh_zero) {
+                        (true, true) => "0".into(),
+                        (true, false) => bh,
+                        (false, true) => ah,
+                        (false, false) => format!("({ah})+({bh})|0"),
+                    }
+                } else {
+                    match (ah_zero, bh_zero) {
+                        (true, true) => format!("(({low_name}>>>0)<(({add_carry})>>>0))|0"),
+                        (true, false) => {
+                            format!("({bh})+(({low_name}>>>0)<(({add_carry})>>>0))|0")
+                        }
+                        (false, true) => {
+                            format!("({ah})+(({low_name}>>>0)<(({add_carry})>>>0))|0")
+                        }
+                        (false, false) => {
+                            format!("({ah})+({bh})+(({low_name}>>>0)<(({add_carry})>>>0))|0")
+                        }
+                    }
+                }
+            }
+            BinaryOp::I64Sub => {
+                if bl_low_zero {
+                    write!(self.body, "{low_name}={al}|0;").unwrap();
+                    match (ah_zero, bh_zero) {
+                        (true, true) => "0".into(),
+                        (true, false) => format!("(0|0)-({bh})|0"),
+                        (false, true) => ah,
+                        (false, false) => format!("({ah})-({bh})|0"),
+                    }
+                } else {
+                    write!(self.body, "{low_name}=({al})-({bl})|0;").unwrap();
+                    match (ah_zero, bh_zero) {
+                        (true, true) => format!("(0|0)-(((({al})>>>0)<(({bl})>>>0))|0)|0"),
+                        (true, false) => {
+                            format!("((0|0)-({bh})|0)-(((({al})>>>0)<(({bl})>>>0))|0)|0")
+                        }
+                        (false, true) => {
+                            format!("({ah})-(((({al})>>>0)<(({bl})>>>0))|0)|0")
+                        }
+                        (false, false) => {
+                            format!("({ah})-({bh})-(((({al})>>>0)<(({bl})>>>0))|0)|0")
+                        }
+                    }
+                }
+            }
+            BinaryOp::I64Mul => {
+                write!(self.body, "{low_name}=U({al},{bl})|0;").unwrap();
+                format!("$m({al},{ah},{bl},{bh})|0")
+            }
+            BinaryOp::I64And => {
+                write!(self.body, "{low_name}=({al})&({bl});").unwrap();
+                if ah_zero || bh_zero {
+                    "0".into()
+                } else {
+                    format!("({ah})&({bh})")
+                }
+            }
+            BinaryOp::I64Or | BinaryOp::I64Xor => {
+                let operator = if matches!(op, BinaryOp::I64Or) {
+                    '|'
+                } else {
+                    '^'
+                };
+                write!(self.body, "{low_name}=({al}){operator}({bl});").unwrap();
+                match (ah_zero, bh_zero) {
+                    (true, true) => "0".into(),
+                    (true, false) => bh,
+                    (false, true) => ah,
+                    (false, false) => format!("({ah}){operator}({bh})"),
+                }
+            }
+            _ => {
+                let code = match op {
+                    BinaryOp::I64Shl => 6,
+                    BinaryOp::I64ShrS => 7,
+                    BinaryOp::I64ShrU => 8,
+                    BinaryOp::I64Rotl => 9,
+                    BinaryOp::I64Rotr => 10,
+                    BinaryOp::I64DivS => 11,
+                    BinaryOp::I64DivU => 12,
+                    BinaryOp::I64RemS => 13,
+                    BinaryOp::I64RemU => 14,
+                    _ => unreachable!(),
+                };
+                let high = self.temp(ValType::I32);
+                let high_name = high.i32_expr()?.to_string();
+                if let Some(helper) = ["$g", "$h", "$i"].get((code - 6) as usize) {
+                    write!(
+                        self.body,
+                        "{low_name}={helper}({al},{ah},{bl},{bh})|0;{high_name}=$ih|0;"
+                    )
+                    .unwrap();
+                } else {
+                    write!(
+                        self.body,
+                        "{low_name}=W({code}|0,{al},{ah},{bl},{bh})|0;{high_name}=GH()|0;"
+                    )
+                    .unwrap();
+                }
+                return Ok(Value::I64(low_name, high_name));
+            }
+        };
+        Ok(Value::I64(low_name, lazy_high))
     }
 
     fn trunc_i32(
@@ -2575,11 +2927,18 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let lo_i32 = compact_i32(&lo);
         let hi_i32 = compact_i32(&hi);
         let offset_helper = self.module.load_offset_helpers.get(&(arg.offset, code));
+        let direct = self.module.direct_memory_size.is_some() && compact;
         let call = if let Some(address) = &compact_address {
             if arg.offset == 0 {
-                format!("l({address},{code})")
+                if direct {
+                    format!("$L{code}({address})")
+                } else {
+                    format!("l({address},{code})")
+                }
             } else if let Some(helper) = offset_helper {
                 format!("{helper}({address})")
+            } else if direct {
+                format!("$L{code}(B0({address},{})|0)", arg.offset)
             } else {
                 format!("l2({address},{},{code})", arg.offset)
             }
@@ -2591,9 +2950,15 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         };
         let float_call = compact_address.as_ref().map(|address| {
             if arg.offset == 0 {
-                format!("lf({address},{code})")
+                if direct {
+                    format!("$F{code}({address})")
+                } else {
+                    format!("lf({address},{code})")
+                }
             } else if let Some(helper) = offset_helper {
                 format!("{helper}({address})")
+            } else if direct {
+                format!("$F{code}(B0({address},{})|0)", arg.offset)
             } else {
                 format!("lf2({address},{},{code})", arg.offset)
             }
@@ -2602,13 +2967,23 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             LoadOp::I64 => {
                 let low = self.temp(ValType::I32);
                 let high = self.temp(ValType::I32);
-                write!(
-                    self.body,
-                    "{}={call}|0;{}=GH()|0;",
-                    low.i32_expr()?,
-                    high.i32_expr()?
-                )
-                .unwrap();
+                if direct {
+                    write!(
+                        self.body,
+                        "{}={call}|0;{}=$ih|0;",
+                        low.i32_expr()?,
+                        high.i32_expr()?
+                    )
+                    .unwrap();
+                } else {
+                    write!(
+                        self.body,
+                        "{}={call}|0;{}=GH()|0;",
+                        low.i32_expr()?,
+                        high.i32_expr()?
+                    )
+                    .unwrap();
+                }
                 self.stack
                     .push(Value::I64(low.i32_expr()?.into(), high.i32_expr()?.into()));
             }
@@ -2659,16 +3034,20 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     )
                     .unwrap();
                 }
-                let raw_call = if let Some(address) = &compact_address {
-                    if arg.offset == 0 {
-                        format!("l({address},1)")
-                    } else {
-                        format!("l2({address},{},1)", arg.offset)
-                    }
+                if direct {
+                    write!(self.body, "{raw_low}=$rl|0;{raw_high}=$rh|0;").unwrap();
                 } else {
-                    format!("LI({}|0,{lo_i32},{hi_i32},+{},1|0)", arg.memory, arg.offset)
-                };
-                write!(self.body, "{raw_low}={raw_call}|0;{raw_high}=GH()|0;").unwrap();
+                    let raw_call = if let Some(address) = &compact_address {
+                        if arg.offset == 0 {
+                            format!("l({address},1)")
+                        } else {
+                            format!("l2({address},{},1)", arg.offset)
+                        }
+                    } else {
+                        format!("LI({}|0,{lo_i32},{hi_i32},+{},1|0)", arg.memory, arg.offset)
+                    };
+                    write!(self.body, "{raw_low}={raw_call}|0;{raw_high}=GH()|0;").unwrap();
+                }
                 self.stack.push(value);
             }
             _ => {
@@ -2697,6 +3076,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             && self.module.module.memories.len() == 1
             && !memory.memory64
             && arg.offset <= u32::MAX as u64;
+        let direct = self.module.direct_memory_size.is_some() && compact;
         let (lo, hi) = self.pop_address(memory.memory64)?;
         let lo_i32 = compact_i32(&lo);
         let hi_i32 = compact_i32(&hi);
@@ -2706,7 +3086,14 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             let value_low = compact_i32(&value_low);
             let value_high = compact_i32(&value_high);
             if let Some(address) = compact.then(|| compact_memory_address(&lo, arg.offset)) {
-                if arg.offset == 0 {
+                if direct {
+                    let address = if arg.offset == 0 {
+                        address
+                    } else {
+                        format!("B0({address},{})|0", arg.offset)
+                    };
+                    write!(self.body, "$S1({address},{value_low},{value_high});").unwrap();
+                } else if arg.offset == 0 {
                     write!(self.body, "st({address},1,{value_low},{value_high});").unwrap();
                 } else {
                     write!(
@@ -2731,38 +3118,67 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 StoreOp::F32 | StoreOp::F64 => {
                     let value = coerce(ValType::F64, &expect_float(value)?);
                     if arg.offset == 0 {
-                        write!(self.body, "sf({address},{code},{value});").unwrap();
+                        if direct {
+                            write!(self.body, "$D{code}({address},{value});").unwrap();
+                        } else {
+                            write!(self.body, "sf({address},{code},{value});").unwrap();
+                        }
                     } else if let Some(helper) = offset_helper {
                         write!(self.body, "{helper}({address},{value});").unwrap();
+                    } else if direct {
+                        write!(
+                            self.body,
+                            "$D{code}(B0({address},{})|0,{value});",
+                            arg.offset
+                        )
+                        .unwrap();
                     } else {
                         write!(self.body, "sf2({address},{},{code},{value});", arg.offset).unwrap();
                     }
                 }
                 StoreOp::I64 | StoreOp::I64_8 | StoreOp::I64_16 | StoreOp::I64_32 => {
                     let (value_lo, value_hi) = expect_i64(value)?;
+                    let value_lo = compact_i32(&value_lo);
+                    let value_hi = compact_i32(&value_hi);
                     if arg.offset == 0 {
-                        write!(
-                            self.body,
-                            "st({address},{code},{},{});",
-                            compact_i32(&value_lo),
-                            compact_i32(&value_hi)
-                        )
-                        .unwrap();
+                        if direct {
+                            if code == 1 {
+                                write!(self.body, "$S1({address},{value_lo},{value_hi});").unwrap();
+                            } else {
+                                write!(self.body, "$S{code}({address},{value_lo});").unwrap();
+                            }
+                        } else {
+                            write!(self.body, "st({address},{code},{value_lo},{value_hi});")
+                                .unwrap();
+                        }
                     } else if let Some(helper) = offset_helper {
-                        write!(
-                            self.body,
-                            "{helper}({address},{},{});",
-                            compact_i32(&value_lo),
-                            compact_i32(&value_hi)
-                        )
-                        .unwrap();
+                        if code == 1 {
+                            write!(self.body, "{helper}({address},{value_lo},{value_hi});")
+                                .unwrap();
+                        } else {
+                            write!(self.body, "{helper}({address},{value_lo});").unwrap();
+                        }
+                    } else if direct {
+                        if code == 1 {
+                            write!(
+                                self.body,
+                                "$S1(B0({address},{})|0,{value_lo},{value_hi});",
+                                arg.offset
+                            )
+                            .unwrap();
+                        } else {
+                            write!(
+                                self.body,
+                                "$S{code}(B0({address},{})|0,{value_lo});",
+                                arg.offset
+                            )
+                            .unwrap();
+                        }
                     } else {
                         write!(
                             self.body,
-                            "st2({address},{},{code},{},{});",
-                            arg.offset,
-                            compact_i32(&value_lo),
-                            compact_i32(&value_hi)
+                            "st2({address},{},{code},{value_lo},{value_hi});",
+                            arg.offset
                         )
                         .unwrap();
                     }
@@ -2770,9 +3186,20 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 _ => {
                     let value = compact_i32(value.i32_expr()?);
                     if arg.offset == 0 {
-                        write!(self.body, "st({address},{code},{value},0);").unwrap();
+                        if direct {
+                            write!(self.body, "$S{code}({address},{value});").unwrap();
+                        } else {
+                            write!(self.body, "st({address},{code},{value},0);").unwrap();
+                        }
                     } else if let Some(helper) = offset_helper {
                         write!(self.body, "{helper}({address},{value});").unwrap();
+                    } else if direct {
+                        write!(
+                            self.body,
+                            "$S{code}(B0({address},{})|0,{value});",
+                            arg.offset
+                        )
+                        .unwrap();
                     } else {
                         write!(self.body, "st2({address},{},{code},{value},0);", arg.offset)
                             .unwrap();
@@ -3176,6 +3603,10 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             return false;
         };
         if value_components.len() != target_components.len()
+            || value_components
+                .iter()
+                .skip(1)
+                .any(|component| expression_mentions_identifier(component, source))
             || !self.temp_slots.iter().any(|(base, ty)| {
                 named_value(*ty, base)
                     .components()
@@ -3281,6 +3712,18 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             }
         }
     }
+    fn preserve_assignment_source(&mut self, target: &Value, value: Value) -> Value {
+        if target
+            .components()
+            .into_iter()
+            .any(|name| value.mentions_identifier(name))
+        {
+            self.materialize(&value)
+        } else {
+            value
+        }
+    }
+
     fn materialize(&mut self, value: &Value) -> Value {
         let snapshot = self.temp(value.ty());
         self.assign(&snapshot, value);
@@ -3387,6 +3830,64 @@ fn visit_javascript_identifiers(source: &str, mut visit: impl FnMut(usize, usize
         visit(start, index);
     }
 }
+
+fn identifier_is_read(source: &str, name: &str) -> bool {
+    let mut read = false;
+    visit_javascript_identifiers(source, |start, end| {
+        if read || &source[start..end] != name {
+            return;
+        }
+        let suffix = &source[end..];
+        if !suffix.starts_with('=') || suffix.starts_with("==") {
+            read = true;
+        }
+    });
+    read
+}
+
+fn eliminate_write_only_i64_high_multiply(source: &str) -> String {
+    let bytes = source.as_bytes();
+    let mut removals = Vec::new();
+    let mut from = 0usize;
+    while let Some(relative) = source[from..].find("=$m(") {
+        let equals = from + relative;
+        let mut start = equals;
+        while start > 0 && is_js_identifier_byte(bytes[start - 1]) {
+            start -= 1;
+        }
+        let name = &source[start..equals];
+        let boundary = start == 0 || matches!(bytes[start - 1], b';' | b'{' | b'}');
+        let open = equals + 3;
+        let Some(close) = matching_delimiter(source, open, b'(', b')') else {
+            break;
+        };
+        let end = if bytes.get(close + 1..close + 3) == Some(b"|0") {
+            close + 3
+        } else {
+            close + 1
+        };
+        if boundary
+            && is_js_identifier(name)
+            && bytes.get(end) == Some(&b';')
+            && !identifier_is_read(source, name)
+        {
+            removals.push((start, end + 1));
+        }
+        from = end;
+    }
+    if removals.is_empty() {
+        return source.into();
+    }
+    let mut output = String::with_capacity(source.len());
+    let mut copied = 0usize;
+    for (start, end) in removals {
+        output.push_str(&source[copied..start]);
+        copied = end;
+    }
+    output.push_str(&source[copied..]);
+    output
+}
+
 fn optimize_labeled_early_exits(source: &str) -> String {
     let mut output = String::with_capacity(source.len());
     let mut copied = 0usize;
@@ -4446,7 +4947,7 @@ fn return_slot_layout(module: &Module) -> ([usize; 3], Vec<Value>) {
 
     let mut slots = Vec::with_capacity(counts.iter().sum());
     for (class, (ty, prefix)) in [
-        (ValType::I32, "$i"),
+        (ValType::I32, "$v"),
         (ValType::F32, "$f"),
         (ValType::F64, "$d"),
     ]
@@ -4672,6 +5173,38 @@ fn is_js_identifier(value: &str) -> bool {
 fn is_js_identifier_char(value: char) -> bool {
     value.is_ascii_alphanumeric() || matches!(value, '_' | '$')
 }
+fn reusable_i32_expression(value: &str) -> bool {
+    let value = strip_redundant_atom_parentheses(value.trim());
+    is_js_identifier(value)
+        || value.parse::<i32>().is_ok()
+        || value.strip_suffix("|0").is_some_and(is_js_identifier)
+}
+fn nonzero_guard_dominates(body: &str, value: &str) -> bool {
+    let value = strip_redundant_atom_parentheses(value.trim());
+    let name = value.strip_suffix("|0").unwrap_or(value);
+    if !is_js_identifier(name) {
+        return false;
+    }
+    let guard = format!("if(({value})==0)X();");
+    let Some(guard_start) = body.rfind(&guard) else {
+        return false;
+    };
+    let suffix = &body[guard_start + guard.len()..];
+    if suffix.bytes().any(|byte| matches!(byte, b'{' | b'}')) {
+        return false;
+    }
+    let mut assigned = false;
+    visit_javascript_identifiers(suffix, |start, end| {
+        if &suffix[start..end] == name
+            && suffix[end..].starts_with('=')
+            && !suffix[end..].starts_with("==")
+        {
+            assigned = true;
+        }
+    });
+    !assigned
+}
+
 fn is_js_callee(value: &str) -> bool {
     !value.is_empty() && value.split('.').all(is_js_identifier)
 }
@@ -4759,6 +5292,25 @@ fn compact_i32(value: &str) -> String {
     } else {
         format!("({value})|0")
     }
+}
+
+fn is_i32_zero(value: &str) -> bool {
+    matches!(value.trim(), "0" | "0|0" | "(0|0)")
+}
+fn i32_literal(value: &str) -> Option<i32> {
+    let value = strip_redundant_atom_parentheses(value.trim());
+    value
+        .strip_suffix("|0")
+        .unwrap_or(value)
+        .parse::<i32>()
+        .ok()
+}
+
+fn is_unsigned_u16(value: &str) -> bool {
+    let value = strip_redundant_atom_parentheses(value.trim());
+    i32_literal(value).is_some_and(|value| (value as u32) <= u16::MAX as u32)
+        || value.ends_with("&65535")
+        || value.starts_with("65535&")
 }
 
 fn is_signed_i32_expression(value: &str) -> bool {
@@ -5038,26 +5590,124 @@ fn float_helper(a: Value, b: Value, name: &str, f32_: bool) -> Result<Value, Com
 fn i64_compare(a: Value, b: Value, op: BinaryOp) -> Result<Value, CompileError> {
     let (al, ah) = expect_i64(a)?;
     let (bl, bh) = expect_i64(b)?;
-    let opcode = match op {
-        BinaryOp::I64Eq => 0,
-        BinaryOp::I64Ne => 1,
-        BinaryOp::I64LtS => 2,
-        BinaryOp::I64LtU => 3,
-        BinaryOp::I64GtS => 4,
-        BinaryOp::I64GtU => 5,
-        BinaryOp::I64LeS => 6,
-        BinaryOp::I64LeU => 7,
-        BinaryOp::I64GeS => 8,
-        BinaryOp::I64GeU => 9,
-        _ => unreachable!(),
+    let al_literal = i32_literal(&al);
+    let ah_literal = i32_literal(&ah);
+    let bl_literal = i32_literal(&bl);
+    let bh_literal = i32_literal(&bh);
+    let a_zero = al_literal == Some(0) && ah_literal == Some(0);
+    let b_zero = bl_literal == Some(0) && bh_literal == Some(0);
+    let al = format!("({})", compact_external_i32_argument(&al));
+    let ah = format!("({})", compact_external_i32_argument(&ah));
+    let bl = format!("({})", compact_external_i32_argument(&bl));
+    let bh = format!("({})", compact_external_i32_argument(&bh));
+    let expression = if b_zero {
+        match op {
+            BinaryOp::I64Eq => format!("((({al}|{ah})==0)|0)"),
+            BinaryOp::I64Ne => format!("((({al}|{ah})!=0)|0)"),
+            BinaryOp::I64LtS => format!("(({ah}<0)|0)"),
+            BinaryOp::I64LtU => "0".into(),
+            BinaryOp::I64GtS => format!("((({ah}>0)|(({ah}==0)&({al}!=0)))|0)"),
+            BinaryOp::I64GtU => format!("((({al}|{ah})!=0)|0)"),
+            BinaryOp::I64LeS => format!("((({ah}<0)|(({ah}==0)&({al}==0)))|0)"),
+            BinaryOp::I64LeU => format!("((({al}|{ah})==0)|0)"),
+            BinaryOp::I64GeS => format!("(({ah}>=0)|0)"),
+            BinaryOp::I64GeU => "1".into(),
+            _ => unreachable!(),
+        }
+    } else if a_zero {
+        match op {
+            BinaryOp::I64Eq => format!("((({bl}|{bh})==0)|0)"),
+            BinaryOp::I64Ne => format!("((({bl}|{bh})!=0)|0)"),
+            BinaryOp::I64LtS => format!("((({bh}>0)|(({bh}==0)&({bl}!=0)))|0)"),
+            BinaryOp::I64LtU => format!("((({bl}|{bh})!=0)|0)"),
+            BinaryOp::I64GtS => format!("(({bh}<0)|0)"),
+            BinaryOp::I64GtU => "0".into(),
+            BinaryOp::I64LeS => format!("(({bh}>=0)|0)"),
+            BinaryOp::I64LeU => "1".into(),
+            BinaryOp::I64GeS => format!("((({bh}<0)|(({bh}==0)&({bl}==0)))|0)"),
+            BinaryOp::I64GeU => format!("((({bl}|{bh})==0)|0)"),
+            _ => unreachable!(),
+        }
+    } else if bl_literal == Some(0) && !matches!(op, BinaryOp::I64Eq | BinaryOp::I64Ne) {
+        match op {
+            BinaryOp::I64LtS => format!("(({ah}<{bh})|0)"),
+            BinaryOp::I64LtU => format!("((({ah}>>>0)<({bh}>>>0))|0)"),
+            BinaryOp::I64GtS => format!("((({ah}>{bh})|(({ah}=={bh})&({al}!=0)))|0)"),
+            BinaryOp::I64GtU => format!("(((({ah}>>>0)>({bh}>>>0))|(({ah}=={bh})&({al}!=0)))|0)"),
+            BinaryOp::I64LeS => format!("((({ah}<{bh})|(({ah}=={bh})&({al}==0)))|0)"),
+            BinaryOp::I64LeU => format!("(((({ah}>>>0)<({bh}>>>0))|(({ah}=={bh})&({al}==0)))|0)"),
+            BinaryOp::I64GeS => format!("(({ah}>={bh})|0)"),
+            BinaryOp::I64GeU => format!("((({ah}>>>0)>=({bh}>>>0))|0)"),
+            _ => unreachable!(),
+        }
+    } else if bl_literal == Some(-1) && !matches!(op, BinaryOp::I64Eq | BinaryOp::I64Ne) {
+        match op {
+            BinaryOp::I64LtS => format!("((({ah}<{bh})|(({ah}=={bh})&({al}!=-1)))|0)"),
+            BinaryOp::I64LtU => format!("(((({ah}>>>0)<({bh}>>>0))|(({ah}=={bh})&({al}!=-1)))|0)"),
+            BinaryOp::I64GtS => format!("(({ah}>{bh})|0)"),
+            BinaryOp::I64GtU => format!("((({ah}>>>0)>({bh}>>>0))|0)"),
+            BinaryOp::I64LeS => format!("(({ah}<={bh})|0)"),
+            BinaryOp::I64LeU => format!("((({ah}>>>0)<=({bh}>>>0))|0)"),
+            BinaryOp::I64GeS => format!("((({ah}>{bh})|(({ah}=={bh})&({al}==-1)))|0)"),
+            BinaryOp::I64GeU => format!("(((({ah}>>>0)>({bh}>>>0))|(({ah}=={bh})&({al}==-1)))|0)"),
+            _ => unreachable!(),
+        }
+    } else if al_literal == Some(0) && !matches!(op, BinaryOp::I64Eq | BinaryOp::I64Ne) {
+        match op {
+            BinaryOp::I64LtS => format!("((({ah}<{bh})|(({ah}=={bh})&({bl}!=0)))|0)"),
+            BinaryOp::I64LtU => format!("(((({ah}>>>0)<({bh}>>>0))|(({ah}=={bh})&({bl}!=0)))|0)"),
+            BinaryOp::I64GtS => format!("(({ah}>{bh})|0)"),
+            BinaryOp::I64GtU => format!("((({ah}>>>0)>({bh}>>>0))|0)"),
+            BinaryOp::I64LeS => format!("(({ah}<={bh})|0)"),
+            BinaryOp::I64LeU => format!("((({ah}>>>0)<=({bh}>>>0))|0)"),
+            BinaryOp::I64GeS => format!("((({ah}>{bh})|(({ah}=={bh})&({bl}==0)))|0)"),
+            BinaryOp::I64GeU => format!("(((({ah}>>>0)>({bh}>>>0))|(({ah}=={bh})&({bl}==0)))|0)"),
+            _ => unreachable!(),
+        }
+    } else if al_literal == Some(-1) && !matches!(op, BinaryOp::I64Eq | BinaryOp::I64Ne) {
+        match op {
+            BinaryOp::I64LtS => format!("(({ah}<{bh})|0)"),
+            BinaryOp::I64LtU => format!("((({ah}>>>0)<({bh}>>>0))|0)"),
+            BinaryOp::I64GtS => format!("((({ah}>{bh})|(({ah}=={bh})&({bl}!=-1)))|0)"),
+            BinaryOp::I64GtU => format!("(((({ah}>>>0)>({bh}>>>0))|(({ah}=={bh})&({bl}!=-1)))|0)"),
+            BinaryOp::I64LeS => format!("((({ah}<{bh})|(({ah}=={bh})&({bl}==-1)))|0)"),
+            BinaryOp::I64LeU => format!("(((({ah}>>>0)<({bh}>>>0))|(({ah}=={bh})&({bl}==-1)))|0)"),
+            BinaryOp::I64GeS => format!("(({ah}>={bh})|0)"),
+            BinaryOp::I64GeU => format!("((({ah}>>>0)>=({bh}>>>0))|0)"),
+            _ => unreachable!(),
+        }
+    } else {
+        match op {
+            BinaryOp::I64Eq => format!("(({al}=={bl})&({ah}=={bh}))|0"),
+            BinaryOp::I64Ne => format!("(({al}!={bl})|({ah}!={bh}))|0"),
+            BinaryOp::I64LtS => {
+                format!("(({ah}<{bh})|(({ah}=={bh})&(({al}>>>0)<({bl}>>>0))))|0")
+            }
+            BinaryOp::I64LtU => {
+                format!("((({ah}>>>0)<({bh}>>>0))|(({ah}=={bh})&(({al}>>>0)<({bl}>>>0))))|0")
+            }
+            BinaryOp::I64GtS => {
+                format!("(({ah}>{bh})|(({ah}=={bh})&(({al}>>>0)>({bl}>>>0))))|0")
+            }
+            BinaryOp::I64GtU => {
+                format!("((({ah}>>>0)>({bh}>>>0))|(({ah}=={bh})&(({al}>>>0)>({bl}>>>0))))|0")
+            }
+            BinaryOp::I64LeS => {
+                format!("(({ah}<{bh})|(({ah}=={bh})&(({al}>>>0)<=({bl}>>>0))))|0")
+            }
+            BinaryOp::I64LeU => {
+                format!("((({ah}>>>0)<({bh}>>>0))|(({ah}=={bh})&(({al}>>>0)<=({bl}>>>0))))|0")
+            }
+            BinaryOp::I64GeS => {
+                format!("(({ah}>{bh})|(({ah}=={bh})&(({al}>>>0)>=({bl}>>>0))))|0")
+            }
+            BinaryOp::I64GeU => {
+                format!("((({ah}>>>0)>({bh}>>>0))|(({ah}=={bh})&(({al}>>>0)>=({bl}>>>0))))|0")
+            }
+            _ => unreachable!(),
+        }
     };
-    Ok(Value::I32(format!(
-        "IC({},{},{},{},{opcode}|0)|0",
-        compact_external_i32_argument(&al),
-        compact_external_i32_argument(&ah),
-        compact_external_i32_argument(&bl),
-        compact_external_i32_argument(&bh)
-    )))
+    Ok(Value::I32(expression))
 }
 
 fn load_code(op: LoadOp) -> u8 {
@@ -5368,9 +6018,9 @@ function sf(a,t,v){a=a|0;t=t|0;v=+v;var x=AA(0,a,0,0,t==3?8:4);if(t==3)V.setFloa
 function vl(a,i){a=a|0;i=i|0;var x=AA(0,a,0,0,16);return V.getInt32(x+i*4,true)|0}
 function vs(a,v0,v1,v2,v3){a=a|0;v0=v0|0;v1=v1|0;v2=v2|0;v3=v3|0;var x=AA(0,a,0,0,16);V.setInt32(x,v0,true);V.setInt32(x+4,v1,true);V.setInt32(x+8,v2,true);V.setInt32(x+12,v3,true)}
 function G(k,d){k=k|0;d=d|0;var old=0,add=0,ns=0,total=0,x=0,y=0,nb=null,nh=null;if(d<0)return -1;old=s[k]/p[k]|0;add=(d>>>0)*p[k];ns=s[k]+add;if(ns>4294967295||m[k]>=0&&ns>m[k])return -1;for(x=0;x<s.length;x++)total+=x==k?ns:s[x];if(total>4294967295)return -1;nb=new ArrayBuffer(total);nh=new Uint8Array(nb);for(x=0,y=0;x<s.length;x++){nh.set(new Uint8Array(B,a[x],s[x]),y);a[x]=y;y+=x==k?ns:s[x]}s[k]=ns;B=r.b=nb;V=new DataView(B);H=new Uint8Array(B);return old}
-function IC(al,ah,bl,bh,o){al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;o=o|0;if((o|0)==0)return ((al==bl)&(ah==bh))|0;if((o|0)==1)return ((al!=bl)|(ah!=bh))|0;if((o|0)==2)return ((ah<bh)|((ah==bh)&((al>>>0)<(bl>>>0))))|0;if((o|0)==3)return (((ah>>>0)<(bh>>>0))|((ah==bh)&((al>>>0)<(bl>>>0))))|0;if((o|0)==4)return ((ah>bh)|((ah==bh)&((al>>>0)>(bl>>>0))))|0;if((o|0)==5)return (((ah>>>0)>(bh>>>0))|((ah==bh)&((al>>>0)>(bl>>>0))))|0;if((o|0)==6)return ((ah<bh)|((ah==bh)&((al>>>0)<=(bl>>>0))))|0;if((o|0)==7)return (((ah>>>0)<(bh>>>0))|((ah==bh)&((al>>>0)<=(bl>>>0))))|0;if((o|0)==8)return ((ah>bh)|((ah==bh)&((al>>>0)>=(bl>>>0))))|0;if((o|0)==9)return (((ah>>>0)>(bh>>>0))|((ah==bh)&((al>>>0)>=(bl>>>0))))|0;return 0}
-function AB(dm,sm,d,sr,n){dm=dm|0;sm=sm|0;d=d>>>0;sr=sr>>>0;n=n>>>0;var da=AA(dm,d,0,0,n),sa=AA(sm,sr,0,0,n),i=0;if(da>sa&&da<sa+n)for(i=n-1;i>=0;i--)H[da+i]=H[sa+i];else for(i=0;i<n;i++)H[da+i]=H[sa+i]}
-function AC(k,d,v,n){k=k|0;d=d>>>0;v=v|0;n=n>>>0;var x=AA(k,d,0,0,n),i=0;for(i=0;i<n;i++)H[x+i]=v}
+
+function AB(dm,sm,d,sr,n){dm=dm|0;sm=sm|0;d=d>>>0;sr=sr>>>0;n=n>>>0;var da=AA(dm,d,0,0,n),sa=AA(sm,sr,0,0,n);H.set(H.subarray(sa,sa+n),da)}
+function AC(k,d,v,n){k=k|0;d=d>>>0;v=v|0;n=n>>>0;var x=AA(k,d,0,0,n);H.fill(v,x,x+n)}
 function K(di,k,d,sr,n){di=di|0;k=k|0;d=d>>>0;sr=sr>>>0;n=n>>>0;var x=0,i=0,j=0,v='';v=D[di].b;if(D[di].x||sr+n>D[di].n)X();x=AA(k,d,0,0,n);for(i=0;i<n;i++){j=sr+i;H[x+i]=(j&1)?v.charCodeAt(j>>>1)&255:v.charCodeAt(j>>>1)>>>8}}
 function N(x){x=x>>>0;if(x>=T.length)X();return T[x]|0}
 function O(x,v){x=x>>>0;v=v|0;if(x>=T.length)X();T[x]=v;S[x]=v?Z[v]:-1}

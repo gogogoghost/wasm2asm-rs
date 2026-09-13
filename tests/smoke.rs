@@ -102,6 +102,23 @@ fn memory_offset_overflow_traps() {
 }
 
 #[test]
+fn fast_mode_uses_unchecked_direct_memory() {
+    let wat = include_str!("fixtures/smoke/fast_mode_uses_unchecked_direct_memory.wat");
+    let options = CompileOptions {
+        preserve_traps: false,
+        ..CompileOptions::default()
+    };
+    assert_eq!(
+        run_with_options(
+            wat,
+            "instantiate({env:{memory:{buffer:new ArrayBuffer(33554432)}}}).outOfBounds()",
+            &options
+        ),
+        "0"
+    );
+}
+
+#[test]
 fn local_get_preserves_evaluation_order() {
     let wat = include_str!("fixtures/smoke/local_get_preserves_evaluation_order.wat");
     assert_eq!(run(wat, "instantiate({}).snapshot(42)"), "42");
