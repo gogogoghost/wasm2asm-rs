@@ -857,37 +857,39 @@ impl<'a> ModuleCx<'a> {
     fn emit_memory_offset_helpers(&self, out: &mut String) {
         if self.direct_memory_size.is_some() {
             for (&(offset, code), name) in &self.load_offset_helpers {
+                let address = fixed_memory_offset_address("a", offset, self.options.preserve_traps);
                 if matches!(code, 2 | 3) {
                     write!(
                         out,
-                        "function {name}(a){{a=a|0;return +$F{code}(B0(a,{offset})|0)}}"
+                        "function {name}(a){{a=a|0;return +$F{code}({address})}}"
                     )
                     .unwrap();
                 } else {
                     write!(
                         out,
-                        "function {name}(a){{a=a|0;return $L{code}(B0(a,{offset})|0)|0}}"
+                        "function {name}(a){{a=a|0;return $L{code}({address})|0}}"
                     )
                     .unwrap();
                 }
             }
             for (&(offset, code), name) in &self.store_offset_helpers {
+                let address = fixed_memory_offset_address("a", offset, self.options.preserve_traps);
                 if matches!(code, 2 | 3) {
                     write!(
                         out,
-                        "function {name}(a,v){{a=a|0;v=+v;$D{code}(B0(a,{offset})|0,+v)}}"
+                        "function {name}(a,v){{a=a|0;v=+v;$D{code}({address},+v)}}"
                     )
                     .unwrap();
                 } else if code == 1 {
                     write!(
                         out,
-                        "function {name}(a,v,w){{a=a|0;v=v|0;w=w|0;$S1(B0(a,{offset})|0,v|0,w|0)}}"
+                        "function {name}(a,v,w){{a=a|0;v=v|0;w=w|0;$S1({address},v|0,w|0)}}"
                     )
                     .unwrap();
                 } else {
                     write!(
                         out,
-                        "function {name}(a,v){{a=a|0;v=v|0;$S{code}(B0(a,{offset})|0,v|0)}}"
+                        "function {name}(a,v){{a=a|0;v=v|0;$S{code}({address},v|0)}}"
                     )
                     .unwrap();
                 }
@@ -2945,7 +2947,13 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let direct = self.module.direct_memory_size.is_some() && compact;
         let call = if let Some(address) = &compact_address {
             if arg.offset == 0 {
-                if direct {
+                if let Some(load) = self
+                    .module
+                    .direct_memory_size
+                    .and_then(|size| direct_static_load(address, code, size))
+                {
+                    load
+                } else if direct {
                     format!("$L{code}({address})")
                 } else {
                     format!("l({address},{code})")
@@ -2953,7 +2961,14 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             } else if let Some(helper) = offset_helper {
                 format!("{helper}({address})")
             } else if direct {
-                format!("$L{code}(B0({address},{})|0)", arg.offset)
+                format!(
+                    "$L{code}({})",
+                    fixed_memory_offset_address(
+                        address,
+                        arg.offset,
+                        self.module.options.preserve_traps
+                    )
+                )
             } else {
                 format!("l2({address},{},{code})", arg.offset)
             }
@@ -2973,7 +2988,14 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             } else if let Some(helper) = offset_helper {
                 format!("{helper}({address})")
             } else if direct {
-                format!("$F{code}(B0({address},{})|0)", arg.offset)
+                format!(
+                    "$F{code}({})",
+                    fixed_memory_offset_address(
+                        address,
+                        arg.offset,
+                        self.module.options.preserve_traps
+                    )
+                )
             } else {
                 format!("lf2({address},{},{code})", arg.offset)
             }
@@ -3105,7 +3127,11 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     let address = if arg.offset == 0 {
                         address
                     } else {
-                        format!("B0({address},{})|0", arg.offset)
+                        fixed_memory_offset_address(
+                            &address,
+                            arg.offset,
+                            self.module.options.preserve_traps,
+                        )
                     };
                     write!(self.body, "$S1({address},{value_low},{value_high});").unwrap();
                 } else if arg.offset == 0 {
@@ -3141,12 +3167,12 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     } else if let Some(helper) = offset_helper {
                         write!(self.body, "{helper}({address},{value});").unwrap();
                     } else if direct {
-                        write!(
-                            self.body,
-                            "$D{code}(B0({address},{})|0,{value});",
-                            arg.offset
-                        )
-                        .unwrap();
+                        let address = fixed_memory_offset_address(
+                            &address,
+                            arg.offset,
+                            self.module.options.preserve_traps,
+                        );
+                        write!(self.body, "$D{code}({address},{value});").unwrap();
                     } else {
                         write!(self.body, "sf2({address},{},{code},{value});", arg.offset).unwrap();
                     }
@@ -3174,20 +3200,15 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                             write!(self.body, "{helper}({address},{value_lo});").unwrap();
                         }
                     } else if direct {
+                        let address = fixed_memory_offset_address(
+                            &address,
+                            arg.offset,
+                            self.module.options.preserve_traps,
+                        );
                         if code == 1 {
-                            write!(
-                                self.body,
-                                "$S1(B0({address},{})|0,{value_lo},{value_hi});",
-                                arg.offset
-                            )
-                            .unwrap();
+                            write!(self.body, "$S1({address},{value_lo},{value_hi});").unwrap();
                         } else {
-                            write!(
-                                self.body,
-                                "$S{code}(B0({address},{})|0,{value_lo});",
-                                arg.offset
-                            )
-                            .unwrap();
+                            write!(self.body, "$S{code}({address},{value_lo});").unwrap();
                         }
                     } else {
                         write!(
@@ -3209,12 +3230,12 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     } else if let Some(helper) = offset_helper {
                         write!(self.body, "{helper}({address},{value});").unwrap();
                     } else if direct {
-                        write!(
-                            self.body,
-                            "$S{code}(B0({address},{})|0,{value});",
-                            arg.offset
-                        )
-                        .unwrap();
+                        let address = fixed_memory_offset_address(
+                            &address,
+                            arg.offset,
+                            self.module.options.preserve_traps,
+                        );
+                        write!(self.body, "$S{code}({address},{value});").unwrap();
                     } else {
                         write!(self.body, "st2({address},{},{code},{value},0);", arg.offset)
                             .unwrap();
@@ -4682,6 +4703,22 @@ fn named_value(ty: ValType, base: &str) -> Value {
         ValType::V128 => Value::V128(std::array::from_fn(|i| format!("{base}{i}"))),
     }
 }
+fn direct_static_load(address: &str, code: u8, memory_size: u32) -> Option<String> {
+    let address = u32::try_from(i32_literal(address)?).ok()?;
+    let (array, width, shift) = match code {
+        0 | 12 => ("$h32", 4, 2),
+        4 | 8 => ("$h8", 1, 0),
+        5 | 9 => ("$u8", 1, 0),
+        6 | 10 => ("$h16", 2, 1),
+        7 | 11 => ("$u16", 2, 1),
+        13 => ("$u32", 4, 2),
+        _ => return None,
+    };
+    if address & (width - 1) != 0 || address.checked_add(width)? > memory_size {
+        return None;
+    }
+    Some(format!("{array}[{}]", address >> shift))
+}
 fn compact_memory_address(lo: &str, offset: u64) -> String {
     if offset == 0 {
         compact_i32(lo)
@@ -4689,6 +4726,14 @@ fn compact_memory_address(lo: &str, offset: u64) -> String {
         compact_operand(lo)
     }
 }
+fn fixed_memory_offset_address(base: &str, offset: u64, preserve_traps: bool) -> String {
+    if preserve_traps {
+        format!("B0({base},{offset})|0")
+    } else {
+        format!("{}+{offset}|0", compact_operand(base))
+    }
+}
+
 fn local_ident(index: usize) -> String {
     compact_index(index)
 }
