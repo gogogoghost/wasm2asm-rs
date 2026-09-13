@@ -18,6 +18,18 @@ fn scalar_add_runs() {
 }
 
 #[test]
+fn repeated_offset_loads_preserve_aligned_and_unaligned_accesses() {
+    let wat = include_str!("fixtures/smoke/repeated_offset_loads_run.wat");
+    assert_eq!(
+        run(
+            wat,
+            "(()=>{let m=instantiate({});return [m.sum(3),m.sum(4)]})()"
+        ),
+        "-2140118960,-1870630816"
+    );
+}
+
+#[test]
 fn nested_float_additions_generate_valid_javascript() {
     let wat = include_str!("fixtures/smoke/nested_float_additions_generate_valid_javascript.wat");
     assert_eq!(run(wat, "instantiate({}).sum()"), "10");

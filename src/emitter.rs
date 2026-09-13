@@ -795,48 +795,24 @@ impl<'a> ModuleCx<'a> {
         let half_check = check(half_limit);
         let word_check = check(word_limit);
         let double_check = check(double_limit);
-        write!(
-            out,
-            "function $L0(a){{a=a|0;{word_check}if(a&3)return l(a|0,0|0)|0;return $h32[a>>2]|0}}"
-        )
-        .unwrap();
-        write!(out, "function $L1(a){{a=a|0;var v=0;{double_check}if(a&3){{v=l(a|0,1|0)|0;$ih=GH()|0;return v|0}}$ih=$h32[(a+4)>>2]|0;return $h32[a>>2]|0}}").unwrap();
-        write!(
-            out,
-            "function $F2(a){{a=a|0;{word_check}if(a&3)return +lf(a|0,2|0);return +F($f32[a>>2])}}"
-        )
-        .unwrap();
-        write!(out, "function $F3(a){{a=a|0;var v=0.0;{double_check}if(a&7){{v=+lf(a|0,3|0);$rl=l(a|0,1|0)|0;$rh=GH()|0;return +v}}$rl=$h32[a>>2]|0;$rh=$h32[(a+4)>>2]|0;return +$f64[a>>3]}}").unwrap();
-        for code in [4, 8] {
-            write!(
-                out,
-                "function $L{code}(a){{a=a|0;{byte_check}return $h8[a>>0]|0}}"
-            )
-            .unwrap();
+        for (code, name) in [
+            (0, "$L0"),
+            (1, "$L1"),
+            (2, "$F2"),
+            (3, "$F3"),
+            (4, "$L4"),
+            (8, "$L8"),
+            (5, "$L5"),
+            (9, "$L9"),
+            (6, "$L6"),
+            (10, "$L10"),
+            (7, "$L7"),
+            (11, "$L11"),
+            (12, "$L12"),
+            (13, "$L13"),
+        ] {
+            self.emit_direct_memory_load_helper(out, name, None, code);
         }
-        for code in [5, 9] {
-            write!(
-                out,
-                "function $L{code}(a){{a=a|0;{byte_check}return $u8[a>>0]|0}}"
-            )
-            .unwrap();
-        }
-        for code in [6, 10] {
-            write!(out, "function $L{code}(a){{a=a|0;{half_check}if(a&1)return l(a|0,{code}|0)|0;return $h16[a>>1]|0}}").unwrap();
-        }
-        for code in [7, 11] {
-            write!(out, "function $L{code}(a){{a=a|0;{half_check}if(a&1)return l(a|0,{code}|0)|0;return $u16[a>>1]|0}}").unwrap();
-        }
-        write!(
-            out,
-            "function $L12(a){{a=a|0;{word_check}if(a&3)return l(a|0,12|0)|0;return $h32[a>>2]|0}}"
-        )
-        .unwrap();
-        write!(
-            out,
-            "function $L13(a){{a=a|0;{word_check}if(a&3)return l(a|0,13|0)|0;return $u32[a>>2]|0}}"
-        )
-        .unwrap();
         write!(out, "function $S0(a,v){{a=a|0;v=v|0;{word_check}if(a&3){{st(a|0,0|0,v|0,0|0);return}}$h32[a>>2]=v}}").unwrap();
         write!(out, "function $S1(a,v,w){{a=a|0;v=v|0;w=w|0;{double_check}if(a&3){{st(a|0,1|0,v|0,w|0);return}}$h32[a>>2]=v;$h32[(a+4)>>2]=w}}").unwrap();
         write!(out, "function $D2(a,v){{a=a|0;v=+v;{word_check}if(a&3){{sf(a|0,2|0,+v);return}}$f32[a>>2]=F(v)}}").unwrap();
@@ -854,23 +830,52 @@ impl<'a> ModuleCx<'a> {
         write!(out, "function $S8(a,v){{a=a|0;v=v|0;{word_check}if(a&3){{st(a|0,8|0,v|0,0|0);return}}$h32[a>>2]=v}}").unwrap();
     }
 
+    fn emit_direct_memory_load_helper(
+        &self,
+        out: &mut String,
+        name: &str,
+        offset: Option<u64>,
+        code: u8,
+    ) {
+        let size = self
+            .direct_memory_size
+            .expect("direct load helper requires fixed memory");
+        let width = match code {
+            4 | 5 | 8 | 9 => 1,
+            6 | 7 | 10 | 11 => 2,
+            1 | 3 => 8,
+            _ => 4,
+        };
+        let check = self
+            .options
+            .preserve_traps
+            .then(|| format!("if((a>>>0)>{})X();", size - width))
+            .unwrap_or_default();
+        let setup = offset
+            .map(|offset| {
+                let address = fixed_memory_offset_address("a", offset, self.options.preserve_traps);
+                format!("a={address};")
+            })
+            .unwrap_or_default();
+        match code {
+            0 | 12 => write!(out, "function {name}(a){{a=a|0;{setup}{check}if(a&3)return l(a|0,{code}|0)|0;return $h32[a>>2]|0}}"),
+            1 => write!(out, "function {name}(a){{a=a|0;var v=0;{setup}{check}if(a&3){{v=l(a|0,1|0)|0;$ih=GH()|0;return v|0}}$ih=$h32[(a+4)>>2]|0;return $h32[a>>2]|0}}"),
+            2 => write!(out, "function {name}(a){{a=a|0;{setup}{check}if(a&3)return +lf(a|0,2|0);return +F($f32[a>>2])}}"),
+            3 => write!(out, "function {name}(a){{a=a|0;var v=0.0;{setup}{check}if(a&7){{v=+lf(a|0,3|0);$rl=l(a|0,1|0)|0;$rh=GH()|0;return +v}}$rl=$h32[a>>2]|0;$rh=$h32[(a+4)>>2]|0;return +$f64[a>>3]}}"),
+            4 | 8 => write!(out, "function {name}(a){{a=a|0;{setup}{check}return $h8[a>>0]|0}}"),
+            5 | 9 => write!(out, "function {name}(a){{a=a|0;{setup}{check}return $u8[a>>0]|0}}"),
+            6 | 10 => write!(out, "function {name}(a){{a=a|0;{setup}{check}if(a&1)return l(a|0,{code}|0)|0;return $h16[a>>1]|0}}"),
+            7 | 11 => write!(out, "function {name}(a){{a=a|0;{setup}{check}if(a&1)return l(a|0,{code}|0)|0;return $u16[a>>1]|0}}"),
+            13 => write!(out, "function {name}(a){{a=a|0;{setup}{check}if(a&3)return l(a|0,13|0)|0;return $u32[a>>2]|0}}"),
+            _ => unreachable!("invalid direct load helper code {code}"),
+        }
+        .unwrap();
+    }
+
     fn emit_memory_offset_helpers(&self, out: &mut String) {
         if self.direct_memory_size.is_some() {
             for (&(offset, code), name) in &self.load_offset_helpers {
-                let address = fixed_memory_offset_address("a", offset, self.options.preserve_traps);
-                if matches!(code, 2 | 3) {
-                    write!(
-                        out,
-                        "function {name}(a){{a=a|0;return +$F{code}({address})}}"
-                    )
-                    .unwrap();
-                } else {
-                    write!(
-                        out,
-                        "function {name}(a){{a=a|0;return $L{code}({address})|0}}"
-                    )
-                    .unwrap();
-                }
+                self.emit_direct_memory_load_helper(out, name, Some(offset), code);
             }
             for (&(offset, code), name) in &self.store_offset_helpers {
                 let address = fixed_memory_offset_address("a", offset, self.options.preserve_traps);
@@ -2119,6 +2124,8 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
 
     fn emit_br_table(&mut self, targets: &[u32], default: u32) -> Result<(), CompileError> {
         let selector = compact_i32(&self.pop_i32()?.to_string());
+        let (selector, rotate_cases) =
+            simplify_rotated_u8_br_table(&selector, targets.len()).unwrap_or((selector, 0));
         let default_target = self.target_index(default)?;
         let values = self.pop_types(&self.branch_types(default_target))?;
         let mut groups = Vec::<(usize, Vec<usize>)>::new();
@@ -2136,6 +2143,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         write!(self.body, "switch({selector}){{").unwrap();
         for (target, cases) in groups {
             for case in cases {
+                let case = rotate_u8(case, rotate_cases);
                 write!(self.body, "case {case}:").unwrap();
             }
             self.emit_branch_to_index(target, &values)?;
@@ -5351,6 +5359,42 @@ fn compact_i32(value: &str) -> String {
         format!("{value}|0")
     } else {
         format!("({value})|0")
+    }
+}
+
+fn simplify_rotated_u8_br_table(selector: &str, cases: usize) -> Option<(String, u32)> {
+    if cases > 256 {
+        return None;
+    }
+    let selector = selector.strip_suffix("|0").unwrap_or(selector);
+    let rotated = selector.strip_suffix("&255")?;
+    let rotated = rotated.strip_prefix('(')?.strip_suffix(')')?;
+    for right in 1..8 {
+        let left = 8 - right;
+        let mask = (255u32 << right) & 255;
+        let infix = format!("<<{left})|((");
+        let suffix = format!("&{mask})>>>{right})");
+        let Some(rotated) = rotated.strip_prefix('(') else {
+            continue;
+        };
+        let Some((base, remainder)) = rotated.split_once(&infix) else {
+            continue;
+        };
+        let Some(other) = remainder.strip_suffix(&suffix) else {
+            continue;
+        };
+        if base == other && is_js_identifier(base) {
+            return Some((format!("{}&255", compact_operand(base)), right));
+        }
+    }
+    None
+}
+
+fn rotate_u8(value: usize, left: u32) -> usize {
+    if left == 0 {
+        value
+    } else {
+        ((value << left) | (value >> (8 - left))) & 255
     }
 }
 
