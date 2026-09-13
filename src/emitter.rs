@@ -1541,6 +1541,12 @@ struct NumericLiteral {
     must_literal: bool,
 }
 
+#[derive(Debug, Clone)]
+struct DivisionCache {
+    divisor: String,
+    reciprocal: String,
+}
+
 struct FunctionCompiler<'a, 'm> {
     module: &'a ModuleCx<'m>,
     function_index: usize,
@@ -1555,6 +1561,7 @@ struct FunctionCompiler<'a, 'm> {
     declarations: Vec<(String, ValType)>,
     f64_bits: BTreeMap<String, (String, String)>,
     plan: FunctionPlan,
+    division_caches: BTreeMap<usize, DivisionCache>,
     body: String,
     temp_index: usize,
     label_index: usize,
@@ -1588,6 +1595,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             temp_slots: Vec::new(),
             instruction_temps: Vec::new(),
             f64_bits: BTreeMap::new(),
+            division_caches: BTreeMap::new(),
             plan,
             body: String::new(),
             temp_index: next_local,
@@ -1815,7 +1823,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 }
             }
             Unary(op) => self.emit_unary(*op)?,
-            Binary(op) => self.emit_binary(*op)?,
+            Binary(op) => self.emit_binary(instruction_index, *op)?,
             Load(op, memarg) => self.emit_load(*op, *memarg)?,
             Store(op, memarg) => self.emit_store(*op, *memarg)?,
             MemorySize(memory) => {
@@ -2656,7 +2664,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         Ok(())
     }
 
-    fn emit_binary(&mut self, op: BinaryOp) -> Result<(), CompileError> {
+    fn emit_binary(&mut self, instruction_index: usize, op: BinaryOp) -> Result<(), CompileError> {
         use BinaryOp::*;
         let right = self.pop()?;
         let left = self.pop()?;
@@ -2683,7 +2691,9 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 let (a, b) = expect_i32_pair(left, right)?;
                 Value::I32(format!("U({a},{b})"))
             }
-            I32DivS | I32DivU | I32RemS | I32RemU => self.i32_divrem(left, right, op)?,
+            I32DivS | I32DivU | I32RemS | I32RemU => {
+                self.i32_divrem(left, right, op, instruction_index)?
+            }
             I32And => i32_bin(left, right, "&")?,
             I32Or => i32_bin(left, right, "|")?,
             I32Xor => i32_bin(left, right, "^")?,
@@ -2737,11 +2747,19 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         left: Value,
         right: Value,
         op: BinaryOp,
+        instruction_index: usize,
     ) -> Result<Value, CompileError> {
         let (a, b) = expect_i32_pair(left, right)?;
-        let a_i32 = compact_i32(&a);
-        let b_i32 = compact_i32(&b);
         let b_literal = i32_literal(&b);
+        let reciprocal_division = matches!(op, BinaryOp::I32DivS)
+            && b_literal.is_none()
+            && self.plan.reciprocal_division(instruction_index);
+        let mut a_i32 = compact_i32(&a);
+        let mut b_i32 = compact_i32(&b);
+        if reciprocal_division {
+            a_i32 = self.stabilize_i32_expression(a_i32)?;
+            b_i32 = self.stabilize_i32_expression(b_i32)?;
+        }
         if self.module.options.preserve_traps {
             if b_literal.is_none_or(|value| value == 0)
                 && !nonzero_guard_dominates(&self.body, &b_i32)
@@ -2759,6 +2777,9 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     _ => {}
                 }
             }
+        }
+        if reciprocal_division {
+            return self.emit_cached_i32_division(a_i32, b_i32, instruction_index);
         }
         let unsigned_divisor = b_literal.map(|value| value as u32);
         let expr = match op {
@@ -2788,6 +2809,74 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             _ => unreachable!(),
         };
         Ok(Value::I32(expr))
+    }
+
+    fn emit_cached_i32_division(
+        &mut self,
+        a: String,
+        b: String,
+        instruction_index: usize,
+    ) -> Result<Value, CompileError> {
+        let cache = self.division_cache(instruction_index);
+        let quotient = self.temp(ValType::I32).i32_expr()?.to_string();
+        let remainder = self.temp(ValType::I32).i32_expr()?.to_string();
+        let abs_remainder = self.temp(ValType::I32).i32_expr()?.to_string();
+        let abs_divisor = self.temp(ValType::I32).i32_expr()?.to_string();
+        let emit_cached = |body: &mut String| {
+            write!(
+                body,
+                "if((({b})|0)!=(({divisor})|0)){{\
+                   {divisor}=({b})|0;\
+                   {reciprocal}=+(1.0/(+(({b})|0)))\
+                 }}\
+                 {quotient}=~~(+(({a})|0)*{reciprocal});\
+                 {remainder}=(({a})|0)-U({quotient},({b})|0)|0;\
+                 if({remainder}){{\
+                   if(({remainder}^(({a})|0))>>31){{\
+                     {quotient}={quotient}+((((({a})|0)^(({b})|0))>>31)?1:-1)|0\
+                   }}else{{\
+                     {abs_remainder}=({remainder}|0)<0?-{remainder}|0:{remainder};\
+                     {abs_divisor}=(({b})|0)<0?-(({b})|0)|0:({b})|0;\
+                     if(({abs_remainder}>>>0)>=({abs_divisor}>>>0))\
+                       {quotient}={quotient}+((((({a})|0)^(({b})|0))>>31)?-1:1)|0\
+                   }}\
+                 }}",
+                divisor = cache.divisor,
+                reciprocal = cache.reciprocal,
+            )
+            .unwrap();
+        };
+        if self.module.options.preserve_traps {
+            emit_cached(&mut self.body);
+        } else {
+            write!(self.body, "if({b}){{").unwrap();
+            emit_cached(&mut self.body);
+            write!(self.body, "}}else{{{quotient}=({a})/({b})|0}}").unwrap();
+        }
+        Ok(Value::I32(quotient))
+    }
+
+    fn division_cache(&mut self, instruction_index: usize) -> DivisionCache {
+        if let Some(cache) = self.division_caches.get(&instruction_index) {
+            return cache.clone();
+        }
+        let cache = DivisionCache {
+            divisor: self.persistent_local(ValType::I32),
+            reciprocal: self.persistent_local(ValType::F64),
+        };
+        self.division_caches
+            .insert(instruction_index, cache.clone());
+        cache
+    }
+
+    fn stabilize_i32_expression(&mut self, expression: String) -> Result<String, CompileError> {
+        if reusable_i32_expression(&expression) {
+            return Ok(expression);
+        }
+        let value = self.temp(ValType::I32);
+        let target = value.i32_expr()?.to_string();
+        write!(self.body, "{target}=({expression})|0;").unwrap();
+        Ok(target)
     }
 
     fn i64_binary(
@@ -3600,6 +3689,13 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             .checked_sub(1 + depth as usize)
             .ok_or_else(|| self.internal("invalid branch depth"))
     }
+    fn persistent_local(&mut self, ty: ValType) -> String {
+        let name = local_ident(self.temp_index);
+        self.temp_index += 1;
+        self.declarations.push((name.clone(), ty));
+        name
+    }
+
     fn temp(&mut self, ty: ValType) -> Value {
         // Values from earlier instructions are live only through the operand/control state.
         let reusable = self

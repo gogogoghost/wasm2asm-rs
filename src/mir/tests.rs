@@ -125,3 +125,41 @@ fn cfg_models_loop_and_block_branch_targets() {
     };
     assert_eq!(then_block, Some(loop_body));
 }
+
+#[test]
+fn repeated_signed_division_in_loops_uses_reciprocal_cache() {
+    let empty = BlockSig {
+        params: vec![],
+        results: vec![],
+    };
+    let function = Function {
+        type_index: 0,
+        locals: vec![],
+        body: vec![
+            instruction(0, Op::Loop(empty)),
+            instruction(1, Op::LocalGet(0)),
+            instruction(2, Op::LocalGet(1)),
+            instruction(3, Op::Binary(BinaryOp::I32DivS)),
+            instruction(4, Op::Drop),
+            instruction(5, Op::LocalGet(2)),
+            instruction(6, Op::BrIf(0)),
+            instruction(7, Op::End),
+            instruction(8, Op::LocalGet(0)),
+            instruction(9, Op::LocalGet(1)),
+            instruction(10, Op::Binary(BinaryOp::I32DivS)),
+            instruction(11, Op::Drop),
+            instruction(12, Op::End),
+        ],
+        name: None,
+    };
+    let module = module_with(
+        function,
+        FuncType {
+            params: vec![ValType::I32, ValType::I32, ValType::I32],
+            results: vec![],
+        },
+    );
+    let plan = optimize_function(&module, 0, &module.functions[0]).unwrap();
+    assert!(plan.reciprocal_division(3));
+    assert!(!plan.reciprocal_division(10));
+}

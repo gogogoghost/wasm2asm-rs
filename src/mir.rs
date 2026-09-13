@@ -29,6 +29,7 @@ pub(crate) enum SwitchDecision {
 pub(crate) struct FunctionPlan {
     branches: Vec<Option<BranchDecision>>,
     switches: Vec<Option<SwitchDecision>>,
+    reciprocal_divisions: Vec<bool>,
 }
 
 impl FunctionPlan {
@@ -38,6 +39,13 @@ impl FunctionPlan {
 
     pub(crate) fn switch(&self, instruction: usize) -> Option<SwitchDecision> {
         self.switches.get(instruction).copied().flatten()
+    }
+
+    pub(crate) fn reciprocal_division(&self, instruction: usize) -> bool {
+        self.reciprocal_divisions
+            .get(instruction)
+            .copied()
+            .unwrap_or(false)
     }
 }
 
@@ -149,10 +157,11 @@ enum Pass {
     MarkReachable,
     ConstantPropagation,
     CanonicalizeSwitches,
+    PlanReciprocalDivisions,
 }
 
 struct PassManager {
-    passes: [Pass; 3],
+    passes: [Pass; 4],
 }
 
 impl Default for PassManager {
@@ -162,6 +171,7 @@ impl Default for PassManager {
                 Pass::MarkReachable,
                 Pass::ConstantPropagation,
                 Pass::CanonicalizeSwitches,
+                Pass::PlanReciprocalDivisions,
             ],
         }
     }
@@ -172,6 +182,7 @@ impl PassManager {
         let mut plan = FunctionPlan {
             branches: vec![None; function.body.len()],
             switches: vec![None; function.body.len()],
+            reciprocal_divisions: vec![false; function.body.len()],
         };
         let mut constants = Vec::new();
         for pass in self.passes {
@@ -183,6 +194,9 @@ impl PassManager {
                 }
                 Pass::CanonicalizeSwitches => {
                     plan_switch_canonicalization(mir, function, &constants, &mut plan)
+                }
+                Pass::PlanReciprocalDivisions => {
+                    plan_loop_reciprocal_divisions(mir, function, &mut plan)
                 }
             }
         }
@@ -848,6 +862,29 @@ fn plan_switch_canonicalization(
         };
         if let Some((local, right)) = rotated_u8_local(mir, constants, *value) {
             plan.switches[instruction] = Some(SwitchDecision::RotateLocal { local, left: right });
+        }
+    }
+}
+
+fn plan_loop_reciprocal_divisions(mir: &FunctionMir, function: &Function, plan: &mut FunctionPlan) {
+    let mut loop_blocks = vec![false; mir.blocks.len()];
+    for (block_index, block) in mir.blocks.iter().enumerate() {
+        if !block.reachable {
+            continue;
+        }
+        for successor in block
+            .terminator
+            .successors()
+            .filter(|successor| successor.0 <= block_index)
+        {
+            loop_blocks[successor.0..=block_index].fill(true);
+        }
+    }
+
+    for (instruction, item) in function.body.iter().enumerate() {
+        let block = mir.instruction_blocks[instruction];
+        if loop_blocks[block.0] && matches!(item.op, Op::Binary(BinaryOp::I32DivS)) {
+            plan.reciprocal_divisions[instruction] = true;
         }
     }
 }

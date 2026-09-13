@@ -42,6 +42,18 @@ fn mir_switch_and_constant_branch_optimizations_preserve_behavior() {
 }
 
 #[test]
+fn repeated_signed_division_preserves_exact_i32_results() {
+    let wat = include_str!("fixtures/smoke/repeated_signed_division_run.wat");
+    assert_eq!(
+        run(
+            wat,
+            "(()=>{let m=instantiate({});let cases=[[2147483647,10500],[-2147483648,10500],[2147483647,-10500],[-2147483647,-10500],[123456789,10000],[-123456789,10000],[123456789,300],[-123456789,300],[17,3],[-17,3],[17,-3],[-17,-3],[2147483647,-2147483648],[-2147483648,-2147483648],[0,1]];for(let c of cases){let actual=m.div_repeat(c[0],c[1],3),expected=(c[0]/c[1])|0;if(actual!==expected)throw Error(c+\":\"+actual+\"!=\"+expected)}return \"ok\"})()"
+        ),
+        "ok"
+    );
+}
+
+#[test]
 fn nested_float_additions_generate_valid_javascript() {
     let wat = include_str!("fixtures/smoke/nested_float_additions_generate_valid_javascript.wat");
     assert_eq!(run(wat, "instantiate({}).sum()"), "10");
