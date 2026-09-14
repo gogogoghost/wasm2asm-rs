@@ -1,5 +1,7 @@
 use crate::diagnostics::{CompileError, ErrorKind};
-use crate::ir::{BinaryOp, Function, LoadOp, MemArg, Module, Op, SimdOp, UnaryOp, ValType};
+use crate::ir::{
+    BinaryOp, Function, LoadOp, MemArg, Module, Op, SimdOp, StoreOp, UnaryOp, ValType,
+};
 use std::collections::{BTreeSet, VecDeque};
 use std::ops::Range;
 
@@ -24,6 +26,11 @@ pub(crate) enum SwitchDecision {
     Constant(u32),
     RotateLocal { local: u32, left: u32 },
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum I64Demand {
+    Low,
+    Full,
+}
 
 #[derive(Debug, Clone)]
 pub(crate) struct FunctionPlan {
@@ -31,6 +38,9 @@ pub(crate) struct FunctionPlan {
     switches: Vec<Option<SwitchDecision>>,
     reciprocal_divisions: Vec<bool>,
     i32_constants: Vec<Option<i32>>,
+    i64_low_only: Vec<bool>,
+    i32_unsigned_max: Vec<Option<u32>>,
+    i64_unsigned_max: Vec<Option<u64>>,
 }
 
 impl FunctionPlan {
@@ -52,11 +62,24 @@ impl FunctionPlan {
     pub(crate) fn i32_constant(&self, instruction: usize) -> Option<i32> {
         self.i32_constants.get(instruction).copied().flatten()
     }
+
+    pub(crate) fn i64_low_only(&self, instruction: usize) -> bool {
+        self.i64_low_only.get(instruction).copied().unwrap_or(false)
+    }
+
+    pub(crate) fn i32_unsigned_max(&self, instruction: usize) -> Option<u32> {
+        self.i32_unsigned_max.get(instruction).copied().flatten()
+    }
+
+    pub(crate) fn i64_unsigned_max(&self, instruction: usize) -> Option<u64> {
+        self.i64_unsigned_max.get(instruction).copied().flatten()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ValueDef {
     I32Const(i32),
+    I64Const(i64),
     LocalGet {
         local: u32,
         version: u32,
@@ -130,6 +153,7 @@ struct FunctionMir {
     instruction_blocks: Vec<BlockId>,
     values: Vec<ValueData>,
     control_values: Vec<Option<ValueId>>,
+    i64_roots: Vec<(ValueId, I64Demand)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,12 +189,14 @@ struct RegionLayout {
 enum Pass {
     MarkReachable,
     ConstantPropagation,
+    PlanIntegerRanges,
+    PlanI64Demands,
     CanonicalizeSwitches,
     PlanReciprocalDivisions,
 }
 
 struct PassManager {
-    passes: [Pass; 4],
+    passes: [Pass; 6],
 }
 
 impl Default for PassManager {
@@ -179,6 +205,8 @@ impl Default for PassManager {
             passes: [
                 Pass::MarkReachable,
                 Pass::ConstantPropagation,
+                Pass::PlanIntegerRanges,
+                Pass::PlanI64Demands,
                 Pass::CanonicalizeSwitches,
                 Pass::PlanReciprocalDivisions,
             ],
@@ -193,6 +221,9 @@ impl PassManager {
             switches: vec![None; function.body.len()],
             reciprocal_divisions: vec![false; function.body.len()],
             i32_constants: vec![None; function.body.len()],
+            i64_low_only: vec![false; function.body.len()],
+            i32_unsigned_max: vec![None; function.body.len()],
+            i64_unsigned_max: vec![None; function.body.len()],
         };
         let mut constants = Vec::new();
         for pass in self.passes {
@@ -207,6 +238,8 @@ impl PassManager {
                     }
                     plan_constant_branches(mir, function, &constants, &mut plan);
                 }
+                Pass::PlanIntegerRanges => plan_integer_ranges(mir, &mut plan),
+                Pass::PlanI64Demands => plan_i64_demands(mir, &mut plan),
                 Pass::CanonicalizeSwitches => {
                     plan_switch_canonicalization(mir, function, &constants, &mut plan)
                 }
@@ -242,6 +275,7 @@ impl FunctionMir {
             instruction_blocks,
             values: Vec::new(),
             control_values: vec![None; function.body.len()],
+            i64_roots: Vec::new(),
         };
         mir.build_values(module, function_index, function)?;
         Ok(mir)
@@ -255,6 +289,14 @@ impl FunctionMir {
 
     fn opaque(&mut self, ty: ValType, source: usize) -> ValueId {
         self.push_value(ty, ValueDef::Opaque, source)
+    }
+
+    fn demand_i64(&mut self, value: Option<ValueId>, demand: I64Demand) {
+        if let Some(value) = value
+            && self.values[value.0].ty == ValType::I64
+        {
+            self.i64_roots.push((value, demand));
+        }
     }
 
     fn build_values(
@@ -282,8 +324,12 @@ impl FunctionMir {
                         );
                         stack.push(value);
                     }
-                    Op::I64Const(_) => {
-                        let value = self.opaque(ValType::I64, instruction_index);
+                    Op::I64Const(value) => {
+                        let value = self.push_value(
+                            ValType::I64,
+                            ValueDef::I64Const(*value),
+                            instruction_index,
+                        );
                         stack.push(value);
                     }
                     Op::F32Const(_) => {
@@ -322,14 +368,20 @@ impl FunctionMir {
                         stack.push(value);
                     }
                     Op::Unary(op) => {
-                        let operand = pop_or_opaque(
-                            self,
-                            &mut stack,
-                            unary_operand_type(*op),
-                            instruction_index,
-                        );
+                        let operand_ty = unary_operand_type(*op);
+                        let operand =
+                            pop_or_opaque(self, &mut stack, operand_ty, instruction_index);
+                        let result_ty = unary_result_type(*op);
+                        if operand_ty == ValType::I64 && result_ty != ValType::I64 {
+                            let demand = if matches!(op, UnaryOp::I32WrapI64) {
+                                I64Demand::Low
+                            } else {
+                                I64Demand::Full
+                            };
+                            self.demand_i64(Some(operand), demand);
+                        }
                         let value = self.push_value(
-                            unary_result_type(*op),
+                            result_ty,
                             ValueDef::Unary(*op, operand),
                             instruction_index,
                         );
@@ -339,6 +391,10 @@ impl FunctionMir {
                         let operand_ty = binary_operand_type(*op);
                         let right = pop_or_opaque(self, &mut stack, operand_ty, instruction_index);
                         let left = pop_or_opaque(self, &mut stack, operand_ty, instruction_index);
+                        if operand_ty == ValType::I64 && binary_result_type(*op) != ValType::I64 {
+                            self.demand_i64(Some(left), I64Demand::Full);
+                            self.demand_i64(Some(right), I64Demand::Full);
+                        }
                         let value = self.push_value(
                             binary_result_type(*op),
                             ValueDef::Binary(*op, left, right),
@@ -356,7 +412,11 @@ impl FunctionMir {
                             .ok_or_else(|| internal("MIR local version overflow"))?;
                         local_values[*index as usize] = value;
                     }
-                    Op::GlobalSet(_) | Op::Drop => {
+                    Op::GlobalSet(_) => {
+                        let value = stack.pop();
+                        self.demand_i64(value, I64Demand::Full);
+                    }
+                    Op::Drop => {
                         stack.pop();
                     }
                     Op::LocalTee(index) => {
@@ -391,6 +451,8 @@ impl FunctionMir {
                         stack.pop();
                         let right = stack.pop();
                         let left = stack.pop();
+                        self.demand_i64(left, I64Demand::Full);
+                        self.demand_i64(right, I64Demand::Full);
                         let result_ty = ty
                             .or_else(|| left.map(|value| self.values[value.0].ty))
                             .or_else(|| right.map(|value| self.values[value.0].ty))
@@ -412,9 +474,17 @@ impl FunctionMir {
                         );
                         stack.push(value);
                     }
-                    Op::Store(_, _) => {
-                        stack.pop();
-                        stack.pop();
+                    Op::Store(op, _) => {
+                        let value = stack.pop();
+                        let demand =
+                            if matches!(op, StoreOp::I64_8 | StoreOp::I64_16 | StoreOp::I64_32) {
+                                I64Demand::Low
+                            } else {
+                                I64Demand::Full
+                            };
+                        self.demand_i64(value, demand);
+                        let address = stack.pop();
+                        self.demand_i64(address, I64Demand::Full);
                     }
                     Op::MemorySize(memory) => {
                         let ty = memory_index_type(module, *memory)?;
@@ -422,15 +492,16 @@ impl FunctionMir {
                         stack.push(value);
                     }
                     Op::MemoryGrow(memory) => {
-                        stack.pop();
+                        let delta = stack.pop();
+                        self.demand_i64(delta, I64Demand::Full);
                         let ty = memory_index_type(module, *memory)?;
                         let value = self.opaque(ty, instruction_index);
                         stack.push(value);
                     }
                     Op::MemoryInit { .. } | Op::MemoryCopy { .. } => {
-                        pop_many(&mut stack, 3);
+                        pop_many_full(self, &mut stack, 3);
                     }
-                    Op::MemoryFill(_) => pop_many(&mut stack, 3),
+                    Op::MemoryFill(_) => pop_many_full(self, &mut stack, 3),
                     Op::DataDrop(_) | Op::ElemDrop(_) => {}
                     Op::TableGet(table) => {
                         stack.pop();
@@ -503,17 +574,31 @@ impl FunctionMir {
                         apply_call(self, ty, &mut stack, instruction_index);
                     }
                     Op::Simd(op) => apply_simd(self, op, &mut stack, instruction_index),
+                    Op::Return => {
+                        for value in &stack {
+                            self.demand_i64(Some(*value), I64Demand::Full);
+                        }
+                    }
                     Op::Block(_)
                     | Op::Loop(_)
                     | Op::Else
                     | Op::End
                     | Op::Br(_)
-                    | Op::Return
                     | Op::Unreachable
                     | Op::Nop
                     | Op::Throw(_)
                     | Op::TryTable { .. }
                     | Op::Unsupported { .. } => {}
+                }
+            }
+            if self.blocks[block_index]
+                .terminator
+                .successors()
+                .next()
+                .is_some()
+            {
+                for value in local_values.into_iter().flatten() {
+                    self.demand_i64(Some(value), I64Demand::Full);
                 }
             }
         }
@@ -584,6 +669,7 @@ impl FunctionMir {
                     verify_operand(right)?;
                 }
                 ValueDef::I32Const(_)
+                | ValueDef::I64Const(_)
                 | ValueDef::LocalGet { alias: None, .. }
                 | ValueDef::Opaque => {}
             }
@@ -651,10 +737,10 @@ fn build_region_layout(function: &Function) -> Result<RegionLayout, CompileError
                 parent: head,
             });
             head = Some(node);
-        } else if matches!(instruction.op, Op::End) {
-            if let Some(node) = head {
-                head = active_nodes[node].parent;
-            }
+        } else if matches!(instruction.op, Op::End)
+            && let Some(node) = head
+        {
+            head = active_nodes[node].parent;
         }
     }
     Ok(RegionLayout {
@@ -706,8 +792,8 @@ fn build_cfg(
             continue;
         }
         let id = BlockId(blocks.len());
-        for instruction in range[0]..range[1] {
-            instruction_blocks[instruction] = id;
+        for block in instruction_blocks.iter_mut().take(range[1]).skip(range[0]) {
+            *block = id;
         }
         blocks.push(BasicBlock {
             instructions: range[0]..range[1],
@@ -832,12 +918,356 @@ fn propagate_constants(mir: &FunctionMir) -> Vec<Option<i32>> {
             ValueDef::LocalGet {
                 alias: Some(value), ..
             } => constants[value.0],
-            ValueDef::LocalGet { alias: None, .. } | ValueDef::Load(_, _, _) | ValueDef::Opaque => {
-                None
-            }
+            ValueDef::I64Const(_)
+            | ValueDef::LocalGet { alias: None, .. }
+            | ValueDef::Load(_, _, _)
+            | ValueDef::Opaque => None,
         };
     }
     constants
+}
+
+fn plan_integer_ranges(mir: &FunctionMir, plan: &mut FunctionPlan) {
+    let mut i32_maxima = vec![None; mir.values.len()];
+    let mut i64_maxima = vec![None; mir.values.len()];
+    let mut seen_i32 = vec![false; plan.i32_unsigned_max.len()];
+    let mut seen_i64 = vec![false; plan.i64_unsigned_max.len()];
+    for (index, value) in mir.values.iter().enumerate() {
+        match value.def {
+            ValueDef::I32Const(constant) => i32_maxima[index] = Some(constant as u32),
+            ValueDef::I64Const(constant) => i64_maxima[index] = Some(constant as u64),
+            ValueDef::LocalGet {
+                alias: Some(alias), ..
+            } => match value.ty {
+                ValType::I32 => i32_maxima[index] = i32_maxima[alias.0],
+                ValType::I64 => i64_maxima[index] = i64_maxima[alias.0],
+                _ => {}
+            },
+            ValueDef::Unary(op, operand) => {
+                let i32_maximum = i32_maxima[operand.0];
+                let i64_maximum = i64_maxima[operand.0];
+                match op {
+                    UnaryOp::I32Eqz | UnaryOp::I64Eqz => i32_maxima[index] = Some(1),
+                    UnaryOp::I32Clz | UnaryOp::I32Ctz | UnaryOp::I32Popcnt => {
+                        i32_maxima[index] = Some(32)
+                    }
+                    UnaryOp::I64Clz | UnaryOp::I64Ctz | UnaryOp::I64Popcnt => {
+                        i64_maxima[index] = Some(64)
+                    }
+                    UnaryOp::I32WrapI64 => {
+                        i32_maxima[index] = i64_maximum
+                            .filter(|maximum| *maximum <= u64::from(u32::MAX))
+                            .map(|maximum| maximum as u32)
+                    }
+                    UnaryOp::I64ExtendI32U => i64_maxima[index] = i32_maximum.map(u64::from),
+                    UnaryOp::I64ExtendI32S => {
+                        i64_maxima[index] = i32_maximum
+                            .filter(|maximum| *maximum <= i32::MAX as u32)
+                            .map(u64::from)
+                    }
+                    UnaryOp::I64Extend8S => {
+                        i64_maxima[index] = i64_maximum.filter(|maximum| *maximum <= i8::MAX as u64)
+                    }
+                    UnaryOp::I64Extend16S => {
+                        i64_maxima[index] =
+                            i64_maximum.filter(|maximum| *maximum <= i16::MAX as u64)
+                    }
+                    UnaryOp::I64Extend32S => {
+                        i64_maxima[index] =
+                            i64_maximum.filter(|maximum| *maximum <= i32::MAX as u64)
+                    }
+                    UnaryOp::I32TruncSatF32U | UnaryOp::I32TruncSatF64U => {
+                        i32_maxima[index] = Some(u32::MAX)
+                    }
+                    UnaryOp::I64TruncSatF32U | UnaryOp::I64TruncSatF64U => {
+                        i64_maxima[index] = Some(u64::MAX)
+                    }
+                    _ => {}
+                }
+            }
+            ValueDef::Binary(op, left, right) => {
+                let left_i32 = i32_maxima[left.0];
+                let right_i32 = i32_maxima[right.0];
+                let left_i64 = i64_maxima[left.0];
+                let right_i64 = i64_maxima[right.0];
+                let right_i32_constant = exact_i32_value(mir, right).map(|value| value as u32);
+                let right_i64_constant = exact_i64_value(mir, right).map(|value| value as u64);
+                if matches!(
+                    op,
+                    BinaryOp::I32Eq
+                        | BinaryOp::I32Ne
+                        | BinaryOp::I32LtS
+                        | BinaryOp::I32LtU
+                        | BinaryOp::I32GtS
+                        | BinaryOp::I32GtU
+                        | BinaryOp::I32LeS
+                        | BinaryOp::I32LeU
+                        | BinaryOp::I32GeS
+                        | BinaryOp::I32GeU
+                        | BinaryOp::I64Eq
+                        | BinaryOp::I64Ne
+                        | BinaryOp::I64LtS
+                        | BinaryOp::I64LtU
+                        | BinaryOp::I64GtS
+                        | BinaryOp::I64GtU
+                        | BinaryOp::I64LeS
+                        | BinaryOp::I64LeU
+                        | BinaryOp::I64GeS
+                        | BinaryOp::I64GeU
+                        | BinaryOp::F32Eq
+                        | BinaryOp::F32Ne
+                        | BinaryOp::F32Lt
+                        | BinaryOp::F32Gt
+                        | BinaryOp::F32Le
+                        | BinaryOp::F32Ge
+                        | BinaryOp::F64Eq
+                        | BinaryOp::F64Ne
+                        | BinaryOp::F64Lt
+                        | BinaryOp::F64Gt
+                        | BinaryOp::F64Le
+                        | BinaryOp::F64Ge
+                ) {
+                    i32_maxima[index] = Some(1);
+                } else {
+                    match op {
+                        BinaryOp::I32Add => {
+                            i32_maxima[index] = left_i32
+                                .zip(right_i32)
+                                .and_then(|(left, right)| left.checked_add(right))
+                        }
+                        BinaryOp::I32Sub if right_i32 == Some(0) => i32_maxima[index] = left_i32,
+                        BinaryOp::I32Mul => {
+                            i32_maxima[index] = left_i32
+                                .zip(right_i32)
+                                .and_then(|(left, right)| left.checked_mul(right))
+                        }
+                        BinaryOp::I32And => i32_maxima[index] = bounded_and32(left_i32, right_i32),
+                        BinaryOp::I32Or | BinaryOp::I32Xor => {
+                            i32_maxima[index] = left_i32.zip(right_i32).map(|(left, right)| {
+                                range_bit_mask32(left) | range_bit_mask32(right)
+                            })
+                        }
+                        BinaryOp::I32Shl => {
+                            i32_maxima[index] =
+                                left_i32.zip(right_i32_constant).and_then(|(left, shift)| {
+                                    let shift = shift & 31;
+                                    left.checked_shl(shift)
+                                        .filter(|value| (*value >> shift) == left)
+                                })
+                        }
+                        BinaryOp::I32ShrU => {
+                            i32_maxima[index] = left_i32
+                                .zip(right_i32_constant)
+                                .map(|(left, shift)| left >> (shift & 31))
+                        }
+                        BinaryOp::I32DivU => {
+                            i32_maxima[index] = left_i32
+                                .zip(right_i32_constant)
+                                .and_then(|(left, right)| (right != 0).then_some(left / right))
+                        }
+                        BinaryOp::I32RemU => {
+                            i32_maxima[index] = right_i32_constant.and_then(|right| {
+                                (right != 0).then_some(left_i32.unwrap_or(u32::MAX).min(right - 1))
+                            })
+                        }
+                        BinaryOp::I64Add => {
+                            i64_maxima[index] = left_i64
+                                .zip(right_i64)
+                                .and_then(|(left, right)| left.checked_add(right))
+                        }
+                        BinaryOp::I64Sub if right_i64 == Some(0) => i64_maxima[index] = left_i64,
+                        BinaryOp::I64Mul => {
+                            i64_maxima[index] = left_i64
+                                .zip(right_i64)
+                                .and_then(|(left, right)| left.checked_mul(right))
+                        }
+                        BinaryOp::I64And => i64_maxima[index] = bounded_and64(left_i64, right_i64),
+                        BinaryOp::I64Or | BinaryOp::I64Xor => {
+                            i64_maxima[index] = left_i64.zip(right_i64).map(|(left, right)| {
+                                range_bit_mask64(left) | range_bit_mask64(right)
+                            })
+                        }
+                        BinaryOp::I64Shl => {
+                            i64_maxima[index] =
+                                left_i64.zip(right_i64_constant).and_then(|(left, shift)| {
+                                    let shift = (shift as u32) & 63;
+                                    left.checked_shl(shift)
+                                        .filter(|value| (*value >> shift) == left)
+                                })
+                        }
+                        BinaryOp::I64ShrU => {
+                            i64_maxima[index] = left_i64
+                                .zip(right_i64_constant)
+                                .map(|(left, shift)| left >> ((shift as u32) & 63))
+                        }
+                        BinaryOp::I64DivU => i64_maxima[index] = left_i64,
+                        BinaryOp::I64RemU => {
+                            i64_maxima[index] = right_i64_constant.and_then(|right| {
+                                (right != 0).then_some(left_i64.unwrap_or(u64::MAX).min(right - 1))
+                            })
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ValueDef::Load(op, _, _) => match op {
+                LoadOp::I32_8U => i32_maxima[index] = Some(u32::from(u8::MAX)),
+                LoadOp::I32_16U => i32_maxima[index] = Some(u32::from(u16::MAX)),
+                LoadOp::I64_8U => i64_maxima[index] = Some(u64::from(u8::MAX)),
+                LoadOp::I64_16U => i64_maxima[index] = Some(u64::from(u16::MAX)),
+                LoadOp::I64_32U => i64_maxima[index] = Some(u64::from(u32::MAX)),
+                _ => {}
+            },
+            ValueDef::LocalGet { alias: None, .. } | ValueDef::Opaque => {}
+        }
+
+        let source = value.source;
+        match value.ty {
+            ValType::I32 => {
+                plan.i32_unsigned_max[source] = if seen_i32[source] {
+                    plan.i32_unsigned_max[source]
+                        .zip(i32_maxima[index])
+                        .map(|(left, right)| left.max(right))
+                } else {
+                    seen_i32[source] = true;
+                    i32_maxima[index]
+                };
+            }
+            ValType::I64 => {
+                plan.i64_unsigned_max[source] = if seen_i64[source] {
+                    plan.i64_unsigned_max[source]
+                        .zip(i64_maxima[index])
+                        .map(|(left, right)| left.max(right))
+                } else {
+                    seen_i64[source] = true;
+                    i64_maxima[index]
+                };
+            }
+            _ => {}
+        }
+    }
+}
+
+fn exact_i32_value(mir: &FunctionMir, value: ValueId) -> Option<i32> {
+    match mir.values[value.0].def {
+        ValueDef::I32Const(value) => Some(value),
+        ValueDef::LocalGet {
+            alias: Some(alias), ..
+        } => exact_i32_value(mir, alias),
+        _ => None,
+    }
+}
+
+fn exact_i64_value(mir: &FunctionMir, value: ValueId) -> Option<i64> {
+    match mir.values[value.0].def {
+        ValueDef::I64Const(value) => Some(value),
+        ValueDef::LocalGet {
+            alias: Some(alias), ..
+        } => exact_i64_value(mir, alias),
+        _ => None,
+    }
+}
+
+fn bounded_and32(left: Option<u32>, right: Option<u32>) -> Option<u32> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(maximum), None) | (None, Some(maximum)) => Some(maximum),
+        (None, None) => None,
+    }
+}
+
+fn bounded_and64(left: Option<u64>, right: Option<u64>) -> Option<u64> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(maximum), None) | (None, Some(maximum)) => Some(maximum),
+        (None, None) => None,
+    }
+}
+
+fn range_bit_mask32(maximum: u32) -> u32 {
+    if maximum == 0 {
+        0
+    } else {
+        u32::MAX >> maximum.leading_zeros()
+    }
+}
+
+fn range_bit_mask64(maximum: u64) -> u64 {
+    if maximum == 0 {
+        0
+    } else {
+        u64::MAX >> maximum.leading_zeros()
+    }
+}
+
+fn plan_i64_demands(mir: &FunctionMir, plan: &mut FunctionPlan) {
+    let mut demands = vec![None; mir.values.len()];
+    let mut queue = VecDeque::from_iter(mir.i64_roots.iter().copied());
+    while let Some((value, demand)) = queue.pop_front() {
+        let merged = match (demands[value.0], demand) {
+            (Some(I64Demand::Full), _) | (_, I64Demand::Full) => I64Demand::Full,
+            _ => I64Demand::Low,
+        };
+        if demands[value.0] == Some(merged) {
+            continue;
+        }
+        demands[value.0] = Some(merged);
+        match mir.values[value.0].def {
+            ValueDef::LocalGet {
+                alias: Some(alias), ..
+            } => queue.push_back((alias, merged)),
+            ValueDef::Unary(op, operand) if mir.values[operand.0].ty == ValType::I64 => {
+                let operand_demand = if merged == I64Demand::Low
+                    && matches!(
+                        op,
+                        UnaryOp::I64Extend8S | UnaryOp::I64Extend16S | UnaryOp::I64Extend32S
+                    ) {
+                    I64Demand::Low
+                } else {
+                    I64Demand::Full
+                };
+                queue.push_back((operand, operand_demand));
+            }
+            ValueDef::Binary(op, left, right)
+                if mir.values[left.0].ty == ValType::I64
+                    && mir.values[right.0].ty == ValType::I64 =>
+            {
+                let operand_demand = if merged == I64Demand::Low
+                    && matches!(
+                        op,
+                        BinaryOp::I64Add
+                            | BinaryOp::I64Sub
+                            | BinaryOp::I64Mul
+                            | BinaryOp::I64And
+                            | BinaryOp::I64Or
+                            | BinaryOp::I64Xor
+                            | BinaryOp::I64Shl
+                    ) {
+                    I64Demand::Low
+                } else {
+                    I64Demand::Full
+                };
+                queue.push_back((left, operand_demand));
+                queue.push_back((right, operand_demand));
+            }
+            _ => {}
+        }
+    }
+
+    let mut full_sources = vec![false; plan.i64_low_only.len()];
+    for (value, demand) in mir.values.iter().zip(demands) {
+        if value.ty != ValType::I64 {
+            continue;
+        }
+        match demand {
+            Some(I64Demand::Low) => plan.i64_low_only[value.source] = true,
+            Some(I64Demand::Full) => full_sources[value.source] = true,
+            None => {}
+        }
+    }
+    for (low_only, full) in plan.i64_low_only.iter_mut().zip(full_sources) {
+        *low_only &= !full;
+    }
 }
 
 fn plan_constant_branches(
@@ -1061,6 +1491,12 @@ fn pop_many(stack: &mut Vec<ValueId>, count: usize) {
         stack.pop();
     }
 }
+fn pop_many_full(mir: &mut FunctionMir, stack: &mut Vec<ValueId>, count: usize) {
+    for _ in 0..count {
+        let value = stack.pop();
+        mir.demand_i64(value, I64Demand::Full);
+    }
+}
 
 fn apply_call(
     mir: &mut FunctionMir,
@@ -1068,7 +1504,12 @@ fn apply_call(
     stack: &mut Vec<ValueId>,
     source: usize,
 ) {
-    pop_many(stack, ty.params.len());
+    for param in ty.params.iter().rev() {
+        let value = stack.pop();
+        if *param == ValType::I64 {
+            mir.demand_i64(value, I64Demand::Full);
+        }
+    }
     for &result in &ty.results {
         let value = mir.opaque(result, source);
         stack.push(value);

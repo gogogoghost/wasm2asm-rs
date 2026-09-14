@@ -192,3 +192,53 @@ fn repeated_signed_division_in_loops_uses_reciprocal_cache() {
     assert!(plan.reciprocal_division(3));
     assert!(!plan.reciprocal_division(10));
 }
+
+#[test]
+fn i64_demand_analysis_distinguishes_low_only_and_full_consumers() {
+    let low_only_function = Function {
+        type_index: 0,
+        locals: vec![],
+        body: vec![
+            instruction(0, Op::I64Const(70_000)),
+            instruction(1, Op::I64Const(3)),
+            instruction(2, Op::Binary(BinaryOp::I64Mul)),
+            instruction(3, Op::Unary(UnaryOp::I32WrapI64)),
+            instruction(4, Op::Drop),
+            instruction(5, Op::End),
+        ],
+        name: None,
+    };
+    let low_only_module = module_with(
+        low_only_function,
+        FuncType {
+            params: vec![],
+            results: vec![],
+        },
+    );
+    let plan = optimize_function(&low_only_module, 0, &low_only_module.functions[0]).unwrap();
+    assert!(plan.i64_low_only(2));
+
+    let full_function = Function {
+        type_index: 0,
+        locals: vec![],
+        body: vec![
+            instruction(0, Op::I64Const(70_000)),
+            instruction(1, Op::I64Const(3)),
+            instruction(2, Op::Binary(BinaryOp::I64Mul)),
+            instruction(3, Op::I64Const(210_000)),
+            instruction(4, Op::Binary(BinaryOp::I64Eq)),
+            instruction(5, Op::Drop),
+            instruction(6, Op::End),
+        ],
+        name: None,
+    };
+    let full_module = module_with(
+        full_function,
+        FuncType {
+            params: vec![],
+            results: vec![],
+        },
+    );
+    let plan = optimize_function(&full_module, 0, &full_module.functions[0]).unwrap();
+    assert!(!plan.i64_low_only(2));
+}

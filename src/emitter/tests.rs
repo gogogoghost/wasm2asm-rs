@@ -329,11 +329,14 @@ fn constants_and_return_abi_cover_every_value_kind() {
     assert_eq!(float32_literal(f32::NEG_INFINITY.to_bits()), "F(-In)");
     assert_eq!(float32_literal((-0.0f32).to_bits()), "F(-0.0)");
     assert!(float32_literal(1.25f32.to_bits()).starts_with("F("));
+    assert_eq!(float32_literal(1.0e20f32.to_bits()), "F(1.0e20)");
     assert_eq!(float64_literal(f64::NAN.to_bits()), "Na");
     assert_eq!(float64_literal(f64::INFINITY.to_bits()), "In");
     assert_eq!(float64_literal(f64::NEG_INFINITY.to_bits()), "-In");
     assert_eq!(float64_literal((-0.0f64).to_bits()), "-0.0");
     assert_eq!(float64_literal(1.25f64.to_bits()), "1.25");
+    assert_eq!(float64_literal(1.0e300f64.to_bits()), "1.0e300");
+    assert_eq!(float64_literal(1.0e-300f64.to_bits()), "1.0e-300");
 
     let results = [
         ValType::V128,
@@ -528,7 +531,7 @@ fn module_context_reports_invalid_synthetic_layouts() {
     context.indirect_types.insert(2);
     assert!(context.emit_dispatchers(&mut String::new()).is_err());
 
-    let mut context = ModuleCx::new(&module, &options).unwrap();
+    let context = ModuleCx::new(&module, &options).unwrap();
     let malformed = [CompiledFunction {
         index: 0,
         code: "malformed".into(),

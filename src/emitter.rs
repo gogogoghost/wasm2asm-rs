@@ -303,10 +303,88 @@ fn direct_memory_size(module: &Module, live_functions: &[bool]) -> Option<u32> {
     let bytes = memory.initial.checked_shl(memory.page_size_log2)?;
     let conventional_asm_heap =
         bytes.is_power_of_two() || bytes >= 16 * 1024 * 1024 && bytes % (16 * 1024 * 1024) == 0;
-    if bytes < 16 * 1024 * 1024 || bytes > 2 * 1024 * 1024 * 1024 || !conventional_asm_heap {
+    if !(16 * 1024 * 1024..=2 * 1024 * 1024 * 1024).contains(&bytes) || !conventional_asm_heap {
         return None;
     }
     u32::try_from(bytes).ok()
+}
+
+fn immutable_table_functions(module: &Module, live_functions: &[bool]) -> Option<Vec<Option<u32>>> {
+    let [table] = module.tables.as_slice() else {
+        return None;
+    };
+    if table.table64 || table.maximum != Some(table.initial) {
+        return None;
+    }
+    let size = usize::try_from(table.initial).ok()?;
+    if size == 0 || size > 1 << 20 {
+        return None;
+    }
+    let mut functions = vec![None; size];
+    for element in &module.elements {
+        let ElementMode::Active {
+            table: 0,
+            ref offset,
+        } = element.mode
+        else {
+            continue;
+        };
+        let ConstExpr::I32(offset) = *offset else {
+            return None;
+        };
+        let start = usize::try_from(offset).ok()?;
+        let end = start.checked_add(element.items.len())?;
+        functions
+            .get_mut(start..end)?
+            .copy_from_slice(&element.items);
+    }
+    if functions
+        .iter()
+        .flatten()
+        .any(|index| (*index as usize) < module.imported_function_count as usize)
+    {
+        return None;
+    }
+    let mutable = module
+        .functions
+        .iter()
+        .enumerate()
+        .any(|(defined, function)| {
+            let index = module.imported_function_count as usize + defined;
+            live_functions[index]
+                && function.body.iter().any(|instruction| {
+                    matches!(
+                        instruction.op,
+                        Op::TableSet(0)
+                            | Op::TableGrow(0)
+                            | Op::TableFill(0)
+                            | Op::TableCopy { dst: 0, .. }
+                            | Op::TableCopy { src: 0, .. }
+                            | Op::TableInit { table: 0, .. }
+                    )
+                })
+        });
+    (!mutable).then_some(functions)
+}
+
+fn requires_index_dispatcher(module: &Module, live_functions: &[bool], type_index: u32) -> bool {
+    module
+        .functions
+        .iter()
+        .enumerate()
+        .any(|(defined, function)| {
+            let index = module.imported_function_count as usize + defined;
+            live_functions[index]
+                && function.body.iter().any(|instruction| {
+                    matches!(
+                        instruction.op,
+                        Op::CallRef(index) if index == type_index
+                    ) || matches!(
+                        instruction.op,
+                        Op::ReturnCallIndirect { type_index: index, .. } if index == type_index
+                    )
+                })
+        })
 }
 
 fn uses_inline_i64_helpers(module: &Module, live_functions: &[bool]) -> bool {
@@ -336,6 +414,172 @@ fn uses_inline_i64_helpers(module: &Module, live_functions: &[bool]) -> bool {
         })
 }
 
+#[derive(Clone, Copy)]
+enum UnsignedAbstractValue {
+    I32(Option<u32>),
+    Other,
+}
+
+fn infer_i32_result_maxima(module: &Module) -> Vec<Option<u32>> {
+    let mut maxima = vec![None; module.function_type_indices.len()];
+    loop {
+        let mut changed = false;
+        for (defined_index, function) in module.functions.iter().enumerate() {
+            let function_index = module.imported_function_count as usize + defined_index;
+            let Some(ty) = module
+                .function_type_indices
+                .get(function_index)
+                .and_then(|index| module.types.get(*index as usize))
+            else {
+                continue;
+            };
+            if ty.results.as_slice() != [ValType::I32] {
+                continue;
+            }
+            let inferred = infer_straight_line_i32_maximum(module, function, ty, &maxima);
+            if inferred.is_some() && inferred != maxima[function_index] {
+                maxima[function_index] = inferred;
+                changed = true;
+            }
+        }
+        if !changed {
+            return maxima;
+        }
+    }
+}
+
+fn infer_straight_line_i32_maximum(
+    module: &Module,
+    function: &Function,
+    ty: &FuncType,
+    result_maxima: &[Option<u32>],
+) -> Option<u32> {
+    let mut locals = ty
+        .params
+        .iter()
+        .map(|ty| match ty {
+            ValType::I32 => UnsignedAbstractValue::I32(None),
+            _ => UnsignedAbstractValue::Other,
+        })
+        .collect::<Vec<_>>();
+    locals.extend(function.locals.iter().map(|ty| match ty {
+        ValType::I32 => UnsignedAbstractValue::I32(Some(0)),
+        _ => UnsignedAbstractValue::Other,
+    }));
+    let mut stack = Vec::new();
+    for instruction in &function.body {
+        match instruction.op {
+            Op::I32Const(value) => {
+                stack.push(UnsignedAbstractValue::I32(Some(value as u32)));
+            }
+            Op::LocalGet(index) => stack.push(*locals.get(index as usize)?),
+            Op::LocalSet(index) => {
+                locals[index as usize] = stack.pop()?;
+            }
+            Op::LocalTee(index) => {
+                let value = stack.pop()?;
+                locals[index as usize] = value;
+                stack.push(value);
+            }
+            Op::Unary(op) => {
+                let value = stack.pop()?;
+                let maximum = match (op, value) {
+                    (UnaryOp::I32Eqz, UnsignedAbstractValue::I32(_)) => Some(1),
+                    (
+                        UnaryOp::I32Clz | UnaryOp::I32Ctz | UnaryOp::I32Popcnt,
+                        UnsignedAbstractValue::I32(_),
+                    ) => Some(32),
+                    _ => return None,
+                };
+                stack.push(UnsignedAbstractValue::I32(maximum));
+            }
+            Op::Binary(op) => {
+                let right = match stack.pop()? {
+                    UnsignedAbstractValue::I32(value) => value,
+                    UnsignedAbstractValue::Other => return None,
+                };
+                let left = match stack.pop()? {
+                    UnsignedAbstractValue::I32(value) => value,
+                    UnsignedAbstractValue::Other => return None,
+                };
+                let maximum = match op {
+                    BinaryOp::I32Eq
+                    | BinaryOp::I32Ne
+                    | BinaryOp::I32LtS
+                    | BinaryOp::I32LtU
+                    | BinaryOp::I32GtS
+                    | BinaryOp::I32GtU
+                    | BinaryOp::I32LeS
+                    | BinaryOp::I32LeU
+                    | BinaryOp::I32GeS
+                    | BinaryOp::I32GeU => Some(1),
+                    BinaryOp::I32Add => left
+                        .zip(right)
+                        .and_then(|(left, right)| left.checked_add(right)),
+                    BinaryOp::I32Sub if right == Some(0) => left,
+                    BinaryOp::I32Mul => left
+                        .zip(right)
+                        .and_then(|(left, right)| left.checked_mul(right)),
+                    BinaryOp::I32And => match (left, right) {
+                        (Some(left), Some(right)) => Some(left.min(right)),
+                        (Some(maximum), None) | (None, Some(maximum)) => Some(maximum),
+                        (None, None) => None,
+                    },
+                    BinaryOp::I32Or | BinaryOp::I32Xor => left
+                        .zip(right)
+                        .map(|(left, right)| unsigned_bit_mask(left) | unsigned_bit_mask(right)),
+                    BinaryOp::I32ShrU => left.zip(right).map(|(left, right)| left >> (right & 31)),
+                    BinaryOp::I32DivU => left
+                        .zip(right)
+                        .and_then(|(left, right)| (right != 0).then_some(left / right)),
+                    BinaryOp::I32RemU => right.and_then(|right| {
+                        (right != 0).then_some(left.unwrap_or(u32::MAX).min(right - 1))
+                    }),
+                    _ => None,
+                };
+                stack.push(UnsignedAbstractValue::I32(maximum));
+            }
+            Op::Load(op, _) => {
+                stack.pop()?;
+                let value = match op {
+                    LoadOp::I32_8U => UnsignedAbstractValue::I32(Some(u32::from(u8::MAX))),
+                    LoadOp::I32_16U => UnsignedAbstractValue::I32(Some(u32::from(u16::MAX))),
+                    LoadOp::I32 | LoadOp::I32_8S | LoadOp::I32_16S => {
+                        UnsignedAbstractValue::I32(None)
+                    }
+                    _ => UnsignedAbstractValue::Other,
+                };
+                stack.push(value);
+            }
+            Op::Call(index) => {
+                let callee_type_index = *module.function_type_indices.get(index as usize)?;
+                let callee_ty = module.types.get(callee_type_index as usize)?;
+                for _ in &callee_ty.params {
+                    stack.pop()?;
+                }
+                for result in &callee_ty.results {
+                    stack.push(match result {
+                        ValType::I32 => UnsignedAbstractValue::I32(
+                            result_maxima.get(index as usize).copied().flatten(),
+                        ),
+                        _ => UnsignedAbstractValue::Other,
+                    });
+                }
+            }
+            Op::Drop => {
+                stack.pop()?;
+            }
+            Op::Nop | Op::End => {}
+            Op::Return => break,
+            _ => return None,
+        }
+    }
+    match stack.last().copied()? {
+        UnsignedAbstractValue::I32(maximum) => maximum,
+        UnsignedAbstractValue::Other => None,
+    }
+}
+
 struct ModuleCx<'a> {
     module: &'a Module,
     options: &'a CompileOptions,
@@ -350,6 +594,8 @@ struct ModuleCx<'a> {
     store_offset_helpers: OffsetHelpers,
     direct_memory_size: Option<u32>,
     inline_i64_helpers: bool,
+    i32_result_maxima: Vec<Option<u32>>,
+    immutable_table_functions: Option<Vec<Option<u32>>>,
 }
 
 impl<'a> ModuleCx<'a> {
@@ -369,6 +615,8 @@ impl<'a> ModuleCx<'a> {
             memory_offset_helpers(module, &live_functions);
         let direct_memory_size = direct_memory_size(module, &live_functions);
         let inline_i64_helpers = uses_inline_i64_helpers(module, &live_functions);
+        let i32_result_maxima = infer_i32_result_maxima(module);
+        let immutable_table_functions = immutable_table_functions(module, &live_functions);
         let (return_slot_counts, return_slots) = return_slot_layout(module);
         Ok(Self {
             module,
@@ -384,6 +632,8 @@ impl<'a> ModuleCx<'a> {
             store_offset_helpers,
             direct_memory_size,
             inline_i64_helpers,
+            i32_result_maxima,
+            immutable_table_functions,
         })
     }
 
@@ -401,6 +651,7 @@ impl<'a> ModuleCx<'a> {
     fn emit_module(&mut self) -> Result<String, CompileError> {
         let mut out = String::new();
         self.emit_core(&mut out)?;
+        out = deduplicate_non_exported_functions(&out, self.module, &self.function_names);
         let mut function_names = self.import_function_names.clone();
         function_names.extend(core_function_names(&out));
         let mut global_names = self
@@ -765,6 +1016,17 @@ impl<'a> ModuleCx<'a> {
         self.emit_direct_memory_helpers(out);
         self.emit_memory_offset_helpers(out);
         self.emit_dispatchers(out)?;
+        let mut compiled = self.compile_live_functions()?;
+        deduplicate_outlined_helpers(&mut compiled);
+        let static_memory_helpers = optimize_static_memory_accesses(&mut compiled);
+        out.push_str(&static_memory_helpers);
+        self.emit_compiled_functions(out, &compiled)?;
+        self.emit_export_object(out)?;
+        out.push('}');
+        Ok(())
+    }
+
+    fn compile_live_functions(&self) -> Result<Vec<CompiledFunction>, CompileError> {
         let mut compiled = Vec::new();
         for (defined_index, function) in self.module.functions.iter().enumerate() {
             let function_index = self.module.imported_function_count as usize + defined_index;
@@ -779,13 +1041,7 @@ impl<'a> ModuleCx<'a> {
                 helpers,
             });
         }
-        deduplicate_outlined_helpers(&mut compiled);
-        let static_memory_helpers = optimize_static_memory_accesses(&mut compiled);
-        out.push_str(&static_memory_helpers);
-        self.emit_compiled_functions(out, &compiled)?;
-        self.emit_export_object(out)?;
-        out.push('}');
-        Ok(())
+        Ok(compiled)
     }
 
     fn emit_i64_helpers(&self, out: &mut String) {
@@ -793,9 +1049,37 @@ impl<'a> ModuleCx<'a> {
             return;
         }
         out.push_str("function $m(a,b,c,d){a=a|0;b=b|0;c=c|0;d=d|0;var w0=0,t=0,w1=0,w2=0,h=0;w0=U(a&65535,c&65535)|0;t=U(a>>>16,c&65535)+(w0>>>16)|0;w0=w0&65535;w1=t&65535;w2=t>>>16;w1=U(a&65535,c>>>16)+w1|0;h=U(a>>>16,c>>>16)+w2|0;h=h+(w1>>>16)|0;h=h+U(b,c)|0;h=h+U(a,d)|0;return h|0}");
+
         out.push_str("function $g(a,b,c,d){a=a|0;b=b|0;c=c|0;d=d|0;var n=0;n=c&63;if(!n){$ih=b;return a|0}if((n|0)<32){$ih=(b<<n)|(a>>>(32-n));return a<<n}$ih=a<<(n-32);return 0}");
         out.push_str("function $h(a,b,c,d){a=a|0;b=b|0;c=c|0;d=d|0;var n=0;n=c&63;if(!n){$ih=b;return a|0}if((n|0)<32){$ih=b>>n;return (a>>>n)|(b<<(32-n))}$ih=b>>31;return b>>(n-32)}");
         out.push_str("function $i(a,b,c,d){a=a|0;b=b|0;c=c|0;d=d|0;var n=0;n=c&63;if(!n){$ih=b;return a|0}if((n|0)<32){$ih=b>>>n;return (a>>>n)|(b<<(32-n))}$ih=0;return (b>>>(n-32))|0}");
+    }
+    fn emit_static_function_tables(&self, out: &mut String) {
+        let Some(table) = &self.immutable_table_functions else {
+            return;
+        };
+        let length = table.len().next_power_of_two();
+        for &type_index in &self.indirect_types {
+            let suffix = short_index(type_index as usize);
+            let trap_name = format!("$it{suffix}");
+            write!(out, "var $ft{suffix}=[").unwrap();
+            for slot in 0..length {
+                if slot != 0 {
+                    out.push(',');
+                }
+                let function = table
+                    .get(slot)
+                    .copied()
+                    .flatten()
+                    .filter(|index| {
+                        self.module.function_type_indices[*index as usize] == type_index
+                    })
+                    .map(|index| self.function_names[index as usize].as_str())
+                    .unwrap_or(&trap_name);
+                out.push_str(function);
+            }
+            out.push_str("];");
+        }
     }
 
     fn emit_direct_memory_helpers(&self, out: &mut String) {
@@ -807,10 +1091,11 @@ impl<'a> ModuleCx<'a> {
         let word_limit = size - 4;
         let double_limit = size - 8;
         let check = |limit| {
-            self.options
-                .preserve_traps
-                .then(|| format!("if((a>>>0)>{limit})X();"))
-                .unwrap_or_default()
+            if self.options.preserve_traps {
+                format!("if((a>>>0)>{limit})X();")
+            } else {
+                String::new()
+            }
         };
         let byte_check = check(byte_limit);
         let half_check = check(half_limit);
@@ -867,11 +1152,11 @@ impl<'a> ModuleCx<'a> {
             1 | 3 => 8,
             _ => 4,
         };
-        let check = self
-            .options
-            .preserve_traps
-            .then(|| format!("if((a>>>0)>{})X();", size - width))
-            .unwrap_or_default();
+        let check = if self.options.preserve_traps {
+            format!("if((a>>>0)>{})X();", size - width)
+        } else {
+            String::new()
+        };
         let setup = offset
             .map(|offset| {
                 let address = fixed_memory_offset_address("a", offset, self.options.preserve_traps);
@@ -1220,22 +1505,50 @@ impl<'a> ModuleCx<'a> {
             })?;
             let params = parameter_values(&ty.params);
             let flat = flatten_names(&params);
-            write!(out, "function I{}(x", short_index(type_index as usize)).unwrap();
+            let suffix = short_index(type_index as usize);
+            if self.immutable_table_functions.is_some() {
+                write!(out, "function $it{suffix}(").unwrap();
+                out.push_str(&flat.join(","));
+                out.push_str("){ ");
+                emit_param_coercions(out, &params);
+                out.push_str("X();");
+                match ty.results.first() {
+                    None => {}
+                    Some(ValType::F32) => out.push_str("return F(0)"),
+                    Some(ValType::F64) => out.push_str("return +0"),
+                    _ => out.push_str("return 0"),
+                }
+                out.push('}');
+            }
+            write!(out, "function I{suffix}(x").unwrap();
             for name in &flat {
                 write!(out, ",{name}").unwrap();
             }
             out.push_str("){x=x|0;");
             emit_param_coercions(out, &params);
-            write!(out, "x=IG(x|0,{type_index}|0)|0;").unwrap();
-            let call = format!(
-                "J{}(x{})",
-                short_index(type_index as usize),
-                flat.iter()
-                    .map(|name| format!(",{name}"))
-                    .collect::<String>()
-            );
+            let call = if let Some(table) = &self.immutable_table_functions {
+                write!(out, "if((x>>>0)>={})X();", table.len()).unwrap();
+                format!(
+                    "$ft{suffix}[x&{}]({})",
+                    table.len().next_power_of_two() - 1,
+                    flat.join(",")
+                )
+            } else {
+                write!(out, "x=IG(x|0,{type_index}|0)|0;").unwrap();
+                format!(
+                    "J{suffix}(x{})",
+                    flat.iter()
+                        .map(|name| format!(",{name}"))
+                        .collect::<String>()
+                )
+            };
             emit_direct_js_return(out, &ty.results, &call, false);
             out.push('}');
+            if self.immutable_table_functions.is_some()
+                && !requires_index_dispatcher(self.module, &self.live_functions, type_index)
+            {
+                continue;
+            }
 
             write!(out, "function J{}(x", short_index(type_index as usize)).unwrap();
             for name in &flat {
@@ -1387,6 +1700,7 @@ impl<'a> ModuleCx<'a> {
             .unwrap();
         }
 
+        self.emit_static_function_tables(out);
         out.push_str("return{");
         let mut first = true;
         for (export_position, export) in self.module.exports.iter().enumerate() {
@@ -1588,6 +1902,8 @@ struct FunctionCompiler<'a, 'm> {
     instruction_temps: Vec<usize>,
     declarations: Vec<(String, ValType)>,
     f64_bits: BTreeMap<String, (String, String)>,
+    i32_unsigned_max: BTreeMap<String, u32>,
+    i64_unsigned_max: BTreeMap<(String, String), u64>,
     plan: FunctionPlan,
     division_caches: BTreeMap<usize, DivisionCache>,
     condition_inversions: BTreeMap<String, String>,
@@ -1624,6 +1940,8 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             temp_slots: Vec::new(),
             instruction_temps: Vec::new(),
             f64_bits: BTreeMap::new(),
+            i32_unsigned_max: BTreeMap::new(),
+            i64_unsigned_max: BTreeMap::new(),
             division_caches: BTreeMap::new(),
             condition_inversions: BTreeMap::new(),
             plan,
@@ -1736,6 +2054,13 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         {
             return Ok(());
         }
+        if matches!(
+            instruction.op,
+            Loop(_) | Else | End | Br(_) | BrIf(_) | BrTable { .. }
+        ) {
+            self.i32_unsigned_max.clear();
+            self.i64_unsigned_max.clear();
+        }
         match &instruction.op {
             Unreachable => {
                 self.body.push_str("X();");
@@ -1807,7 +2132,15 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 self.pop()?;
             }
             Select(_) => self.emit_select()?,
-            LocalGet(index) => self.stack.push(self.local(*index)?.clone()),
+            LocalGet(index) => {
+                let value = self.local(*index)?.clone();
+                self.set_integer_facts(
+                    &value,
+                    self.plan.i32_unsigned_max(instruction_index),
+                    self.plan.i64_unsigned_max(instruction_index),
+                );
+                self.stack.push(value);
+            }
             LocalSet(index) => {
                 let value = self.pop()?;
                 let target = self.local(*index)?.clone();
@@ -1867,7 +2200,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     self.pop()?;
                     self.stack.push(Value::I32(value.to_string()));
                 } else {
-                    self.emit_unary(*op)?;
+                    self.emit_unary(instruction_index, *op)?;
                 }
             }
             Binary(op) => {
@@ -2296,7 +2629,16 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
 
     fn emit_call(&mut self, index: u32, tail: bool) -> Result<(), CompileError> {
         let ty = self.module.function_type(index as usize)?.clone();
-        let args = self.pop_types(&ty.params)?;
+        let mut args = self.pop_types(&ty.params)?;
+        for argument in &mut args {
+            if self
+                .i64_unsigned_max(argument)
+                .is_some_and(|maximum| maximum <= u64::from(u32::MAX))
+                && let Value::I64(_, high) = argument
+            {
+                *high = "0".into();
+            }
+        }
         if tail
             && self.module.module.features.tail_call
             && index >= self.module.module.imported_function_count
@@ -2317,12 +2659,20 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             self.module.function_names[index as usize],
             arguments.join(",")
         );
+        let result_maximum = self.module.i32_result_maxima[index as usize];
         self.finish_call(
             &ty.results,
             call,
             tail,
             index < self.module.module.imported_function_count,
-        )
+        )?;
+        if !tail
+            && ty.results.as_slice() == [ValType::I32]
+            && let Some(value) = self.stack.last().cloned()
+        {
+            self.remember_i32_unsigned_max(&value, result_maximum);
+        }
+        Ok(())
     }
 
     fn emit_indirect(
@@ -2505,9 +2855,11 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         Ok(())
     }
 
-    fn emit_unary(&mut self, op: UnaryOp) -> Result<(), CompileError> {
+    fn emit_unary(&mut self, instruction_index: usize, op: UnaryOp) -> Result<(), CompileError> {
         use UnaryOp::*;
         let value = self.pop()?;
+        let i32_maximum = self.i32_unsigned_max(&value);
+        let i64_maximum = self.i64_unsigned_max(&value);
         let result = match op {
             I32Eqz => Value::I32(format!(
                 "{}==0|0",
@@ -2518,7 +2870,11 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             I32Popcnt => Value::I32(format!("pc({})|0", compact_i32(value.i32_expr()?))),
             I64Eqz => {
                 let (lo, hi) = expect_i64(value)?;
-                Value::I32(format!("({}|{})==0|0", compact_i32(&lo), compact_i32(&hi)))
+                if i64_maximum.is_some_and(|maximum| maximum <= u64::from(u32::MAX)) {
+                    Value::I32(format!("{}==0|0", compact_compare_operand(&lo, false)))
+                } else {
+                    Value::I32(format!("({}|{})==0|0", compact_i32(&lo), compact_i32(&hi)))
+                }
             }
             I64Clz => {
                 let (lo, hi) = expect_i64(value)?;
@@ -2715,6 +3071,30 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 self.trunc_i64(x, true, true)?
             }
         };
+        let result_i32_maximum = match op {
+            I32Eqz | I64Eqz => Some(1),
+            I32Clz | I32Ctz | I32Popcnt => Some(32),
+            I32WrapI64 => i64_maximum.map(|maximum| maximum.min(u64::from(u32::MAX)) as u32),
+            _ => None,
+        };
+        let result_i64_maximum = match op {
+            I64Clz | I64Ctz | I64Popcnt => Some(64),
+            I64ExtendI32U => Some(u64::from(i32_maximum.unwrap_or(u32::MAX))),
+            I64ExtendI32S if i32_maximum.is_some_and(|maximum| maximum <= i32::MAX as u32) => {
+                i32_maximum.map(u64::from)
+            }
+            _ => None,
+        };
+        let result_i32_maximum = self
+            .plan
+            .i32_unsigned_max(instruction_index)
+            .or(result_i32_maximum);
+        let result_i64_maximum = self
+            .plan
+            .i64_unsigned_max(instruction_index)
+            .or(result_i64_maximum);
+        self.remember_i32_unsigned_max(&result, result_i32_maximum);
+        self.remember_i64_unsigned_max(&result, result_i64_maximum);
         self.stack.push(result);
         Ok(())
     }
@@ -2722,7 +3102,12 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     fn emit_binary(&mut self, instruction_index: usize, op: BinaryOp) -> Result<(), CompileError> {
         use BinaryOp::*;
         let right = self.pop()?;
+        let right = self.normalize_i64_high(right);
         let left = self.pop()?;
+        let left = self.normalize_i64_high(left);
+        let left_i32_maximum = self.i32_unsigned_max(&left);
+        let right_i32_maximum = self.i32_unsigned_max(&right);
+        let right_i32_literal = right.i32_expr().ok().and_then(i32_literal);
         let inverted_comparison = inverted_i32_comparison(op, &left, &right)?;
         let result = if let Some(result) = simplify_i32_binary(op, &left, &right) {
             result
@@ -2748,7 +3133,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 I32Sub => i32_bin(left, right, "-")?,
                 I32Mul => {
                     let (a, b) = expect_i32_pair(left, right)?;
-                    Value::I32(format!("U({a},{b})"))
+                    Value::I32(format!("U({},{})|0", compact_i32(&a), compact_i32(&b)))
                 }
                 I32DivS | I32DivU | I32RemS | I32RemU => {
                     self.i32_divrem(left, right, op, instruction_index)?
@@ -2780,7 +3165,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 | I64GeU => i64_compare(left, right, op)?,
                 I64Add | I64Sub | I64Mul | I64DivS | I64DivU | I64RemS | I64RemU | I64And
                 | I64Or | I64Xor | I64Shl | I64ShrS | I64ShrU | I64Rotl | I64Rotr => {
-                    self.i64_binary(left, right, op)?
+                    self.i64_binary(instruction_index, left, right, op)?
                 }
                 F32Add => float_bin(left, right, "+", true)?,
                 F32Sub => float_bin(left, right, "-", true)?,
@@ -2804,6 +3189,46 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             self.condition_inversions
                 .insert(compact_condition(&comparison), compact_condition(&inverted));
         }
+        let result_i32_maximum = match op {
+            I32Eq | I32Ne | I32LtS | I32LtU | I32GtS | I32GtU | I32LeS | I32LeU | I32GeS
+            | I32GeU | I64Eq | I64Ne | I64LtS | I64LtU | I64GtS | I64GtU | I64LeS | I64LeU
+            | I64GeS | I64GeU | F32Eq | F32Ne | F32Lt | F32Gt | F32Le | F32Ge | F64Eq | F64Ne
+            | F64Lt | F64Gt | F64Le | F64Ge => Some(1),
+            I32Add => left_i32_maximum
+                .zip(right_i32_maximum)
+                .and_then(|(left, right)| left.checked_add(right)),
+            I32Sub if right_i32_maximum == Some(0) => left_i32_maximum,
+            I32Mul => left_i32_maximum
+                .zip(right_i32_maximum)
+                .and_then(|(left, right)| left.checked_mul(right)),
+            I32And => match (left_i32_maximum, right_i32_maximum) {
+                (Some(left), Some(right)) => Some(left.min(right)),
+                (Some(maximum), None) | (None, Some(maximum)) => Some(maximum),
+                (None, None) => None,
+            },
+            I32Or | I32Xor => left_i32_maximum
+                .zip(right_i32_maximum)
+                .map(|(left, right)| unsigned_bit_mask(left) | unsigned_bit_mask(right)),
+            I32ShrU => left_i32_maximum
+                .zip(right_i32_literal)
+                .map(|(left, right)| left >> ((right as u32) & 31)),
+            I32DivU => left_i32_maximum
+                .zip(right_i32_literal)
+                .and_then(|(left, right)| {
+                    let right = right as u32;
+                    (right != 0).then_some(left / right)
+                }),
+            I32RemU => right_i32_literal.and_then(|right| {
+                let right = right as u32;
+                (right != 0).then_some(left_i32_maximum.unwrap_or(u32::MAX).min(right - 1))
+            }),
+            _ => None,
+        };
+        let result_i32_maximum = self
+            .plan
+            .i32_unsigned_max(instruction_index)
+            .or(result_i32_maximum);
+        self.remember_i32_unsigned_max(&result, result_i32_maximum);
         self.stack.push(result);
         Ok(())
     }
@@ -2947,16 +3372,53 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
 
     fn i64_binary(
         &mut self,
+        instruction_index: usize,
         left: Value,
         right: Value,
         op: BinaryOp,
     ) -> Result<Value, CompileError> {
+        let left_maximum = self.i64_unsigned_max(&left);
+        let right_maximum = self.i64_unsigned_max(&right);
         let (al, ah) = expect_i64(left)?;
         let (bl, bh) = expect_i64(right)?;
         let al_literal = i32_literal(&al);
         let ah_literal = i32_literal(&ah);
         let bl_literal = i32_literal(&bl);
         let bh_literal = i32_literal(&bh);
+        let shift = bl_literal.map(|value| (value as u32) & 63);
+        let result_maximum = self
+            .plan
+            .i64_unsigned_max(instruction_index)
+            .or_else(|| match op {
+                BinaryOp::I64Add => left_maximum
+                    .zip(right_maximum)
+                    .and_then(|(left, right)| left.checked_add(right)),
+                BinaryOp::I64Sub if right_maximum == Some(0) => left_maximum,
+                BinaryOp::I64Mul => left_maximum
+                    .zip(right_maximum)
+                    .and_then(|(left, right)| left.checked_mul(right)),
+                BinaryOp::I64And => match (left_maximum, right_maximum) {
+                    (Some(left), Some(right)) => Some(left.min(right)),
+                    (Some(maximum), None) | (None, Some(maximum)) => Some(maximum),
+                    (None, None) => None,
+                },
+                BinaryOp::I64Or | BinaryOp::I64Xor => left_maximum
+                    .zip(right_maximum)
+                    .map(|(left, right)| unsigned_bit_mask64(left) | unsigned_bit_mask64(right)),
+                BinaryOp::I64Shl => left_maximum.zip(shift).and_then(|(left, shift)| {
+                    left.checked_shl(shift)
+                        .filter(|value| (*value >> shift) == left)
+                }),
+                BinaryOp::I64ShrU => left_maximum.zip(shift).map(|(left, shift)| left >> shift),
+                BinaryOp::I64DivU => left_maximum,
+                BinaryOp::I64RemU if bh_literal == Some(0) => bl_literal.and_then(|right| {
+                    let right = u64::from(right as u32);
+                    (right != 0).then(|| left_maximum.unwrap_or(u64::MAX).min(right - 1))
+                }),
+                _ => None,
+            });
+        let high_is_zero = result_maximum.is_some_and(|maximum| maximum <= u64::from(u32::MAX));
+        let low_only = self.plan.i64_low_only(instruction_index);
         let a_zero = al_literal == Some(0) && ah_literal == Some(0);
         let b_zero = bl_literal == Some(0) && bh_literal == Some(0);
         let a_one = al_literal == Some(1) && ah_literal == Some(0);
@@ -3113,6 +3575,16 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     BinaryOp::I64RemU => 14,
                     _ => unreachable!(),
                 };
+                if high_is_zero || low_only {
+                    if let Some(helper) = ["$g", "$h", "$i"].get((code - 6) as usize) {
+                        write!(self.body, "{low_name}={helper}({al},{ah},{bl},{bh})|0;").unwrap();
+                    } else {
+                        write!(self.body, "{low_name}=W({code}|0,{al},{ah},{bl},{bh})|0;").unwrap();
+                    }
+                    let result = Value::I64(low_name, "0".into());
+                    self.remember_i64_unsigned_max(&result, result_maximum);
+                    return Ok(result);
+                }
                 let high = self.temp(ValType::I32);
                 let high_name = high.i32_expr()?.to_string();
                 if let Some(helper) = ["$g", "$h", "$i"].get((code - 6) as usize) {
@@ -3131,7 +3603,16 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 return Ok(Value::I64(low_name, high_name));
             }
         };
-        Ok(Value::I64(low_name, lazy_high))
+        let result = Value::I64(
+            low_name,
+            if high_is_zero || low_only {
+                "0".into()
+            } else {
+                lazy_high
+            },
+        );
+        self.remember_i64_unsigned_max(&result, result_maximum);
+        Ok(result)
     }
 
     fn trunc_i32(
@@ -3287,7 +3768,15 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 } else {
                     "0".into()
                 };
-                self.stack.push(Value::I64(low_name, high));
+                let value = Value::I64(low_name, high);
+                let maximum = match op {
+                    LoadOp::I64_8U => Some(u64::from(u8::MAX)),
+                    LoadOp::I64_16U => Some(u64::from(u16::MAX)),
+                    LoadOp::I64_32U => Some(u64::from(u32::MAX)),
+                    _ => None,
+                };
+                self.remember_i64_unsigned_max(&value, maximum);
+                self.stack.push(value);
             }
             LoadOp::F32 => {
                 let value = self.temp(ValType::F32);
@@ -3339,6 +3828,12 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             _ => {
                 let value = self.temp(ValType::I32);
                 write!(self.body, "{}={call}|0;", value.i32_expr()?).unwrap();
+                let maximum = match op {
+                    LoadOp::I32_8U => Some(u32::from(u8::MAX)),
+                    LoadOp::I32_16U => Some(u32::from(u16::MAX)),
+                    _ => None,
+                };
+                self.remember_i32_unsigned_max(&value, maximum);
                 self.stack.push(value);
             }
         }
@@ -3837,7 +4332,20 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             self.temp_slots.len() - 1
         };
         self.instruction_temps.push(index);
-        named_value(ty, &self.temp_slots[index].0)
+        let value = named_value(ty, &self.temp_slots[index].0);
+        match &value {
+            Value::I32(expression) => {
+                self.i32_unsigned_max.remove(expression);
+            }
+            Value::I64(low, high) => {
+                self.i64_unsigned_max.remove(&(low.clone(), high.clone()));
+            }
+            Value::F64(expression) => {
+                self.f64_bits.remove(expression);
+            }
+            _ => {}
+        }
+        value
     }
 
     fn temp_is_live(&self, base: &str, ty: ValType) -> bool {
@@ -3883,6 +4391,78 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             .insert(expression.to_string(), (low.clone(), high.clone()));
         (low, high)
     }
+    fn i32_unsigned_max(&self, value: &Value) -> Option<u32> {
+        let Value::I32(expression) = value else {
+            return None;
+        };
+        self.i32_unsigned_max
+            .get(expression)
+            .copied()
+            .or_else(|| i32_literal(expression).map(|value| value as u32))
+    }
+
+    fn i64_unsigned_max(&self, value: &Value) -> Option<u64> {
+        let Value::I64(low, high) = value else {
+            return None;
+        };
+        self.i64_unsigned_max
+            .get(&(low.clone(), high.clone()))
+            .copied()
+            .or_else(|| {
+                is_i32_zero(high).then(|| {
+                    i32_literal(low)
+                        .map(|value| u64::from(value as u32))
+                        .unwrap_or(u64::from(u32::MAX))
+                })
+            })
+    }
+
+    fn remember_i32_unsigned_max(&mut self, value: &Value, maximum: Option<u32>) {
+        let (Value::I32(expression), Some(maximum)) = (value, maximum) else {
+            return;
+        };
+        self.i32_unsigned_max.insert(expression.clone(), maximum);
+    }
+    fn normalize_i64_high(&mut self, mut value: Value) -> Value {
+        let maximum = self.i64_unsigned_max(&value);
+        if maximum.is_some_and(|maximum| maximum <= u64::from(u32::MAX))
+            && let Value::I64(_, high) = &mut value
+        {
+            *high = "0".into();
+            self.remember_i64_unsigned_max(&value, maximum);
+        }
+        value
+    }
+
+    fn remember_i64_unsigned_max(&mut self, value: &Value, maximum: Option<u64>) {
+        let (Value::I64(low, high), Some(maximum)) = (value, maximum) else {
+            return;
+        };
+        self.i64_unsigned_max
+            .insert((low.clone(), high.clone()), maximum);
+    }
+
+    fn set_integer_facts(
+        &mut self,
+        target: &Value,
+        i32_maximum: Option<u32>,
+        i64_maximum: Option<u64>,
+    ) {
+        if let Value::I32(expression) = target {
+            self.i32_unsigned_max.remove(expression);
+        }
+        if let Value::I64(low, high) = target {
+            self.i64_unsigned_max.remove(&(low.clone(), high.clone()));
+        }
+        self.remember_i32_unsigned_max(target, i32_maximum);
+        self.remember_i64_unsigned_max(target, i64_maximum);
+    }
+
+    fn copy_integer_facts(&mut self, target: &Value, value: &Value) {
+        let i32_maximum = self.i32_unsigned_max(value);
+        let i64_maximum = self.i64_unsigned_max(value);
+        self.set_integer_facts(target, i32_maximum, i64_maximum);
+    }
 
     fn retarget_last_temp_assignment(&mut self, target: &Value, value: &Value) -> bool {
         if matches!(target, Value::F64(_)) || matches!(value, Value::F64(_)) {
@@ -3890,7 +4470,8 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         }
         let value_components = value.components();
         let target_components = target.components();
-        let (Some(source), Some(target)) = (value_components.first(), target_components.first())
+        let (Some(source), Some(target_component)) =
+            (value_components.first(), target_components.first())
         else {
             return false;
         };
@@ -3916,8 +4497,10 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         if !self.body[statement_start..statement_end].starts_with(&format!("{source}=")) {
             return false;
         }
-        self.body
-            .replace_range(statement_start..statement_start + source.len(), target);
+        self.body.replace_range(
+            statement_start..statement_start + source.len(),
+            target_component,
+        );
         for (target, source) in target_components.iter().zip(&value_components).skip(1) {
             write!(
                 self.body,
@@ -3926,6 +4509,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             )
             .unwrap();
         }
+        self.copy_integer_facts(target, value);
         true
     }
 
@@ -3977,6 +4561,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
 
     fn assign(&mut self, target: &Value, value: &Value) {
         let source_bits = self.f64_bits_for(value);
+        self.copy_integer_facts(target, value);
         for (a, b) in target.components().iter().zip(value.components()) {
             write!(
                 self.body,
@@ -4071,6 +4656,62 @@ fn core_function_names(source: &str) -> Vec<String> {
         search = end.max(start + 1);
     }
     names
+}
+
+fn deduplicate_non_exported_functions(
+    source: &str,
+    module: &Module,
+    function_names: &[String],
+) -> String {
+    let exported = module
+        .exports
+        .iter()
+        .filter(|export| export.kind == ExportKind::Func)
+        .map(|export| export.index as usize)
+        .collect::<BTreeSet<_>>();
+    let mut canonical: BTreeMap<(u32, String), usize> = BTreeMap::new();
+    let mut aliases = BTreeMap::new();
+    let mut removals = Vec::new();
+    for index in module.imported_function_count as usize..function_names.len() {
+        if exported.contains(&index) {
+            continue;
+        }
+        let name = &function_names[index];
+        let marker = format!("function {name}(");
+        let Some(start) = source.find(&marker) else {
+            continue;
+        };
+        let Some(relative_open) = source[start + marker.len()..].find('{') else {
+            continue;
+        };
+        let open = start + marker.len() + relative_open;
+        let Some(close) = matching_delimiter(source, open, b'{', b'}') else {
+            continue;
+        };
+        let type_index = module.function_type_indices[index];
+        let key = (
+            type_index,
+            source[start + "function ".len() + name.len()..=close].into(),
+        );
+        if let Some(&canonical_index) = canonical.get(&key) {
+            aliases.insert(name.as_str(), function_names[canonical_index].clone());
+            removals.push((start, close + 1));
+        } else {
+            canonical.insert(key, index);
+        }
+    }
+    if removals.is_empty() {
+        return source.into();
+    }
+    removals.sort_unstable();
+    let mut output = String::with_capacity(source.len());
+    let mut copied = 0usize;
+    for (start, end) in removals {
+        output.push_str(&source[copied..start]);
+        copied = end;
+    }
+    output.push_str(&source[copied..]);
+    replace_javascript_identifiers(&output, &aliases)
 }
 
 fn rename_module_functions(source: &str, function_names: &[String]) -> String {
@@ -5487,6 +6128,16 @@ fn i64_const(value: i64) -> Value {
         ((value >> 32) as i32).to_string(),
     )
 }
+fn asm_float_literal(mut literal: String) -> String {
+    let Some(exponent) = literal.find(['e', 'E']) else {
+        return literal;
+    };
+    if !literal[..exponent].contains('.') {
+        literal.insert_str(exponent, ".0");
+    }
+    literal
+}
+
 fn float32_literal(bits: u32) -> String {
     let value = f32::from_bits(bits);
     if value.is_nan() {
@@ -5498,7 +6149,7 @@ fn float32_literal(bits: u32) -> String {
     } else if bits == 0x80000000 {
         "F(-0.0)".into()
     } else {
-        format!("F({:?})", value)
+        format!("F({})", asm_float_literal(format!("{value:?}")))
     }
 }
 fn float64_literal(bits: u64) -> String {
@@ -5512,7 +6163,7 @@ fn float64_literal(bits: u64) -> String {
     } else if bits == 0x8000000000000000 {
         "-0.0".into()
     } else {
-        format!("{:?}", value)
+        asm_float_literal(format!("{value:?}"))
     }
 }
 fn return_slot_types(results: &[ValType]) -> Vec<ValType> {
@@ -5925,6 +6576,20 @@ fn i32_literal(value: &str) -> Option<i32> {
         .parse::<i32>()
         .ok()
 }
+fn unsigned_bit_mask(maximum: u32) -> u32 {
+    if maximum == 0 {
+        0
+    } else {
+        u32::MAX >> maximum.leading_zeros()
+    }
+}
+fn unsigned_bit_mask64(maximum: u64) -> u64 {
+    if maximum == 0 {
+        0
+    } else {
+        u64::MAX >> maximum.leading_zeros()
+    }
+}
 
 fn is_unsigned_u16(value: &str) -> bool {
     let value = strip_redundant_atom_parentheses(value.trim());
@@ -6309,7 +6974,18 @@ fn i64_compare(a: Value, b: Value, op: BinaryOp) -> Result<Value, CompileError> 
     let ah = format!("({})", compact_external_i32_argument(&ah));
     let bl = format!("({})", compact_external_i32_argument(&bl));
     let bh = format!("({})", compact_external_i32_argument(&bh));
-    let expression = if b_zero {
+    let expression = if ah_literal == Some(0) && bh_literal == Some(0) {
+        let operator = match op {
+            BinaryOp::I64Eq => "==",
+            BinaryOp::I64Ne => "!=",
+            BinaryOp::I64LtS | BinaryOp::I64LtU => "<",
+            BinaryOp::I64GtS | BinaryOp::I64GtU => ">",
+            BinaryOp::I64LeS | BinaryOp::I64LeU => "<=",
+            BinaryOp::I64GeS | BinaryOp::I64GeU => ">=",
+            _ => unreachable!(),
+        };
+        format!("((({al}>>>0){operator}({bl}>>>0))|0)")
+    } else if b_zero {
         match op {
             BinaryOp::I64Eq => format!("((({al}|{ah})==0)|0)"),
             BinaryOp::I64Ne => format!("((({al}|{ah})!=0)|0)"),
