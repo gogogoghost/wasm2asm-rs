@@ -167,7 +167,7 @@ fn literal_and_identifier_helpers_cover_all_lexical_cases() {
     assert!(literal_requires_constant_call_argument(Some("sf"), 1));
     assert!(!literal_requires_constant_call_argument(Some("f"), 0));
 
-    let body = r#"f(12,"34\"56",'78',`90`);l(x,2);z=1.25;u=a1+5"#;
+    let body = r#"f(12,"34\"56",'78',`90`);l(x,2);z=1.25;u=a1+5;v=2147483648"#;
     let literals = numeric_literals(body);
     assert!(
         numeric_literals("switch(x){case 3:return 4}")
@@ -177,7 +177,8 @@ fn literal_and_identifier_helpers_cover_all_lexical_cases() {
     assert!(literals.iter().any(|literal| literal.must_literal));
     let key = numeric_template_key(body, &literals);
     let rendered = render_numeric_template_body(body, &literals, &[0]);
-    assert!(!key.is_empty() && rendered.contains("c0"));
+    assert!(key.contains("2147483648"));
+    assert!(rendered.contains("(c0|0)"));
 
     assert!(!is_js_identifier(""));
     assert!(is_js_identifier("$valid_2"));
@@ -208,6 +209,17 @@ fn literal_and_identifier_helpers_cover_all_lexical_cases() {
     assert_eq!(compact_condition("((x|0)!=0)|0"), "x");
     assert_eq!(compact_condition("((x|0)<(16|0))|0"), "(x|0)<16");
     assert_eq!(compact_condition("(x+y)|0"), "(x+y)|0");
+    let no_inversions = BTreeMap::new();
+    assert_eq!(
+        negate_condition("x>>>0>=y>>>0", &no_inversions),
+        "x>>>0<y>>>0"
+    );
+    assert_eq!(
+        negate_condition("(x|0)==(7|0)", &no_inversions),
+        "(x|0)!=(7|0)"
+    );
+    assert_eq!(negate_condition("(x&255)!=2", &no_inversions), "(x&255)==2");
+    assert_eq!(negate_condition("x>=y", &no_inversions), "!(x>=y)");
     assert_eq!(js_ident(26, false), "aa");
     assert_eq!(js_ident(26, true), "AA");
     assert_eq!(short_index(26), "aa");
@@ -221,6 +233,17 @@ fn literal_and_identifier_helpers_cover_all_lexical_cases() {
         "\"䅂\\ud800\\\"\""
     );
     assert_eq!(instruction_offset("a", "b"), 0);
+    assert_eq!(
+        core_function_names("function asmModule(){function A(){}function $o0_0(){A()}}"),
+        ["A", "$o0_0"]
+    );
+    assert_eq!(
+        rename_module_globals(
+            "var $a=0,$ih=0,$ga=0;$ih=($ih+$ga+$ih)|0;",
+            &["$ih".into(), "$ga".into()]
+        ),
+        "var $a=0,$b=0,$c=0;$b=($b+$c+$b)|0;"
+    );
 }
 
 #[test]
@@ -229,6 +252,7 @@ fn repeated_static_memory_accesses_are_extracted_without_changing_arguments() {
     let mut compiled = [CompiledFunction {
         index: 0,
         code: format!("function A(){{var a=0;{repeated}return a|0}}"),
+        helpers: Vec::new(),
     }];
 
     let helpers = optimize_static_memory_accesses(&mut compiled);
@@ -238,6 +262,51 @@ fn repeated_static_memory_accesses_are_extracted_without_changing_arguments() {
     assert!(!compiled[0].code.contains("l(100|0,0)"));
     assert!(!compiled[0].code.contains("st(104|0,0,a,0)"));
     assert_eq!(compiled[0].code.matches("(a);").count(), 20);
+}
+
+#[test]
+fn repeated_terminal_call_sequences_are_outlined_with_typed_parameters() {
+    let branch =
+        "if($0){storeError($0,1086294|0);storeStatus($0,26|0);finishResult($0,3|0);break L}";
+    let source =
+        format!("function f($0){{$0=$0|0;L:{{{branch}{branch}{branch}{branch}}}return $0|0}}");
+    let local_types = BTreeMap::from([("$0".into(), ValType::I32)]);
+
+    let (output, helpers) = outline_repeated_terminal_calls(&source, 7, &local_types);
+
+    assert_eq!(
+        helpers,
+        [
+            "function $o7_0($0){$0=$0|0;storeError($0,1086294|0);storeStatus($0,26|0);finishResult($0,3|0);}"
+        ]
+    );
+    assert_eq!(output.matches("$o7_0($0);break L").count(), 4);
+    assert!(!output.contains("storeError($0,1086294|0);"));
+}
+
+#[test]
+fn outlined_helper_deduplication_rewrites_whole_identifiers_only() {
+    let mut compiled = [
+        CompiledFunction {
+            index: 0,
+            code: "function A(){return 0}".into(),
+            helpers: vec!["function $o0_0(a){a=a|0;hit(a)}".into()],
+        },
+        CompiledFunction {
+            index: 1,
+            code: "function B(a){a=a|0;$o1_2(a);$o1_20(a)}".into(),
+            helpers: vec![
+                "function $o1_2(a){a=a|0;hit(a)}".into(),
+                "function $o1_20(a){a=a|0;other(a)}".into(),
+            ],
+        },
+    ];
+
+    deduplicate_outlined_helpers(&mut compiled);
+
+    assert_eq!(compiled[1].code.matches("$o0_0(a)").count(), 1);
+    assert!(compiled[1].code.contains("$o1_20(a)"));
+    assert_eq!(compiled[1].helpers.len(), 1);
 }
 
 #[test]
@@ -459,10 +528,11 @@ fn module_context_reports_invalid_synthetic_layouts() {
     context.indirect_types.insert(2);
     assert!(context.emit_dispatchers(&mut String::new()).is_err());
 
-    let context = ModuleCx::new(&module, &options).unwrap();
+    let mut context = ModuleCx::new(&module, &options).unwrap();
     let malformed = [CompiledFunction {
         index: 0,
         code: "malformed".into(),
+        helpers: Vec::new(),
     }];
     assert!(
         context

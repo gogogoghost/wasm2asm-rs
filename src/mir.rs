@@ -30,6 +30,7 @@ pub(crate) struct FunctionPlan {
     branches: Vec<Option<BranchDecision>>,
     switches: Vec<Option<SwitchDecision>>,
     reciprocal_divisions: Vec<bool>,
+    i32_constants: Vec<Option<i32>>,
 }
 
 impl FunctionPlan {
@@ -47,12 +48,20 @@ impl FunctionPlan {
             .copied()
             .unwrap_or(false)
     }
+
+    pub(crate) fn i32_constant(&self, instruction: usize) -> Option<i32> {
+        self.i32_constants.get(instruction).copied().flatten()
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ValueDef {
     I32Const(i32),
-    LocalGet { local: u32, version: u32 },
+    LocalGet {
+        local: u32,
+        version: u32,
+        alias: Option<ValueId>,
+    },
     Unary(UnaryOp, ValueId),
     Binary(BinaryOp, ValueId, ValueId),
     Load(LoadOp, ValueId, MemArg),
@@ -183,6 +192,7 @@ impl PassManager {
             branches: vec![None; function.body.len()],
             switches: vec![None; function.body.len()],
             reciprocal_divisions: vec![false; function.body.len()],
+            i32_constants: vec![None; function.body.len()],
         };
         let mut constants = Vec::new();
         for pass in self.passes {
@@ -190,6 +200,11 @@ impl PassManager {
                 Pass::MarkReachable => mark_reachable(mir),
                 Pass::ConstantPropagation => {
                     constants = propagate_constants(mir);
+                    for (value, constant) in mir.values.iter().zip(&constants) {
+                        if value.ty == ValType::I32 {
+                            plan.i32_constants[value.source] = *constant;
+                        }
+                    }
                     plan_constant_branches(mir, function, &constants, &mut plan);
                 }
                 Pass::CanonicalizeSwitches => {
@@ -255,6 +270,7 @@ impl FunctionMir {
         for block_index in 0..self.blocks.len() {
             let instructions = self.blocks[block_index].instructions.clone();
             let mut stack = Vec::<ValueId>::new();
+            let mut local_values = vec![None; local_types.len()];
             for instruction_index in instructions {
                 let op = &function.body[instruction_index].op;
                 match op {
@@ -288,6 +304,7 @@ impl FunctionMir {
                             ValueDef::LocalGet {
                                 local: *local,
                                 version,
+                                alias: local_values[*local as usize],
                             },
                             instruction_index,
                         );
@@ -330,13 +347,14 @@ impl FunctionMir {
                         stack.push(value);
                     }
                     Op::LocalSet(index) => {
-                        stack.pop();
+                        let value = stack.pop();
                         let version = local_versions.get_mut(*index as usize).ok_or_else(|| {
                             internal(format!("MIR local index {index} is out of range"))
                         })?;
                         *version = version
                             .checked_add(1)
                             .ok_or_else(|| internal("MIR local version overflow"))?;
+                        local_values[*index as usize] = value;
                     }
                     Op::GlobalSet(_) | Op::Drop => {
                         stack.pop();
@@ -352,11 +370,13 @@ impl FunctionMir {
                         *version = version
                             .checked_add(1)
                             .ok_or_else(|| internal("MIR local version overflow"))?;
+                        local_values[*index as usize] = Some(value);
                         let alias = self.push_value(
                             ty,
                             ValueDef::LocalGet {
                                 local: *index,
                                 version: *version,
+                                alias: Some(value),
                             },
                             instruction_index,
                         );
@@ -545,6 +565,10 @@ impl FunctionMir {
             };
             match value.def {
                 ValueDef::Unary(_, operand) => verify_operand(operand)?,
+                ValueDef::LocalGet {
+                    alias: Some(operand),
+                    ..
+                } => verify_operand(operand)?,
                 ValueDef::Load(op, operand, arg) => {
                     verify_operand(operand)?;
                     if arg.align > load_natural_alignment(op) {
@@ -559,7 +583,9 @@ impl FunctionMir {
                     verify_operand(left)?;
                     verify_operand(right)?;
                 }
-                ValueDef::I32Const(_) | ValueDef::LocalGet { .. } | ValueDef::Opaque => {}
+                ValueDef::I32Const(_)
+                | ValueDef::LocalGet { alias: None, .. }
+                | ValueDef::Opaque => {}
             }
             if value.source >= instruction_count {
                 return Err(internal(format!("MIR value {index} has an invalid source")));
@@ -803,7 +829,12 @@ fn propagate_constants(mir: &FunctionMir) -> Vec<Option<i32>> {
             ValueDef::Binary(op, left, right) => constants[left.0].and_then(|left| {
                 constants[right.0].and_then(|right| fold_i32_binary(op, left, right))
             }),
-            ValueDef::LocalGet { .. } | ValueDef::Load(_, _, _) | ValueDef::Opaque => None,
+            ValueDef::LocalGet {
+                alias: Some(value), ..
+            } => constants[value.0],
+            ValueDef::LocalGet { alias: None, .. } | ValueDef::Load(_, _, _) | ValueDef::Opaque => {
+                None
+            }
         };
     }
     constants
@@ -927,7 +958,7 @@ fn rotated_u8_halves(
 
 fn local_value(mir: &FunctionMir, value: ValueId) -> Option<(u32, u32)> {
     match mir.values[value.0].def {
-        ValueDef::LocalGet { local, version } => Some((local, version)),
+        ValueDef::LocalGet { local, version, .. } => Some((local, version)),
         _ => None,
     }
 }

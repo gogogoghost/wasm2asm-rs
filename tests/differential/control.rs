@@ -14,6 +14,6 @@ fn wasm_traps_are_preserved_by_asm_js() {
     assert_differential(DifferentialCase::same(
         "trap preservation",
         wat,
-        "[trapped(function(){m.unreachable()}),trapped(function(){m.divideByZero()}),trapped(function(){m.overflow()}),trapped(function(){m.outOfBounds()}),trapped(function(){m.invalidConversion()})]",
+        "[trapped(function(){m.unreachable()}),trapped(function(){m.divideByZero()}),trapped(function(){m.overflow()}),trapped(function(){m.outOfBounds()}),trapped(function(){m.discardedLoad()}),trapped(function(){m.invalidConversion()})]",
     ));
 }

@@ -401,10 +401,27 @@ impl<'a> ModuleCx<'a> {
     fn emit_module(&mut self) -> Result<String, CompileError> {
         let mut out = String::new();
         self.emit_core(&mut out)?;
+        let mut function_names = self.import_function_names.clone();
+        function_names.extend(core_function_names(&out));
+        let mut global_names = self
+            .global_names
+            .iter()
+            .chain(&self.return_slots)
+            .flat_map(Value::components)
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        global_names.extend(
+            [
+                "$ih", "$rl", "$rh", "$h8", "$u8", "$h16", "$u16", "$h32", "$u32", "$f32", "$f64",
+            ]
+            .into_iter()
+            .map(str::to_string),
+        );
         out = out.replace(";}", "}");
         self.emit_wrapper_prefix(&mut out)?;
         self.emit_wrapper_suffix(&mut out)?;
-        Ok(rename_module_functions(&out, &self.function_names))
+        let out = rename_module_functions(&out, &function_names);
+        Ok(rename_module_globals(&out, &global_names))
     }
 
     fn emit_wrapper_prefix(&self, out: &mut String) -> Result<(), CompileError> {
@@ -755,11 +772,14 @@ impl<'a> ModuleCx<'a> {
                 continue;
             }
             let compiler = FunctionCompiler::new(self, function_index, function)?;
+            let (code, helpers) = compiler.compile()?;
             compiled.push(CompiledFunction {
                 index: function_index,
-                code: compiler.compile()?,
+                code,
+                helpers,
             });
         }
+        deduplicate_outlined_helpers(&mut compiled);
         let static_memory_helpers = optimize_static_memory_accesses(&mut compiled);
         out.push_str(&static_memory_helpers);
         self.emit_compiled_functions(out, &compiled)?;
@@ -950,9 +970,13 @@ impl<'a> ModuleCx<'a> {
             let body = compiled_function_body(&function.code).ok_or_else(|| {
                 CompileError::new(ErrorKind::Internal, "wasm2asm: malformed compiled function")
             })?;
-            let literals = numeric_literals(body);
-            let type_index = self.module.function_type_indices[function.index];
-            let key = format!("{type_index}:{}", numeric_template_key(body, &literals));
+            let key = if function.helpers.is_empty() {
+                let literals = numeric_literals(body);
+                let type_index = self.module.function_type_indices[function.index];
+                format!("{type_index}:{}", numeric_template_key(body, &literals))
+            } else {
+                format!("outlined:{position}")
+            };
             groups.entry(key).or_default().push(position);
         }
 
@@ -1060,6 +1084,9 @@ impl<'a> ModuleCx<'a> {
             }
         }
         for (position, function) in compiled.iter().enumerate() {
+            for helper in &function.helpers {
+                out.push_str(helper);
+            }
             if let Some(&template_index) = by_position.get(&position) {
                 let template = &templates[template_index];
                 if template.members[0] == position {
@@ -1527,6 +1554,7 @@ struct Control {
 struct CompiledFunction {
     index: usize,
     code: String,
+    helpers: Vec<String>,
 }
 struct FunctionTemplate {
     members: Vec<usize>,
@@ -1562,6 +1590,7 @@ struct FunctionCompiler<'a, 'm> {
     f64_bits: BTreeMap<String, (String, String)>,
     plan: FunctionPlan,
     division_caches: BTreeMap<usize, DivisionCache>,
+    condition_inversions: BTreeMap<String, String>,
     body: String,
     temp_index: usize,
     label_index: usize,
@@ -1596,6 +1625,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             instruction_temps: Vec::new(),
             f64_bits: BTreeMap::new(),
             division_caches: BTreeMap::new(),
+            condition_inversions: BTreeMap::new(),
             plan,
             body: String::new(),
             temp_index: next_local,
@@ -1604,7 +1634,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         })
     }
 
-    fn compile(mut self) -> Result<String, CompileError> {
+    fn compile(mut self) -> Result<(String, Vec<String>), CompileError> {
         for (instruction_index, instruction) in self.function.body.iter().enumerate() {
             self.emit_instruction(instruction_index, instruction)?;
         }
@@ -1671,14 +1701,24 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             }
         }
         out.push('}');
+        let mut local_types = BTreeMap::new();
+        for component in &all_components {
+            local_types.insert(
+                component.clone(),
+                component_type(&self.locals, component).unwrap_or(ValType::I32),
+            );
+        }
+        local_types.extend(self.declarations.iter().cloned());
         let mut identifiers = live_local_components
             .into_iter()
             .map(|name| (*name).clone())
             .collect::<Vec<_>>();
         identifiers.extend(live_declarations.into_iter().map(|(name, _)| name.clone()));
+        let out = optimize_labeled_early_exits(&out, &self.condition_inversions);
+        let (out, helpers) =
+            outline_repeated_terminal_calls(&out, self.function_index, &local_types);
         let out = rename_function_locals(&out, &identifiers, &flat_params);
-        let out = rename_function_labels(&out);
-        Ok(optimize_labeled_early_exits(&out))
+        Ok((rename_function_labels(&out), helpers))
     }
 
     fn emit_instruction(
@@ -1822,8 +1862,23 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     self.stack.push(Value::F64(float64_literal(*bits)));
                 }
             }
-            Unary(op) => self.emit_unary(*op)?,
-            Binary(op) => self.emit_binary(instruction_index, *op)?,
+            Unary(op) => {
+                if let Some(value) = self.plan.i32_constant(instruction_index) {
+                    self.pop()?;
+                    self.stack.push(Value::I32(value.to_string()));
+                } else {
+                    self.emit_unary(*op)?;
+                }
+            }
+            Binary(op) => {
+                if let Some(value) = self.plan.i32_constant(instruction_index) {
+                    self.pop()?;
+                    self.pop()?;
+                    self.stack.push(Value::I32(value.to_string()));
+                } else {
+                    self.emit_binary(instruction_index, *op)?;
+                }
+            }
             Load(op, memarg) => self.emit_load(*op, *memarg)?,
             Store(op, memarg) => self.emit_store(*op, *memarg)?,
             MemorySize(memory) => {
@@ -2668,76 +2723,87 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         use BinaryOp::*;
         let right = self.pop()?;
         let left = self.pop()?;
-        let result = match op {
-            I32Eq => cmp_i32(left, right, "==", false)?,
-            I32Ne => cmp_i32(left, right, "!=", false)?,
-            I32LtS => cmp_i32(left, right, "<", false)?,
-            I32LtU => cmp_i32(left, right, "<", true)?,
-            I32GtS => cmp_i32(left, right, ">", false)?,
-            I32GtU => cmp_i32(left, right, ">", true)?,
-            I32LeS => cmp_i32(left, right, "<=", false)?,
-            I32LeU => cmp_i32(left, right, "<=", true)?,
-            I32GeS => cmp_i32(left, right, ">=", false)?,
-            I32GeU => cmp_i32(left, right, ">=", true)?,
-            F32Eq | F64Eq => cmp_float(left, right, "==")?,
-            F32Ne | F64Ne => cmp_float(left, right, "!=")?,
-            F32Lt | F64Lt => cmp_float(left, right, "<")?,
-            F32Gt | F64Gt => cmp_float(left, right, ">")?,
-            F32Le | F64Le => cmp_float(left, right, "<=")?,
-            F32Ge | F64Ge => cmp_float(left, right, ">=")?,
-            I32Add => i32_bin(left, right, "+")?,
-            I32Sub => i32_bin(left, right, "-")?,
-            I32Mul => {
-                let (a, b) = expect_i32_pair(left, right)?;
-                Value::I32(format!("U({a},{b})"))
+        let inverted_comparison = inverted_i32_comparison(op, &left, &right)?;
+        let result = if let Some(result) = simplify_i32_binary(op, &left, &right) {
+            result
+        } else {
+            match op {
+                I32Eq => cmp_i32(left, right, "==", false)?,
+                I32Ne => cmp_i32(left, right, "!=", false)?,
+                I32LtS => cmp_i32(left, right, "<", false)?,
+                I32LtU => cmp_i32(left, right, "<", true)?,
+                I32GtS => cmp_i32(left, right, ">", false)?,
+                I32GtU => cmp_i32(left, right, ">", true)?,
+                I32LeS => cmp_i32(left, right, "<=", false)?,
+                I32LeU => cmp_i32(left, right, "<=", true)?,
+                I32GeS => cmp_i32(left, right, ">=", false)?,
+                I32GeU => cmp_i32(left, right, ">=", true)?,
+                F32Eq | F64Eq => cmp_float(left, right, "==")?,
+                F32Ne | F64Ne => cmp_float(left, right, "!=")?,
+                F32Lt | F64Lt => cmp_float(left, right, "<")?,
+                F32Gt | F64Gt => cmp_float(left, right, ">")?,
+                F32Le | F64Le => cmp_float(left, right, "<=")?,
+                F32Ge | F64Ge => cmp_float(left, right, ">=")?,
+                I32Add => i32_bin(left, right, "+")?,
+                I32Sub => i32_bin(left, right, "-")?,
+                I32Mul => {
+                    let (a, b) = expect_i32_pair(left, right)?;
+                    Value::I32(format!("U({a},{b})"))
+                }
+                I32DivS | I32DivU | I32RemS | I32RemU => {
+                    self.i32_divrem(left, right, op, instruction_index)?
+                }
+                I32And => i32_bin(left, right, "&")?,
+                I32Or => i32_bin(left, right, "|")?,
+                I32Xor => i32_bin(left, right, "^")?,
+                I32Shl => i32_bin(left, right, "<<")?,
+                I32ShrS => i32_bin(left, right, ">>")?,
+                I32ShrU => {
+                    let (a, b) = expect_i32_pair(left, right)?;
+                    let a = compact_unsigned_i32_operand(&a);
+                    let b = compact_operand(&b);
+                    Value::I32(format!("({a}>>>{b})|0"))
+                }
+                I32Rotl => {
+                    let (a, b) = expect_i32_pair(left, right)?;
+                    let a = compact_operand(&a);
+                    let b = compact_operand(&b);
+                    Value::I32(format!("({a}<<{b})|({a}>>>(-{b}))"))
+                }
+                I32Rotr => {
+                    let (a, b) = expect_i32_pair(left, right)?;
+                    let a = compact_operand(&a);
+                    let b = compact_operand(&b);
+                    Value::I32(format!("({a}>>>{b})|({a}<<(-{b}))"))
+                }
+                I64Eq | I64Ne | I64LtS | I64LtU | I64GtS | I64GtU | I64LeS | I64LeU | I64GeS
+                | I64GeU => i64_compare(left, right, op)?,
+                I64Add | I64Sub | I64Mul | I64DivS | I64DivU | I64RemS | I64RemU | I64And
+                | I64Or | I64Xor | I64Shl | I64ShrS | I64ShrU | I64Rotl | I64Rotr => {
+                    self.i64_binary(left, right, op)?
+                }
+                F32Add => float_bin(left, right, "+", true)?,
+                F32Sub => float_bin(left, right, "-", true)?,
+                F32Mul => float_bin(left, right, "*", true)?,
+                F32Div => float_bin(left, right, "/", true)?,
+                F64Add => float_bin(left, right, "+", false)?,
+                F64Sub => float_bin(left, right, "-", false)?,
+                F64Mul => float_bin(left, right, "*", false)?,
+                F64Div => float_bin(left, right, "/", false)?,
+                F32Min => float_helper(left, right, "mn", true)?,
+                F32Max => float_helper(left, right, "mx", true)?,
+                F32Copysign => float_helper(left, right, "cs", true)?,
+                F64Min => float_helper(left, right, "mn", false)?,
+                F64Max => float_helper(left, right, "mx", false)?,
+                F64Copysign => float_helper(left, right, "cs", false)?,
             }
-            I32DivS | I32DivU | I32RemS | I32RemU => {
-                self.i32_divrem(left, right, op, instruction_index)?
-            }
-            I32And => i32_bin(left, right, "&")?,
-            I32Or => i32_bin(left, right, "|")?,
-            I32Xor => i32_bin(left, right, "^")?,
-            I32Shl => i32_bin(left, right, "<<")?,
-            I32ShrS => i32_bin(left, right, ">>")?,
-            I32ShrU => {
-                let (a, b) = expect_i32_pair(left, right)?;
-                let a = compact_unsigned_i32_operand(&a);
-                let b = compact_operand(&b);
-                Value::I32(format!("({a}>>>{b})|0"))
-            }
-            I32Rotl => {
-                let (a, b) = expect_i32_pair(left, right)?;
-                let a = compact_operand(&a);
-                let b = compact_operand(&b);
-                Value::I32(format!("({a}<<{b})|({a}>>>(-{b}))"))
-            }
-            I32Rotr => {
-                let (a, b) = expect_i32_pair(left, right)?;
-                let a = compact_operand(&a);
-                let b = compact_operand(&b);
-                Value::I32(format!("({a}>>>{b})|({a}<<(-{b}))"))
-            }
-            I64Eq | I64Ne | I64LtS | I64LtU | I64GtS | I64GtU | I64LeS | I64LeU | I64GeS
-            | I64GeU => i64_compare(left, right, op)?,
-            I64Add | I64Sub | I64Mul | I64DivS | I64DivU | I64RemS | I64RemU | I64And | I64Or
-            | I64Xor | I64Shl | I64ShrS | I64ShrU | I64Rotl | I64Rotr => {
-                self.i64_binary(left, right, op)?
-            }
-            F32Add => float_bin(left, right, "+", true)?,
-            F32Sub => float_bin(left, right, "-", true)?,
-            F32Mul => float_bin(left, right, "*", true)?,
-            F32Div => float_bin(left, right, "/", true)?,
-            F64Add => float_bin(left, right, "+", false)?,
-            F64Sub => float_bin(left, right, "-", false)?,
-            F64Mul => float_bin(left, right, "*", false)?,
-            F64Div => float_bin(left, right, "/", false)?,
-            F32Min => float_helper(left, right, "mn", true)?,
-            F32Max => float_helper(left, right, "mx", true)?,
-            F32Copysign => float_helper(left, right, "cs", true)?,
-            F64Min => float_helper(left, right, "mn", false)?,
-            F64Max => float_helper(left, right, "mx", false)?,
-            F64Copysign => float_helper(left, right, "cs", false)?,
         };
+        if let Some((comparison, inverted)) = inverted_comparison
+            && result.i32_expr().ok() == Some(comparison.as_str())
+        {
+            self.condition_inversions
+                .insert(compact_condition(&comparison), compact_condition(&inverted));
+        }
         self.stack.push(result);
         Ok(())
     }
@@ -2887,6 +2953,55 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     ) -> Result<Value, CompileError> {
         let (al, ah) = expect_i64(left)?;
         let (bl, bh) = expect_i64(right)?;
+        let al_literal = i32_literal(&al);
+        let ah_literal = i32_literal(&ah);
+        let bl_literal = i32_literal(&bl);
+        let bh_literal = i32_literal(&bh);
+        let a_zero = al_literal == Some(0) && ah_literal == Some(0);
+        let b_zero = bl_literal == Some(0) && bh_literal == Some(0);
+        let a_one = al_literal == Some(1) && ah_literal == Some(0);
+        let b_one = bl_literal == Some(1) && bh_literal == Some(0);
+        let a_ones = al_literal == Some(-1) && ah_literal == Some(-1);
+        let b_ones = bl_literal == Some(-1) && bh_literal == Some(-1);
+        let a_discardable = reusable_i32_expression(&al) && reusable_i32_expression(&ah);
+        let b_discardable = reusable_i32_expression(&bl) && reusable_i32_expression(&bh);
+        match op {
+            BinaryOp::I64Add | BinaryOp::I64Or | BinaryOp::I64Xor if a_zero => {
+                return Ok(Value::I64(bl, bh));
+            }
+            BinaryOp::I64Add | BinaryOp::I64Sub | BinaryOp::I64Or | BinaryOp::I64Xor if b_zero => {
+                return Ok(Value::I64(al, ah));
+            }
+            BinaryOp::I64Mul if a_one => return Ok(Value::I64(bl, bh)),
+            BinaryOp::I64Mul if b_one => return Ok(Value::I64(al, ah)),
+            BinaryOp::I64And if a_ones => return Ok(Value::I64(bl, bh)),
+            BinaryOp::I64And if b_ones => return Ok(Value::I64(al, ah)),
+            BinaryOp::I64Mul | BinaryOp::I64And if a_zero && b_discardable => {
+                return Ok(Value::I64("0".into(), "0".into()));
+            }
+            BinaryOp::I64Mul | BinaryOp::I64And if b_zero && a_discardable => {
+                return Ok(Value::I64("0".into(), "0".into()));
+            }
+            BinaryOp::I64Or if a_ones && b_discardable => {
+                return Ok(Value::I64("-1".into(), "-1".into()));
+            }
+            BinaryOp::I64Or if b_ones && a_discardable => {
+                return Ok(Value::I64("-1".into(), "-1".into()));
+            }
+            BinaryOp::I64RemS | BinaryOp::I64RemU if (b_one || b_ones) && a_discardable => {
+                return Ok(Value::I64("0".into(), "0".into()));
+            }
+            BinaryOp::I64Shl
+            | BinaryOp::I64ShrS
+            | BinaryOp::I64ShrU
+            | BinaryOp::I64Rotl
+            | BinaryOp::I64Rotr
+                if bl_literal.is_some_and(|value| value & 63 == 0) && b_discardable =>
+            {
+                return Ok(Value::I64(al, ah));
+            }
+            _ => {}
+        }
         let al_low_zero = is_i32_zero(&al);
         let bl_low_zero = is_i32_zero(&bl);
         let add_carry = if reusable_i32_expression(&al) || !reusable_i32_expression(&bl) {
@@ -3937,6 +4052,27 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     }
 }
 
+fn core_function_names(source: &str) -> Vec<String> {
+    let bytes = source.as_bytes();
+    let mut names = Vec::new();
+    let mut search = 0usize;
+    while let Some(relative) = source[search..].find("function ") {
+        let start = search + relative + 9;
+        let mut end = start;
+        while bytes
+            .get(end)
+            .is_some_and(|byte| is_js_identifier_byte(*byte))
+        {
+            end += 1;
+        }
+        if end != start && &source[start..end] != "asmModule" {
+            names.push(source[start..end].to_string());
+        }
+        search = end.max(start + 1);
+    }
+    names
+}
+
 fn rename_module_functions(source: &str, function_names: &[String]) -> String {
     let mut counts = function_names
         .iter()
@@ -3963,6 +4099,48 @@ fn rename_module_functions(source: &str, function_names: &[String]) -> String {
         .map(|(rank, (_, name))| (name.as_str(), function_ident(rank)))
         .collect::<BTreeMap<_, _>>();
 
+    replace_javascript_identifiers(source, &replacements)
+}
+fn rename_module_globals(source: &str, global_names: &[String]) -> String {
+    let mut counts = global_names
+        .iter()
+        .map(|name| (name.as_str(), 0usize))
+        .collect::<BTreeMap<_, _>>();
+    let mut used = BTreeSet::new();
+    visit_javascript_identifiers(source, |start, end| {
+        let name = &source[start..end];
+        used.insert(name);
+        if let Some(count) = counts.get_mut(name) {
+            *count += 1;
+        }
+    });
+    let mut ranked = global_names
+        .iter()
+        .enumerate()
+        .filter(|(_, name)| counts[name.as_str()] != 0)
+        .collect::<Vec<_>>();
+    ranked.sort_by(|(left_index, left), (right_index, right)| {
+        counts[right.as_str()]
+            .cmp(&counts[left.as_str()])
+            .then_with(|| left_index.cmp(right_index))
+    });
+    let mut assigned = BTreeSet::new();
+    let mut replacements = BTreeMap::new();
+    let mut candidate = 0usize;
+    for (_, name) in ranked {
+        let replacement = loop {
+            let replacement = format!("${}", short_index(candidate));
+            candidate += 1;
+            if !used.contains(replacement.as_str()) && assigned.insert(replacement.clone()) {
+                break replacement;
+            }
+        };
+        replacements.insert(name.as_str(), replacement);
+    }
+    replace_javascript_identifiers(source, &replacements)
+}
+
+fn replace_javascript_identifiers(source: &str, replacements: &BTreeMap<&str, String>) -> String {
     let mut output = String::with_capacity(source.len());
     let mut copied = 0usize;
     visit_javascript_identifiers(source, |start, end| {
@@ -4065,14 +4243,19 @@ fn eliminate_write_only_i64_high_multiply(source: &str) -> String {
     output
 }
 
-fn optimize_labeled_early_exits(source: &str) -> String {
+fn optimize_labeled_early_exits(
+    source: &str,
+    condition_inversions: &BTreeMap<String, String>,
+) -> String {
     let mut output = String::with_capacity(source.len());
     let mut copied = 0usize;
     while let Some((label_start, label_end, open, close)) = find_labeled_block(source, copied) {
         output.push_str(&source[copied..label_start]);
         let label = &source[label_start..label_end];
-        let mut body = optimize_labeled_early_exits(&source[open + 1..close]);
-        while let Some((start, replacement)) = best_early_exit_rewrite(&body, label) {
+        let mut body = optimize_labeled_early_exits(&source[open + 1..close], condition_inversions);
+        while let Some((start, replacement)) =
+            best_early_exit_rewrite(&body, label, condition_inversions)
+        {
             body.truncate(start);
             body.push_str(&replacement);
         }
@@ -4090,6 +4273,119 @@ fn optimize_labeled_early_exits(source: &str) -> String {
     }
     output.push_str(&source[copied..]);
     output
+}
+fn outline_repeated_terminal_calls(
+    source: &str,
+    function_index: usize,
+    local_types: &BTreeMap<String, ValType>,
+) -> (String, Vec<String>) {
+    let mut grouped: BTreeMap<String, Vec<(usize, usize)>> = BTreeMap::new();
+    let mut search = 0usize;
+    while let Some(relative) = source[search..].find("break ") {
+        let break_start = search + relative;
+        search = break_start + 6;
+        if !is_labeled_break_at(source, break_start) {
+            continue;
+        }
+        let Some((start, end)) = preceding_call_tail(source, break_start, 3) else {
+            continue;
+        };
+        grouped
+            .entry(source[start..end].into())
+            .or_default()
+            .push((start, end));
+    }
+
+    let mut groups = grouped.into_iter().collect::<Vec<_>>();
+    groups.sort_by_key(|(_, occurrences)| occurrences[0].0);
+    let mut replacements = Vec::new();
+    let mut helpers = Vec::new();
+    for (sequence, occurrences) in groups {
+        if occurrences.len() < 4 {
+            continue;
+        }
+        let mut params = Vec::new();
+        visit_generated_identifiers(&sequence, |start, end| {
+            let name = &sequence[start..end];
+            if local_types.contains_key(name) && !params.iter().any(|param| param == name) {
+                params.push(name.to_string());
+            }
+        });
+        if params.len() > 4 {
+            continue;
+        }
+        let helper_name = format!("$o{function_index}_{}", helpers.len());
+        let mut helper = format!("function {helper_name}({}){{", params.join(","));
+        for param in &params {
+            write!(helper, "{param}={};", coerce(local_types[param], param)).unwrap();
+        }
+        helper.push_str(&sequence);
+        helper.push('}');
+        let call = format!("{helper_name}({});", params.join(","));
+        if helper.len() + call.len() * occurrences.len() >= sequence.len() * occurrences.len() {
+            continue;
+        }
+        replacements.extend(
+            occurrences
+                .into_iter()
+                .map(|(start, end)| (start, end, call.clone())),
+        );
+        helpers.push(helper);
+    }
+    if replacements.is_empty() {
+        return (source.into(), helpers);
+    }
+    replacements.sort_by_key(|(start, _, _)| *start);
+    let mut output = String::with_capacity(source.len());
+    let mut copied = 0usize;
+    for (start, end, replacement) in replacements {
+        output.push_str(&source[copied..start]);
+        output.push_str(&replacement);
+        copied = end;
+    }
+    output.push_str(&source[copied..]);
+    (output, helpers)
+}
+
+fn is_labeled_break_at(source: &str, start: usize) -> bool {
+    let bytes = source.as_bytes();
+    let mut end = start + 6;
+    if !bytes
+        .get(end)
+        .is_some_and(|byte| byte.is_ascii_alphabetic() || matches!(byte, b'_' | b'$'))
+    {
+        return false;
+    }
+    end += 1;
+    while bytes
+        .get(end)
+        .is_some_and(|byte| is_js_identifier_byte(*byte))
+    {
+        end += 1;
+    }
+    bytes
+        .get(end)
+        .is_some_and(|byte| matches!(byte, b';' | b'}'))
+}
+
+fn preceding_call_tail(source: &str, end: usize, count: usize) -> Option<(usize, usize)> {
+    let mut start = end;
+    for _ in 0..count {
+        start = preceding_call_statement(source, start)?;
+    }
+    Some((start, end))
+}
+
+fn preceding_call_statement(source: &str, end: usize) -> Option<usize> {
+    let bytes = source.as_bytes();
+    if end == 0 || bytes[end - 1] != b';' {
+        return None;
+    }
+    let statement_end = end - 1;
+    let start = source[..statement_end]
+        .rfind([';', '{', '}'])
+        .map_or(0, |boundary| boundary + 1);
+    is_js_call(&source[start..statement_end]).then_some(start)
 }
 
 fn find_labeled_block(source: &str, from: usize) -> Option<(usize, usize, usize, usize)> {
@@ -4229,7 +4525,11 @@ fn top_level_conditional_block_breaks(
     found
 }
 
-fn best_early_exit_rewrite(source: &str, label: &str) -> Option<(usize, String)> {
+fn best_early_exit_rewrite(
+    source: &str,
+    label: &str,
+    condition_inversions: &BTreeMap<String, String>,
+) -> Option<(usize, String)> {
     let mut best = None;
     for (start, condition_end, end) in top_level_conditional_breaks(source, label) {
         let suffix = &source[end..];
@@ -4237,7 +4537,10 @@ fn best_early_exit_rewrite(source: &str, label: &str) -> Option<(usize, String)>
             continue;
         }
         let condition = &source[start + 3..condition_end];
-        let replacement = format!("if({}){{{suffix}}}", negate_condition(condition));
+        let replacement = format!(
+            "if({}){{{suffix}}}",
+            negate_condition(condition, condition_inversions)
+        );
         if replacement.len() < source.len() - start {
             best = Some((start, replacement));
         }
@@ -4252,7 +4555,10 @@ fn best_early_exit_rewrite(source: &str, label: &str) -> Option<(usize, String)>
         let replacement = if suffix.is_empty() {
             format!("if({condition}){{{prefix}}}")
         } else if prefix.is_empty() {
-            format!("if({}){{{suffix}}}", negate_condition(condition))
+            format!(
+                "if({}){{{suffix}}}",
+                negate_condition(condition, condition_inversions)
+            )
         } else {
             format!("if({condition}){{{prefix}}}else{{{suffix}}}")
         };
@@ -4267,7 +4573,13 @@ fn best_early_exit_rewrite(source: &str, label: &str) -> Option<(usize, String)>
     best
 }
 
-fn negate_condition(condition: &str) -> String {
+fn negate_condition(condition: &str, condition_inversions: &BTreeMap<String, String>) -> String {
+    if let Some(inverted) = condition_inversions.get(condition) {
+        return inverted.clone();
+    }
+    if let Some(inverted) = invert_integer_comparison(condition) {
+        return inverted;
+    }
     if let Some(value) = condition.strip_prefix('!')
         && (is_js_atom(value) || is_fully_parenthesized(value))
     {
@@ -4277,6 +4589,55 @@ fn negate_condition(condition: &str) -> String {
         return format!("!{condition}");
     }
     format!("!({condition})")
+}
+
+fn invert_integer_comparison(condition: &str) -> Option<String> {
+    let condition = strip_redundant_atom_parentheses(condition.trim());
+    let bytes = condition.as_bytes();
+    let mut depth = 0usize;
+    let mut index = 0usize;
+    while index < bytes.len() {
+        match bytes[index] {
+            b'(' => depth += 1,
+            b')' => depth = depth.saturating_sub(1),
+            b'>' if depth == 0 && condition[index..].starts_with(">>>") => {
+                index += 3;
+                continue;
+            }
+            _ if depth == 0 => {
+                for (operator, inverted) in [
+                    ("==", "!="),
+                    ("!=", "=="),
+                    ("<=", ">"),
+                    (">=", "<"),
+                    ("<", ">="),
+                    (">", "<="),
+                ] {
+                    if condition[index..].starts_with(operator) {
+                        let left = &condition[..index];
+                        let right = &condition[index + operator.len()..];
+                        if integer_condition_operand(left) && integer_condition_operand(right) {
+                            return Some(format!("{left}{inverted}{right}"));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+        index += 1;
+    }
+    None
+}
+
+fn integer_condition_operand(value: &str) -> bool {
+    let value = strip_redundant_atom_parentheses(value.trim());
+    value.contains(">>>0")
+        || value.contains("|0")
+        || value.contains('&')
+        || value.contains('^')
+        || value.contains("<<")
+        || value.contains(">>")
+        || i32_literal(value).is_some()
 }
 
 fn label_is_referenced(source: &str, label: &str) -> bool {
@@ -4548,6 +4909,50 @@ fn static_store_key(arguments: &[&str]) -> Option<(i32, u8)> {
     Some(key)
 }
 
+fn outlined_helper_name(helper: &str) -> Option<&str> {
+    let end = helper.find('(')?;
+    helper.get(9..end)
+}
+
+fn deduplicate_outlined_helpers(compiled: &mut [CompiledFunction]) {
+    let mut canonical = BTreeMap::<String, String>::new();
+    for function in compiled {
+        let mut retained = Vec::new();
+        for helper in function.helpers.drain(..) {
+            let Some(name) = outlined_helper_name(&helper) else {
+                retained.push(helper);
+                continue;
+            };
+            let name_end = 9 + name.len();
+            let key = helper[name_end..].to_string();
+            if let Some(existing) = canonical.get(&key) {
+                function.code = replace_generated_identifier(&function.code, name, existing);
+            } else {
+                canonical.insert(key, name.to_string());
+                retained.push(helper);
+            }
+        }
+        function.helpers = retained;
+    }
+}
+
+fn replace_generated_identifier(source: &str, name: &str, replacement: &str) -> String {
+    let mut output = String::with_capacity(source.len());
+    let mut copied = 0usize;
+    visit_generated_identifiers(source, |start, end| {
+        if &source[start..end] == name {
+            output.push_str(&source[copied..start]);
+            output.push_str(replacement);
+            copied = end;
+        }
+    });
+    if copied == 0 {
+        return source.into();
+    }
+    output.push_str(&source[copied..]);
+    output
+}
+
 fn optimize_static_memory_accesses(compiled: &mut [CompiledFunction]) -> String {
     let mut load_counts = BTreeMap::<(i32, u8), usize>::new();
     let mut store_counts = BTreeMap::<(i32, u8), usize>::new();
@@ -4772,12 +5177,17 @@ fn numeric_literals(body: &str) -> Vec<NumericLiteral> {
 fn literal_text<'a>(body: &'a str, literal: &NumericLiteral) -> &'a str {
     &body[literal.start..literal.end]
 }
+fn numeric_literal_is_parameterizable(body: &str, literal: &NumericLiteral) -> bool {
+    !literal.case_label
+        && !literal.must_literal
+        && literal_text(body, literal).parse::<i32>().is_ok()
+}
 fn numeric_template_key(body: &str, literals: &[NumericLiteral]) -> String {
     let mut key = String::with_capacity(body.len());
     let mut previous = 0;
     for literal in literals {
         key.push_str(&body[previous..literal.start]);
-        if literal.case_label || literal.must_literal {
+        if !numeric_literal_is_parameterizable(body, literal) {
             key.push_str(literal_text(body, literal));
         } else {
             key.push('#');
@@ -4797,7 +5207,7 @@ fn render_numeric_template_body(
     for (index, literal) in literals.iter().enumerate() {
         rendered.push_str(&body[previous..literal.start]);
         if let Some(parameter) = differing.iter().position(|&candidate| candidate == index) {
-            write!(rendered, "c{parameter}").unwrap();
+            write!(rendered, "(c{parameter}|0)").unwrap();
         } else {
             rendered.push_str(literal_text(body, literal));
         }
@@ -5380,6 +5790,7 @@ fn reusable_i32_expression(value: &str) -> bool {
         || value.parse::<i32>().is_ok()
         || value.strip_suffix("|0").is_some_and(is_js_identifier)
 }
+
 fn nonzero_guard_dominates(body: &str, value: &str) -> bool {
     let value = strip_redundant_atom_parentheses(value.trim());
     let name = value.strip_suffix("|0").unwrap_or(value);
@@ -5690,6 +6101,51 @@ fn compact_unsigned_i32_operand(value: &str) -> String {
     }
     compact_operand(value)
 }
+
+fn simplify_i32_binary(op: BinaryOp, left: &Value, right: &Value) -> Option<Value> {
+    use BinaryOp::*;
+    let (Value::I32(left), Value::I32(right)) = (left, right) else {
+        return None;
+    };
+    let left_literal = i32_literal(left);
+    let right_literal = i32_literal(right);
+    let unchanged = |value: &str| Some(Value::I32(value.to_string()));
+    let constant = |value: i32| Some(Value::I32(value.to_string()));
+    let left_discardable = reusable_i32_expression(left);
+    let right_discardable = reusable_i32_expression(right);
+    match op {
+        I32Add if left_literal == Some(0) => unchanged(right),
+        I32Add | I32Sub if right_literal == Some(0) => unchanged(left),
+        I32Sub | I32Xor if left == right && left_discardable => constant(0),
+        I32Mul if left_literal == Some(0) && right_discardable => constant(0),
+        I32Mul if right_literal == Some(0) && left_discardable => constant(0),
+        I32Mul if left_literal == Some(1) => unchanged(right),
+        I32Mul if right_literal == Some(1) => unchanged(left),
+        I32RemS | I32RemU if matches!(right_literal, Some(1 | -1)) && left_discardable => {
+            constant(0)
+        }
+        I32And if left_literal == Some(0) && right_discardable => constant(0),
+        I32And if right_literal == Some(0) && left_discardable => constant(0),
+        I32And if left_literal == Some(-1) => unchanged(right),
+        I32And if right_literal == Some(-1) => unchanged(left),
+        I32Or if left_literal == Some(0) => unchanged(right),
+        I32Or | I32Xor if right_literal == Some(0) => unchanged(left),
+        I32Or if left_literal == Some(-1) && right_discardable => constant(-1),
+        I32Or if right_literal == Some(-1) && left_discardable => constant(-1),
+        I32Shl | I32ShrS | I32ShrU | I32Rotl | I32Rotr
+            if right_literal.is_some_and(|value| value & 31 == 0) =>
+        {
+            unchanged(left)
+        }
+        I32Eq | I32LeS | I32LeU | I32GeS | I32GeU if left == right && left_discardable => {
+            constant(1)
+        }
+        I32Ne | I32LtS | I32LtU | I32GtS | I32GtU if left == right && left_discardable => {
+            constant(0)
+        }
+        _ => None,
+    }
+}
 fn compact_float_argument(value: &str) -> String {
     let value = strip_redundant_atom_parentheses(value.trim());
     if value.starts_with('+') {
@@ -5753,6 +6209,33 @@ fn nested_i32_coercion_is_redundant(value: &str, bitwise: bool) -> bool {
     }
     false
 }
+
+fn inverted_i32_comparison(
+    op: BinaryOp,
+    left: &Value,
+    right: &Value,
+) -> Result<Option<(String, String)>, CompileError> {
+    use BinaryOp::*;
+    let (operator, inverted, unsigned) = match op {
+        I32Eq => ("==", "!=", false),
+        I32Ne => ("!=", "==", false),
+        I32LtS => ("<", ">=", false),
+        I32LtU => ("<", ">=", true),
+        I32GtS => (">", "<=", false),
+        I32GtU => (">", "<=", true),
+        I32LeS => ("<=", ">", false),
+        I32LeU => ("<=", ">", true),
+        I32GeS => (">=", "<", false),
+        I32GeU => (">=", "<", true),
+        _ => return Ok(None),
+    };
+    let comparison = cmp_i32(left.clone(), right.clone(), operator, unsigned)?;
+    let inverted = cmp_i32(left.clone(), right.clone(), inverted, unsigned)?;
+    Ok(Some((
+        comparison.i32_expr()?.to_string(),
+        inverted.i32_expr()?.to_string(),
+    )))
+}
 fn cmp_i32(a: Value, b: Value, op: &str, unsigned: bool) -> Result<Value, CompileError> {
     let (a, b) = expect_i32_pair(a, b)?;
     Ok(Value::I32(format!(
@@ -5801,6 +6284,23 @@ fn i64_compare(a: Value, b: Value, op: BinaryOp) -> Result<Value, CompileError> 
     let (bl, bh) = expect_i64(b)?;
     let al_literal = i32_literal(&al);
     let ah_literal = i32_literal(&ah);
+    if al == bl && ah == bh && reusable_i32_expression(&al) && reusable_i32_expression(&ah) {
+        return Ok(Value::I32(
+            if matches!(
+                op,
+                BinaryOp::I64Eq
+                    | BinaryOp::I64LeS
+                    | BinaryOp::I64LeU
+                    | BinaryOp::I64GeS
+                    | BinaryOp::I64GeU
+            ) {
+                "1"
+            } else {
+                "0"
+            }
+            .into(),
+        ));
+    }
     let bl_literal = i32_literal(&bl);
     let bh_literal = i32_literal(&bh);
     let a_zero = al_literal == Some(0) && ah_literal == Some(0);

@@ -54,6 +54,18 @@ fn repeated_signed_division_preserves_exact_i32_results() {
 }
 
 #[test]
+fn templated_comparison_constants_remain_strict_i32_values() {
+    let wat = include_str!("fixtures/smoke/template_comparison_constants_run.wat");
+    assert_eq!(
+        run(
+            wat,
+            "(()=>{let m=instantiate({});return [m.match5(5)+1===m.match9(5),m.match9(9)+1===m.match5(9),m.match13(13)+1===m.match17(13),m.match17(17)+1===m.match13(17)]})()"
+        ),
+        "true,true,true,true"
+    );
+}
+
+#[test]
 fn nested_float_additions_generate_valid_javascript() {
     let wat = include_str!("fixtures/smoke/nested_float_additions_generate_valid_javascript.wat");
     assert_eq!(run(wat, "instantiate({}).sum()"), "10");

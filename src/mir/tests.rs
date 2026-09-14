@@ -84,6 +84,35 @@ fn constant_propagation_plans_conditional_branches() {
     let plan = optimize_function(&module, 0, &module.functions[0]).unwrap();
     assert_eq!(plan.branch(1), Some(BranchDecision::Never));
     assert_eq!(plan.branch(5), Some(BranchDecision::Always));
+    assert_eq!(plan.i32_constant(4), Some(42));
+}
+
+#[test]
+fn constant_propagation_tracks_straight_line_local_assignments() {
+    let function = Function {
+        type_index: 0,
+        locals: vec![ValType::I32],
+        body: vec![
+            instruction(0, Op::I32Const(20)),
+            instruction(1, Op::LocalSet(0)),
+            instruction(2, Op::LocalGet(0)),
+            instruction(3, Op::I32Const(22)),
+            instruction(4, Op::Binary(BinaryOp::I32Add)),
+            instruction(5, Op::Drop),
+            instruction(6, Op::End),
+        ],
+        name: None,
+    };
+    let module = module_with(
+        function,
+        FuncType {
+            params: vec![],
+            results: vec![],
+        },
+    );
+    let plan = optimize_function(&module, 0, &module.functions[0]).unwrap();
+    assert_eq!(plan.i32_constant(2), Some(20));
+    assert_eq!(plan.i32_constant(4), Some(42));
 }
 
 #[test]
