@@ -204,6 +204,8 @@ The supported profile includes:
 - optional fixed-width SIMD scalarization
 - optional typed function-reference lowering
 
+> **Performance note:** Successful lowering does not guarantee native asm.js efficiency. WebAssembly features without direct asm.js equivalents require emulation and may add substantial runtime overhead. Performance-sensitive inputs should stay as close as possible to the subset that maps directly to asm.js.
+
 Features without a valid strict asm.js representation are rejected with a diagnostic instead of producing invalid JavaScript. These include:
 
 - threads, atomics, and shared memory
