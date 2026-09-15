@@ -20,13 +20,16 @@ fn scalar_add_runs() {
 #[test]
 fn repeated_offset_loads_preserve_aligned_and_unaligned_accesses() {
     let wat = include_str!("fixtures/smoke/repeated_offset_loads_run.wat");
-    assert_eq!(
-        run(
-            wat,
-            "(()=>{let m=instantiate({});return [m.sum(3),m.sum(4)]})()"
-        ),
-        "-2140118960,-1870630816"
-    );
+    let invocation =
+        "(()=>{let m=instantiate({});return [m.sum(3),m.sum(4),m.byte_round_trip(5,254)]})()";
+    let expected = "-2140118960,-1870630816,254";
+    assert_eq!(run(wat, invocation), expected);
+
+    let fast = CompileOptions {
+        preserve_traps: false,
+        ..CompileOptions::default()
+    };
+    assert_eq!(run_with_options(wat, invocation, &fast), expected);
 }
 
 #[test]
@@ -44,13 +47,14 @@ fn mir_switch_and_constant_branch_optimizations_preserve_behavior() {
 #[test]
 fn repeated_signed_division_preserves_exact_i32_results() {
     let wat = include_str!("fixtures/smoke/repeated_signed_division_run.wat");
-    assert_eq!(
-        run(
-            wat,
-            "(()=>{let m=instantiate({});let cases=[[2147483647,10500],[-2147483648,10500],[2147483647,-10500],[-2147483647,-10500],[123456789,10000],[-123456789,10000],[123456789,300],[-123456789,300],[17,3],[-17,3],[17,-3],[-17,-3],[2147483647,-2147483648],[-2147483648,-2147483648],[0,1]];for(let c of cases){let actual=m.div_repeat(c[0],c[1],3),expected=(c[0]/c[1])|0;if(actual!==expected)throw Error(c+\":\"+actual+\"!=\"+expected)}return \"ok\"})()"
-        ),
-        "ok"
-    );
+    let invocation = "(()=>{let m=instantiate({});let cases=[[2147483647,10500],[-2147483648,10500],[2147483647,-10500],[-2147483647,-10500],[123456789,10000],[-123456789,10000],[123456789,300],[-123456789,300],[17,3],[-17,3],[17,-3],[-17,-3],[2147483647,-2147483648],[-2147483648,-2147483648],[0,1]];for(let c of cases){let actual=m.div_repeat(c[0],c[1],3),expected=(c[0]/c[1])|0;if(actual!==expected)throw Error(c+\":\"+actual+\"!=\"+expected)}return \"ok\"})()";
+    assert_eq!(run(wat, invocation), "ok");
+
+    let fast = CompileOptions {
+        preserve_traps: false,
+        ..CompileOptions::default()
+    };
+    assert_eq!(run_with_options(wat, invocation, &fast), "ok");
 }
 
 #[test]

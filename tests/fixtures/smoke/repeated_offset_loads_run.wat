@@ -48,4 +48,12 @@
     i32.add
     local.get $address
     i32.load offset=1
-    i32.add))
+    i32.add)
+
+  (func (export "byte_round_trip") (param $address i32) (param $value i32) (result i32)
+    local.get $address
+    local.get $value
+    i32.store8 offset=2
+    local.get $address
+    i32.load8_u offset=2)
+)

@@ -611,8 +611,13 @@ impl<'a> ModuleCx<'a> {
             global_names.push(named_value(ty.ty, &format!("$g{}", short_index(index))));
         }
         let (live_functions, indirect_types) = reachable_functions(module);
-        let (load_offset_helpers, store_offset_helpers) =
-            memory_offset_helpers(module, &live_functions);
+        // Fast output avoids per-offset wrappers so byte accesses can inline and the
+        // remaining memory operations share a small, stable helper set.
+        let (load_offset_helpers, store_offset_helpers) = if options.preserve_traps {
+            memory_offset_helpers(module, &live_functions)
+        } else {
+            (BTreeMap::new(), BTreeMap::new())
+        };
         let direct_memory_size = direct_memory_size(module, &live_functions);
         let inline_i64_helpers = uses_inline_i64_helpers(module, &live_functions);
         let i32_result_maxima = infer_i32_result_maxima(module);
@@ -1903,7 +1908,6 @@ struct FunctionCompiler<'a, 'm> {
     declarations: Vec<(String, ValType)>,
     f64_bits: BTreeMap<String, (String, String)>,
     i32_unsigned_max: BTreeMap<String, u32>,
-    i64_unsigned_max: BTreeMap<(String, String), u64>,
     plan: FunctionPlan,
     division_caches: BTreeMap<usize, DivisionCache>,
     condition_inversions: BTreeMap<String, String>,
@@ -1941,7 +1945,6 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             instruction_temps: Vec::new(),
             f64_bits: BTreeMap::new(),
             i32_unsigned_max: BTreeMap::new(),
-            i64_unsigned_max: BTreeMap::new(),
             division_caches: BTreeMap::new(),
             condition_inversions: BTreeMap::new(),
             plan,
@@ -2059,7 +2062,6 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             Loop(_) | Else | End | Br(_) | BrIf(_) | BrTable { .. }
         ) {
             self.i32_unsigned_max.clear();
-            self.i64_unsigned_max.clear();
         }
         match &instruction.op {
             Unreachable => {
@@ -2134,11 +2136,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             Select(_) => self.emit_select()?,
             LocalGet(index) => {
                 let value = self.local(*index)?.clone();
-                self.set_integer_facts(
-                    &value,
-                    self.plan.i32_unsigned_max(instruction_index),
-                    self.plan.i64_unsigned_max(instruction_index),
-                );
+                self.set_i32_fact(&value, self.plan.i32_unsigned_max(instruction_index));
                 self.stack.push(value);
             }
             LocalSet(index) => {
@@ -2629,16 +2627,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
 
     fn emit_call(&mut self, index: u32, tail: bool) -> Result<(), CompileError> {
         let ty = self.module.function_type(index as usize)?.clone();
-        let mut args = self.pop_types(&ty.params)?;
-        for argument in &mut args {
-            if self
-                .i64_unsigned_max(argument)
-                .is_some_and(|maximum| maximum <= u64::from(u32::MAX))
-                && let Value::I64(_, high) = argument
-            {
-                *high = "0".into();
-            }
-        }
+        let args = self.pop_types(&ty.params)?;
         if tail
             && self.module.module.features.tail_call
             && index >= self.module.module.imported_function_count
@@ -2858,8 +2847,6 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     fn emit_unary(&mut self, instruction_index: usize, op: UnaryOp) -> Result<(), CompileError> {
         use UnaryOp::*;
         let value = self.pop()?;
-        let i32_maximum = self.i32_unsigned_max(&value);
-        let i64_maximum = self.i64_unsigned_max(&value);
         let result = match op {
             I32Eqz => Value::I32(format!(
                 "{}==0|0",
@@ -2870,11 +2857,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             I32Popcnt => Value::I32(format!("pc({})|0", compact_i32(value.i32_expr()?))),
             I64Eqz => {
                 let (lo, hi) = expect_i64(value)?;
-                if i64_maximum.is_some_and(|maximum| maximum <= u64::from(u32::MAX)) {
-                    Value::I32(format!("{}==0|0", compact_compare_operand(&lo, false)))
-                } else {
-                    Value::I32(format!("({}|{})==0|0", compact_i32(&lo), compact_i32(&hi)))
-                }
+                Value::I32(format!("({}|{})==0|0", compact_i32(&lo), compact_i32(&hi)))
             }
             I64Clz => {
                 let (lo, hi) = expect_i64(value)?;
@@ -3074,27 +3057,13 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let result_i32_maximum = match op {
             I32Eqz | I64Eqz => Some(1),
             I32Clz | I32Ctz | I32Popcnt => Some(32),
-            I32WrapI64 => i64_maximum.map(|maximum| maximum.min(u64::from(u32::MAX)) as u32),
-            _ => None,
-        };
-        let result_i64_maximum = match op {
-            I64Clz | I64Ctz | I64Popcnt => Some(64),
-            I64ExtendI32U => Some(u64::from(i32_maximum.unwrap_or(u32::MAX))),
-            I64ExtendI32S if i32_maximum.is_some_and(|maximum| maximum <= i32::MAX as u32) => {
-                i32_maximum.map(u64::from)
-            }
             _ => None,
         };
         let result_i32_maximum = self
             .plan
             .i32_unsigned_max(instruction_index)
             .or(result_i32_maximum);
-        let result_i64_maximum = self
-            .plan
-            .i64_unsigned_max(instruction_index)
-            .or(result_i64_maximum);
         self.remember_i32_unsigned_max(&result, result_i32_maximum);
-        self.remember_i64_unsigned_max(&result, result_i64_maximum);
         self.stack.push(result);
         Ok(())
     }
@@ -3102,9 +3071,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     fn emit_binary(&mut self, instruction_index: usize, op: BinaryOp) -> Result<(), CompileError> {
         use BinaryOp::*;
         let right = self.pop()?;
-        let right = self.normalize_i64_high(right);
         let left = self.pop()?;
-        let left = self.normalize_i64_high(left);
         let left_i32_maximum = self.i32_unsigned_max(&left);
         let right_i32_maximum = self.i32_unsigned_max(&right);
         let right_i32_literal = right.i32_expr().ok().and_then(i32_literal);
@@ -3274,7 +3241,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         }
         let unsigned_divisor = b_literal.map(|value| value as u32);
         let expr = match op {
-            BinaryOp::I32DivS => format!("({a_i32})/({b_i32})|0"),
+            BinaryOp::I32DivS => format!("(({a_i32})|0)/(({b_i32})|0)|0"),
             BinaryOp::I32DivU if unsigned_divisor == Some(255) && is_unsigned_u16(&a) => {
                 format!("U({},32897)>>>23", compact_i32(&a))
             }
@@ -3288,7 +3255,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 compact_unsigned_i32_operand(&a),
                 compact_unsigned_i32_operand(&b)
             ),
-            BinaryOp::I32RemS => format!("({a_i32})%({b_i32})|0"),
+            BinaryOp::I32RemS => format!("(({a_i32})|0)%(({b_i32})|0)|0"),
             BinaryOp::I32RemU if unsigned_divisor.is_some_and(u32::is_power_of_two) => {
                 format!("({})&{}", compact_i32(&a), unsigned_divisor.unwrap() - 1)
             }
@@ -3342,7 +3309,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         } else {
             write!(self.body, "if({b}){{").unwrap();
             emit_cached(&mut self.body);
-            write!(self.body, "}}else{{{quotient}=({a})/({b})|0}}").unwrap();
+            write!(self.body, "}}else{{{quotient}=(({a})|0)/(({b})|0)|0}}").unwrap();
         }
         Ok(Value::I32(quotient))
     }
@@ -3370,6 +3337,51 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         Ok(target)
     }
 
+    fn fast_direct_integer_load(
+        &mut self,
+        base: &str,
+        offset: u64,
+        code: u8,
+    ) -> Result<Option<String>, CompileError> {
+        let Some(memory_size) = self.module.direct_memory_size else {
+            return Ok(None);
+        };
+        if self.module.options.preserve_traps {
+            return Ok(None);
+        }
+        let address = if offset == 0 {
+            base.to_string()
+        } else {
+            fixed_memory_offset_address(base, offset, false)
+        };
+        if let Some(load) = direct_static_load(&address, code, memory_size) {
+            return Ok(Some(load));
+        }
+        Ok(direct_fast_integer_load(&address, code))
+    }
+
+    fn emit_fast_direct_integer_store(
+        &mut self,
+        base: &str,
+        offset: u64,
+        code: u8,
+        value: &str,
+    ) -> Result<bool, CompileError> {
+        if self.module.direct_memory_size.is_none() || self.module.options.preserve_traps {
+            return Ok(false);
+        }
+        let address = if offset == 0 {
+            base.to_string()
+        } else {
+            fixed_memory_offset_address(base, offset, false)
+        };
+        let Some(store) = direct_fast_integer_store(&address, code, value) else {
+            return Ok(false);
+        };
+        self.body.push_str(&store);
+        Ok(true)
+    }
+
     fn i64_binary(
         &mut self,
         instruction_index: usize,
@@ -3377,46 +3389,13 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         right: Value,
         op: BinaryOp,
     ) -> Result<Value, CompileError> {
-        let left_maximum = self.i64_unsigned_max(&left);
-        let right_maximum = self.i64_unsigned_max(&right);
         let (al, ah) = expect_i64(left)?;
         let (bl, bh) = expect_i64(right)?;
         let al_literal = i32_literal(&al);
         let ah_literal = i32_literal(&ah);
         let bl_literal = i32_literal(&bl);
         let bh_literal = i32_literal(&bh);
-        let shift = bl_literal.map(|value| (value as u32) & 63);
-        let result_maximum = self
-            .plan
-            .i64_unsigned_max(instruction_index)
-            .or_else(|| match op {
-                BinaryOp::I64Add => left_maximum
-                    .zip(right_maximum)
-                    .and_then(|(left, right)| left.checked_add(right)),
-                BinaryOp::I64Sub if right_maximum == Some(0) => left_maximum,
-                BinaryOp::I64Mul => left_maximum
-                    .zip(right_maximum)
-                    .and_then(|(left, right)| left.checked_mul(right)),
-                BinaryOp::I64And => match (left_maximum, right_maximum) {
-                    (Some(left), Some(right)) => Some(left.min(right)),
-                    (Some(maximum), None) | (None, Some(maximum)) => Some(maximum),
-                    (None, None) => None,
-                },
-                BinaryOp::I64Or | BinaryOp::I64Xor => left_maximum
-                    .zip(right_maximum)
-                    .map(|(left, right)| unsigned_bit_mask64(left) | unsigned_bit_mask64(right)),
-                BinaryOp::I64Shl => left_maximum.zip(shift).and_then(|(left, shift)| {
-                    left.checked_shl(shift)
-                        .filter(|value| (*value >> shift) == left)
-                }),
-                BinaryOp::I64ShrU => left_maximum.zip(shift).map(|(left, shift)| left >> shift),
-                BinaryOp::I64DivU => left_maximum,
-                BinaryOp::I64RemU if bh_literal == Some(0) => bl_literal.and_then(|right| {
-                    let right = u64::from(right as u32);
-                    (right != 0).then(|| left_maximum.unwrap_or(u64::MAX).min(right - 1))
-                }),
-                _ => None,
-            });
+        let result_maximum = self.plan.i64_unsigned_max(instruction_index);
         let high_is_zero = result_maximum.is_some_and(|maximum| maximum <= u64::from(u32::MAX));
         let low_only = self.plan.i64_low_only(instruction_index);
         let a_zero = al_literal == Some(0) && ah_literal == Some(0);
@@ -3582,7 +3561,6 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                         write!(self.body, "{low_name}=W({code}|0,{al},{ah},{bl},{bh})|0;").unwrap();
                     }
                     let result = Value::I64(low_name, "0".into());
-                    self.remember_i64_unsigned_max(&result, result_maximum);
                     return Ok(result);
                 }
                 let high = self.temp(ValType::I32);
@@ -3611,7 +3589,6 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 lazy_high
             },
         );
-        self.remember_i64_unsigned_max(&result, result_maximum);
         Ok(result)
     }
 
@@ -3673,9 +3650,16 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let compact_address = compact.then(|| compact_memory_address(&lo, arg.offset));
         let lo_i32 = compact_i32(&lo);
         let hi_i32 = compact_i32(&hi);
-        let offset_helper = self.module.load_offset_helpers.get(&(arg.offset, code));
         let direct = self.module.direct_memory_size.is_some() && compact;
-        let call = if let Some(address) = &compact_address {
+        let fast_direct_call = if let Some(address) = &compact_address {
+            self.fast_direct_integer_load(address, arg.offset, code)?
+        } else {
+            None
+        };
+        let offset_helper = self.module.load_offset_helpers.get(&(arg.offset, code));
+        let call = if let Some(call) = fast_direct_call {
+            call
+        } else if let Some(address) = &compact_address {
             if arg.offset == 0 {
                 if let Some(load) = self
                     .module
@@ -3768,15 +3752,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 } else {
                     "0".into()
                 };
-                let value = Value::I64(low_name, high);
-                let maximum = match op {
-                    LoadOp::I64_8U => Some(u64::from(u8::MAX)),
-                    LoadOp::I64_16U => Some(u64::from(u16::MAX)),
-                    LoadOp::I64_32U => Some(u64::from(u32::MAX)),
-                    _ => None,
-                };
-                self.remember_i64_unsigned_max(&value, maximum);
-                self.stack.push(value);
+                self.stack.push(Value::I64(low_name, high));
             }
             LoadOp::F32 => {
                 let value = self.temp(ValType::F32);
@@ -3862,7 +3838,6 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let lo_i32 = compact_i32(&lo);
         let hi_i32 = compact_i32(&hi);
         let code = store_code(op);
-        let offset_helper = self.module.store_offset_helpers.get(&(arg.offset, code));
         if let Some((value_low, value_high)) = f64_bits {
             let value_low = compact_i32(&value_low);
             let value_high = compact_i32(&value_high);
@@ -3902,6 +3877,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             match op {
                 StoreOp::F32 | StoreOp::F64 => {
                     let value = coerce(ValType::F64, &expect_float(value)?);
+                    let offset_helper = self.module.store_offset_helpers.get(&(arg.offset, code));
                     if arg.offset == 0 {
                         if direct {
                             write!(self.body, "$D{code}({address},{value});").unwrap();
@@ -3925,6 +3901,10 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     let (value_lo, value_hi) = expect_i64(value)?;
                     let value_lo = compact_i32(&value_lo);
                     let value_hi = compact_i32(&value_hi);
+                    if self.emit_fast_direct_integer_store(&address, arg.offset, code, &value_lo)? {
+                        return Ok(());
+                    }
+                    let offset_helper = self.module.store_offset_helpers.get(&(arg.offset, code));
                     if arg.offset == 0 {
                         if direct {
                             if code == 1 {
@@ -3965,6 +3945,10 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 }
                 _ => {
                     let value = compact_i32(value.i32_expr()?);
+                    if self.emit_fast_direct_integer_store(&address, arg.offset, code, &value)? {
+                        return Ok(());
+                    }
+                    let offset_helper = self.module.store_offset_helpers.get(&(arg.offset, code));
                     if arg.offset == 0 {
                         if direct {
                             write!(self.body, "$S{code}({address},{value});").unwrap();
@@ -4337,9 +4321,6 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             Value::I32(expression) => {
                 self.i32_unsigned_max.remove(expression);
             }
-            Value::I64(low, high) => {
-                self.i64_unsigned_max.remove(&(low.clone(), high.clone()));
-            }
             Value::F64(expression) => {
                 self.f64_bits.remove(expression);
             }
@@ -4401,67 +4382,23 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             .or_else(|| i32_literal(expression).map(|value| value as u32))
     }
 
-    fn i64_unsigned_max(&self, value: &Value) -> Option<u64> {
-        let Value::I64(low, high) = value else {
-            return None;
-        };
-        self.i64_unsigned_max
-            .get(&(low.clone(), high.clone()))
-            .copied()
-            .or_else(|| {
-                is_i32_zero(high).then(|| {
-                    i32_literal(low)
-                        .map(|value| u64::from(value as u32))
-                        .unwrap_or(u64::from(u32::MAX))
-                })
-            })
-    }
-
     fn remember_i32_unsigned_max(&mut self, value: &Value, maximum: Option<u32>) {
         let (Value::I32(expression), Some(maximum)) = (value, maximum) else {
             return;
         };
         self.i32_unsigned_max.insert(expression.clone(), maximum);
     }
-    fn normalize_i64_high(&mut self, mut value: Value) -> Value {
-        let maximum = self.i64_unsigned_max(&value);
-        if maximum.is_some_and(|maximum| maximum <= u64::from(u32::MAX))
-            && let Value::I64(_, high) = &mut value
-        {
-            *high = "0".into();
-            self.remember_i64_unsigned_max(&value, maximum);
-        }
-        value
-    }
 
-    fn remember_i64_unsigned_max(&mut self, value: &Value, maximum: Option<u64>) {
-        let (Value::I64(low, high), Some(maximum)) = (value, maximum) else {
-            return;
-        };
-        self.i64_unsigned_max
-            .insert((low.clone(), high.clone()), maximum);
-    }
-
-    fn set_integer_facts(
-        &mut self,
-        target: &Value,
-        i32_maximum: Option<u32>,
-        i64_maximum: Option<u64>,
-    ) {
+    fn set_i32_fact(&mut self, target: &Value, maximum: Option<u32>) {
         if let Value::I32(expression) = target {
             self.i32_unsigned_max.remove(expression);
         }
-        if let Value::I64(low, high) = target {
-            self.i64_unsigned_max.remove(&(low.clone(), high.clone()));
-        }
-        self.remember_i32_unsigned_max(target, i32_maximum);
-        self.remember_i64_unsigned_max(target, i64_maximum);
+        self.remember_i32_unsigned_max(target, maximum);
     }
 
-    fn copy_integer_facts(&mut self, target: &Value, value: &Value) {
-        let i32_maximum = self.i32_unsigned_max(value);
-        let i64_maximum = self.i64_unsigned_max(value);
-        self.set_integer_facts(target, i32_maximum, i64_maximum);
+    fn copy_i32_fact(&mut self, target: &Value, value: &Value) {
+        let maximum = self.i32_unsigned_max(value);
+        self.set_i32_fact(target, maximum);
     }
 
     fn retarget_last_temp_assignment(&mut self, target: &Value, value: &Value) -> bool {
@@ -4509,7 +4446,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             )
             .unwrap();
         }
-        self.copy_integer_facts(target, value);
+        self.copy_i32_fact(target, value);
         true
     }
 
@@ -4561,7 +4498,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
 
     fn assign(&mut self, target: &Value, value: &Value) {
         let source_bits = self.f64_bits_for(value);
-        self.copy_integer_facts(target, value);
+        self.copy_i32_fact(target, value);
         for (a, b) in target.components().iter().zip(value.components()) {
             write!(
                 self.body,
@@ -5895,6 +5832,24 @@ fn named_value(ty: ValType, base: &str) -> Value {
         ValType::V128 => Value::V128(std::array::from_fn(|i| format!("{base}{i}"))),
     }
 }
+
+fn direct_fast_integer_load(address: &str, code: u8) -> Option<String> {
+    let expression = match code {
+        4 | 8 => format!("$h8[({address})>>0]"),
+        5 | 9 => format!("$u8[({address})>>0]"),
+        _ => return None,
+    };
+    Some(expression)
+}
+
+fn direct_fast_integer_store(address: &str, code: u8, value: &str) -> Option<String> {
+    let statement = match code {
+        4 | 6 => format!("$h8[({address})>>0]=({value})|0;"),
+        _ => return None,
+    };
+    Some(statement)
+}
+
 fn direct_static_load(address: &str, code: u8, memory_size: u32) -> Option<String> {
     let address = u32::try_from(i32_literal(address)?).ok()?;
     let (array, width, shift) = match code {
@@ -6581,13 +6536,6 @@ fn unsigned_bit_mask(maximum: u32) -> u32 {
         0
     } else {
         u32::MAX >> maximum.leading_zeros()
-    }
-}
-fn unsigned_bit_mask64(maximum: u64) -> u64 {
-    if maximum == 0 {
-        0
-    } else {
-        u64::MAX >> maximum.leading_zeros()
     }
 }
 
