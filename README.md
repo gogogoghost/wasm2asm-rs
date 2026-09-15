@@ -172,6 +172,7 @@ For browsers that cannot load ES modules, generate UMD output and include it as 
 --enable-lowering=references
 --enable-all-lowerings
 --fast
+--assume-memory-alignment
 --max-*=VALUE
 ```
 
@@ -184,6 +185,8 @@ wasm2asm --help
 SIMD and typed function references are high-cost lowerings and are disabled by default.
 
 `--fast` removes selected trap checks while preserving the result of every execution that is valid in WebAssembly. Only paths that WebAssembly would trap may differ: i32 division by zero or signed overflow, invalid non-saturating f32/f64-to-i32 conversion, out-of-bounds or overflowing memory access, and invalid indirect calls. f64 load/store/reinterpret bit patterns, signed zero, and unaligned memory accesses remain unchanged. Use standard mode when exact trap behavior is required.
+
+`--assume-memory-alignment` requires `--fast` and trusts each Wasm memory instruction's alignment hint. Accesses whose hints are too weak still use the unaligned-safe path; naturally aligned accesses use branch-free typed-array operations, inlined for integer loads and stores. Enable it only for trusted producers that guarantee effective addresses satisfy their declared alignment. Violating a hint can read or write the wrong bytes.
 
 ## Compatibility
 

@@ -56,6 +56,9 @@ pub struct Cli {
     /// Omit checks only on paths that would trap in WebAssembly.
     #[arg(long)]
     pub fast: bool,
+    /// Trust Wasm memory alignment hints. Requires --fast; unaligned accesses are invalid.
+    #[arg(long, requires = "fast")]
+    pub assume_memory_alignment: bool,
 
     #[arg(long, default_value_t = 256 * 1024 * 1024)]
     pub max_input_bytes: usize,

@@ -1122,7 +1122,7 @@ impl<'a> ModuleCx<'a> {
             (12, "$L12"),
             (13, "$L13"),
         ] {
-            self.emit_direct_memory_load_helper(out, name, None, code);
+            self.emit_direct_memory_load_helper(out, name, None, code, false);
         }
         write!(out, "function $S0(a,v){{a=a|0;v=v|0;{word_check}if(a&3){{st(a|0,0|0,v|0,0|0);return}}$h32[a>>2]=v}}").unwrap();
         write!(out, "function $S1(a,v,w){{a=a|0;v=v|0;w=w|0;{double_check}if(a&3){{st(a|0,1|0,v|0,w|0);return}}$h32[a>>2]=v;$h32[(a+4)>>2]=w}}").unwrap();
@@ -1139,6 +1139,56 @@ impl<'a> ModuleCx<'a> {
             write!(out, "function $S{code}(a,v){{a=a|0;v=v|0;{half_check}if(a&1){{st(a|0,{code}|0,v|0,0|0);return}}$h16[a>>1]=v}}").unwrap();
         }
         write!(out, "function $S8(a,v){{a=a|0;v=v|0;{word_check}if(a&3){{st(a|0,8|0,v|0,0|0);return}}$h32[a>>2]=v}}").unwrap();
+
+        if !self.options.assume_memory_alignment {
+            return;
+        }
+        for (code, name) in [
+            (0, "$AL0"),
+            (1, "$AL1"),
+            (2, "$AL2"),
+            (3, "$AL3"),
+            (6, "$AL6"),
+            (10, "$AL10"),
+            (7, "$AL7"),
+            (11, "$AL11"),
+            (12, "$AL12"),
+            (13, "$AL13"),
+        ] {
+            self.emit_direct_memory_load_helper(out, name, None, code, true);
+        }
+        write!(
+            out,
+            "function $AS0(a,v){{a=a|0;v=v|0;{word_check}$h32[a>>2]=v}}"
+        )
+        .unwrap();
+        write!(
+            out,
+            "function $AS1(a,v,w){{a=a|0;v=v|0;w=w|0;{double_check}$h32[a>>2]=v;$h32[(a+4)>>2]=w}}"
+        )
+        .unwrap();
+        write!(
+            out,
+            "function $AS2(a,v){{a=a|0;v=+v;{word_check}$f32[a>>2]=F(v)}}"
+        )
+        .unwrap();
+        write!(
+            out,
+            "function $AS3(a,v){{a=a|0;v=+v;{double_check}$f64[a>>3]=v}}"
+        )
+        .unwrap();
+        for code in [5, 7] {
+            write!(
+                out,
+                "function $AS{code}(a,v){{a=a|0;v=v|0;{half_check}$h16[a>>1]=v}}"
+            )
+            .unwrap();
+        }
+        write!(
+            out,
+            "function $AS8(a,v){{a=a|0;v=v|0;{word_check}$h32[a>>2]=v}}"
+        )
+        .unwrap();
     }
 
     fn emit_direct_memory_load_helper(
@@ -1147,6 +1197,7 @@ impl<'a> ModuleCx<'a> {
         name: &str,
         offset: Option<u64>,
         code: u8,
+        aligned: bool,
     ) {
         let size = self
             .direct_memory_size
@@ -1168,16 +1219,23 @@ impl<'a> ModuleCx<'a> {
                 format!("a={address};")
             })
             .unwrap_or_default();
+        let fallback = |mask, body: &str| {
+            if aligned {
+                String::new()
+            } else {
+                format!("if(a&{mask}){{{body}}}")
+            }
+        };
         match code {
-            0 | 12 => write!(out, "function {name}(a){{a=a|0;{setup}{check}if(a&3)return l(a|0,{code}|0)|0;return $h32[a>>2]|0}}"),
-            1 => write!(out, "function {name}(a){{a=a|0;var v=0;{setup}{check}if(a&3){{v=l(a|0,1|0)|0;$ih=GH()|0;return v|0}}$ih=$h32[(a+4)>>2]|0;return $h32[a>>2]|0}}"),
-            2 => write!(out, "function {name}(a){{a=a|0;{setup}{check}if(a&3)return +lf(a|0,2|0);return +F($f32[a>>2])}}"),
-            3 => write!(out, "function {name}(a){{a=a|0;var v=0.0;{setup}{check}if(a&7){{v=+lf(a|0,3|0);$rl=l(a|0,1|0)|0;$rh=GH()|0;return +v}}$rl=$h32[a>>2]|0;$rh=$h32[(a+4)>>2]|0;return +$f64[a>>3]}}"),
+            0 | 12 => write!(out, "function {name}(a){{a=a|0;{setup}{check}{}return $h32[a>>2]|0}}", fallback(3, &format!("return l(a|0,{code}|0)|0"))),
+            1 => write!(out, "function {name}(a){{a=a|0;var v=0;{setup}{check}{}$ih=$h32[(a+4)>>2]|0;return $h32[a>>2]|0}}", fallback(3, "v=l(a|0,1|0)|0;$ih=GH()|0;return v|0")),
+            2 => write!(out, "function {name}(a){{a=a|0;{setup}{check}{}return +F($f32[a>>2])}}", fallback(3, "return +lf(a|0,2|0)")),
+            3 => write!(out, "function {name}(a){{a=a|0;var v=0.0;{setup}{check}{}$rl=$h32[a>>2]|0;$rh=$h32[(a+4)>>2]|0;return +$f64[a>>3]}}", fallback(7, "v=+lf(a|0,3|0);$rl=l(a|0,1|0)|0;$rh=GH()|0;return +v")),
             4 | 8 => write!(out, "function {name}(a){{a=a|0;{setup}{check}return $h8[a>>0]|0}}"),
             5 | 9 => write!(out, "function {name}(a){{a=a|0;{setup}{check}return $u8[a>>0]|0}}"),
-            6 | 10 => write!(out, "function {name}(a){{a=a|0;{setup}{check}if(a&1)return l(a|0,{code}|0)|0;return $h16[a>>1]|0}}"),
-            7 | 11 => write!(out, "function {name}(a){{a=a|0;{setup}{check}if(a&1)return l(a|0,{code}|0)|0;return $u16[a>>1]|0}}"),
-            13 => write!(out, "function {name}(a){{a=a|0;{setup}{check}if(a&3)return l(a|0,13|0)|0;return $u32[a>>2]|0}}"),
+            6 | 10 => write!(out, "function {name}(a){{a=a|0;{setup}{check}{}return $h16[a>>1]|0}}", fallback(1, &format!("return l(a|0,{code}|0)|0"))),
+            7 | 11 => write!(out, "function {name}(a){{a=a|0;{setup}{check}{}return $u16[a>>1]|0}}", fallback(1, &format!("return l(a|0,{code}|0)|0"))),
+            13 => write!(out, "function {name}(a){{a=a|0;{setup}{check}{}return $u32[a>>2]|0}}", fallback(3, "return l(a|0,13|0)|0")),
             _ => unreachable!("invalid direct load helper code {code}"),
         }
         .unwrap();
@@ -1186,7 +1244,7 @@ impl<'a> ModuleCx<'a> {
     fn emit_memory_offset_helpers(&self, out: &mut String) {
         if self.direct_memory_size.is_some() {
             for (&(offset, code), name) in &self.load_offset_helpers {
-                self.emit_direct_memory_load_helper(out, name, Some(offset), code);
+                self.emit_direct_memory_load_helper(out, name, Some(offset), code, false);
             }
             for (&(offset, code), name) in &self.store_offset_helpers {
                 let address = fixed_memory_offset_address("a", offset, self.options.preserve_traps);
@@ -3342,6 +3400,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         base: &str,
         offset: u64,
         code: u8,
+        aligned: bool,
     ) -> Result<Option<String>, CompileError> {
         let Some(memory_size) = self.module.direct_memory_size else {
             return Ok(None);
@@ -3357,7 +3416,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         if let Some(load) = direct_static_load(&address, code, memory_size) {
             return Ok(Some(load));
         }
-        Ok(direct_fast_integer_load(&address, code))
+        Ok(direct_fast_integer_load(&address, code, aligned))
     }
 
     fn emit_fast_direct_integer_store(
@@ -3366,6 +3425,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         offset: u64,
         code: u8,
         value: &str,
+        aligned: bool,
     ) -> Result<bool, CompileError> {
         if self.module.direct_memory_size.is_none() || self.module.options.preserve_traps {
             return Ok(false);
@@ -3375,7 +3435,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         } else {
             fixed_memory_offset_address(base, offset, false)
         };
-        let Some(store) = direct_fast_integer_store(&address, code, value) else {
+        let Some(store) = direct_fast_integer_store(&address, code, value, aligned) else {
             return Ok(false);
         };
         self.body.push_str(&store);
@@ -3651,8 +3711,11 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let lo_i32 = compact_i32(&lo);
         let hi_i32 = compact_i32(&hi);
         let direct = self.module.direct_memory_size.is_some() && compact;
+        let aligned = self.module.options.assume_memory_alignment
+            && load_code_alignment(code).is_some_and(|required| arg.align >= required);
+        let direct_helper = direct_load_helper_name(code, aligned);
         let fast_direct_call = if let Some(address) = &compact_address {
-            self.fast_direct_integer_load(address, arg.offset, code)?
+            self.fast_direct_integer_load(address, arg.offset, code, aligned)?
         } else {
             None
         };
@@ -3668,15 +3731,24 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 {
                     load
                 } else if direct {
-                    format!("$L{code}({address})")
+                    format!("{direct_helper}({address})")
                 } else {
                     format!("l({address},{code})")
                 }
+            } else if aligned && direct {
+                format!(
+                    "{direct_helper}({})",
+                    fixed_memory_offset_address(
+                        address,
+                        arg.offset,
+                        self.module.options.preserve_traps
+                    )
+                )
             } else if let Some(helper) = offset_helper {
                 format!("{helper}({address})")
             } else if direct {
                 format!(
-                    "$L{code}({})",
+                    "{direct_helper}({})",
                     fixed_memory_offset_address(
                         address,
                         arg.offset,
@@ -3695,15 +3767,24 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let float_call = compact_address.as_ref().map(|address| {
             if arg.offset == 0 {
                 if direct {
-                    format!("$F{code}({address})")
+                    format!("{direct_helper}({address})")
                 } else {
                     format!("lf({address},{code})")
                 }
+            } else if aligned && direct {
+                format!(
+                    "{direct_helper}({})",
+                    fixed_memory_offset_address(
+                        address,
+                        arg.offset,
+                        self.module.options.preserve_traps
+                    )
+                )
             } else if let Some(helper) = offset_helper {
                 format!("{helper}({address})")
             } else if direct {
                 format!(
-                    "$F{code}({})",
+                    "{direct_helper}({})",
                     fixed_memory_offset_address(
                         address,
                         arg.offset,
@@ -3838,6 +3919,13 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let lo_i32 = compact_i32(&lo);
         let hi_i32 = compact_i32(&hi);
         let code = store_code(op);
+        let aligned = self.module.options.assume_memory_alignment
+            && store_code_alignment(code).is_some_and(|required| arg.align >= required);
+        let direct_helper = direct_store_helper_name(code, aligned);
+        let f64_bits_helper = direct_store_helper_name(
+            1,
+            self.module.options.assume_memory_alignment && arg.align >= 2,
+        );
         if let Some((value_low, value_high)) = f64_bits {
             let value_low = compact_i32(&value_low);
             let value_high = compact_i32(&value_high);
@@ -3852,7 +3940,11 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                             self.module.options.preserve_traps,
                         )
                     };
-                    write!(self.body, "$S1({address},{value_low},{value_high});").unwrap();
+                    write!(
+                        self.body,
+                        "{f64_bits_helper}({address},{value_low},{value_high});"
+                    )
+                    .unwrap();
                 } else if arg.offset == 0 {
                     write!(self.body, "st({address},1,{value_low},{value_high});").unwrap();
                 } else {
@@ -3880,10 +3972,17 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     let offset_helper = self.module.store_offset_helpers.get(&(arg.offset, code));
                     if arg.offset == 0 {
                         if direct {
-                            write!(self.body, "$D{code}({address},{value});").unwrap();
+                            write!(self.body, "{direct_helper}({address},{value});").unwrap();
                         } else {
                             write!(self.body, "sf({address},{code},{value});").unwrap();
                         }
+                    } else if aligned && direct {
+                        let address = fixed_memory_offset_address(
+                            &address,
+                            arg.offset,
+                            self.module.options.preserve_traps,
+                        );
+                        write!(self.body, "{direct_helper}({address},{value});").unwrap();
                     } else if let Some(helper) = offset_helper {
                         write!(self.body, "{helper}({address},{value});").unwrap();
                     } else if direct {
@@ -3892,7 +3991,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                             arg.offset,
                             self.module.options.preserve_traps,
                         );
-                        write!(self.body, "$D{code}({address},{value});").unwrap();
+                        write!(self.body, "{direct_helper}({address},{value});").unwrap();
                     } else {
                         write!(self.body, "sf2({address},{},{code},{value});", arg.offset).unwrap();
                     }
@@ -3901,20 +4000,42 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     let (value_lo, value_hi) = expect_i64(value)?;
                     let value_lo = compact_i32(&value_lo);
                     let value_hi = compact_i32(&value_hi);
-                    if self.emit_fast_direct_integer_store(&address, arg.offset, code, &value_lo)? {
+                    if self.emit_fast_direct_integer_store(
+                        &address, arg.offset, code, &value_lo, aligned,
+                    )? {
                         return Ok(());
                     }
                     let offset_helper = self.module.store_offset_helpers.get(&(arg.offset, code));
                     if arg.offset == 0 {
                         if direct {
                             if code == 1 {
-                                write!(self.body, "$S1({address},{value_lo},{value_hi});").unwrap();
+                                write!(
+                                    self.body,
+                                    "{direct_helper}({address},{value_lo},{value_hi});"
+                                )
+                                .unwrap();
                             } else {
-                                write!(self.body, "$S{code}({address},{value_lo});").unwrap();
+                                write!(self.body, "{direct_helper}({address},{value_lo});")
+                                    .unwrap();
                             }
                         } else {
                             write!(self.body, "st({address},{code},{value_lo},{value_hi});")
                                 .unwrap();
+                        }
+                    } else if aligned && direct {
+                        let address = fixed_memory_offset_address(
+                            &address,
+                            arg.offset,
+                            self.module.options.preserve_traps,
+                        );
+                        if code == 1 {
+                            write!(
+                                self.body,
+                                "{direct_helper}({address},{value_lo},{value_hi});"
+                            )
+                            .unwrap();
+                        } else {
+                            write!(self.body, "{direct_helper}({address},{value_lo});").unwrap();
                         }
                     } else if let Some(helper) = offset_helper {
                         if code == 1 {
@@ -3930,9 +4051,13 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                             self.module.options.preserve_traps,
                         );
                         if code == 1 {
-                            write!(self.body, "$S1({address},{value_lo},{value_hi});").unwrap();
+                            write!(
+                                self.body,
+                                "{direct_helper}({address},{value_lo},{value_hi});"
+                            )
+                            .unwrap();
                         } else {
-                            write!(self.body, "$S{code}({address},{value_lo});").unwrap();
+                            write!(self.body, "{direct_helper}({address},{value_lo});").unwrap();
                         }
                     } else {
                         write!(
@@ -3945,16 +4070,25 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 }
                 _ => {
                     let value = compact_i32(value.i32_expr()?);
-                    if self.emit_fast_direct_integer_store(&address, arg.offset, code, &value)? {
+                    if self.emit_fast_direct_integer_store(
+                        &address, arg.offset, code, &value, aligned,
+                    )? {
                         return Ok(());
                     }
                     let offset_helper = self.module.store_offset_helpers.get(&(arg.offset, code));
                     if arg.offset == 0 {
                         if direct {
-                            write!(self.body, "$S{code}({address},{value});").unwrap();
+                            write!(self.body, "{direct_helper}({address},{value});").unwrap();
                         } else {
                             write!(self.body, "st({address},{code},{value},0);").unwrap();
                         }
+                    } else if aligned && direct {
+                        let address = fixed_memory_offset_address(
+                            &address,
+                            arg.offset,
+                            self.module.options.preserve_traps,
+                        );
+                        write!(self.body, "{direct_helper}({address},{value});").unwrap();
                     } else if let Some(helper) = offset_helper {
                         write!(self.body, "{helper}({address},{value});").unwrap();
                     } else if direct {
@@ -3963,7 +4097,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                             arg.offset,
                             self.module.options.preserve_traps,
                         );
-                        write!(self.body, "$S{code}({address},{value});").unwrap();
+                        write!(self.body, "{direct_helper}({address},{value});").unwrap();
                     } else {
                         write!(self.body, "st2({address},{},{code},{value},0);", arg.offset)
                             .unwrap();
@@ -5833,21 +5967,32 @@ fn named_value(ty: ValType, base: &str) -> Value {
     }
 }
 
-fn direct_fast_integer_load(address: &str, code: u8) -> Option<String> {
-    let expression = match code {
-        4 | 8 => format!("$h8[({address})>>0]"),
-        5 | 9 => format!("$u8[({address})>>0]"),
+fn direct_fast_integer_load(address: &str, code: u8, aligned: bool) -> Option<String> {
+    let (array, shift) = match code {
+        4 | 8 => ("$h8", 0),
+        5 | 9 => ("$u8", 0),
+        6 | 10 if aligned => ("$h16", 1),
+        7 | 11 if aligned => ("$u16", 1),
+        0 | 12 if aligned => ("$h32", 2),
+        13 if aligned => ("$u32", 2),
         _ => return None,
     };
-    Some(expression)
+    Some(format!("{array}[({address})>>{shift}]"))
 }
 
-fn direct_fast_integer_store(address: &str, code: u8, value: &str) -> Option<String> {
-    let statement = match code {
-        4 | 6 => format!("$h8[({address})>>0]=({value})|0;"),
+fn direct_fast_integer_store(
+    address: &str,
+    code: u8,
+    value: &str,
+    aligned: bool,
+) -> Option<String> {
+    let (array, shift) = match code {
+        4 | 6 => ("$h8", 0),
+        5 | 7 if aligned => ("$h16", 1),
+        0 | 8 if aligned => ("$h32", 2),
         _ => return None,
     };
-    Some(statement)
+    Some(format!("{array}[({address})>>{shift}]=({value})|0;"))
 }
 
 fn direct_static_load(address: &str, code: u8, memory_size: u32) -> Option<String> {
@@ -7041,6 +7186,78 @@ fn i64_compare(a: Value, b: Value, op: BinaryOp) -> Result<Value, CompileError> 
         }
     };
     Ok(Value::I32(expression))
+}
+
+fn load_code_alignment(code: u8) -> Option<u8> {
+    match code {
+        6 | 7 | 10 | 11 => Some(1),
+        0 | 1 | 2 | 12 | 13 => Some(2),
+        3 => Some(3),
+        4 | 5 | 8 | 9 => None,
+        _ => unreachable!("invalid load code {code}"),
+    }
+}
+
+fn direct_load_helper_name(code: u8, aligned: bool) -> &'static str {
+    match (code, aligned) {
+        (0, false) => "$L0",
+        (1, false) => "$L1",
+        (2, false) => "$F2",
+        (3, false) => "$F3",
+        (4, false) => "$L4",
+        (5, false) => "$L5",
+        (6, false) => "$L6",
+        (7, false) => "$L7",
+        (8, false) => "$L8",
+        (9, false) => "$L9",
+        (10, false) => "$L10",
+        (11, false) => "$L11",
+        (12, false) => "$L12",
+        (13, false) => "$L13",
+        (0, true) => "$AL0",
+        (1, true) => "$AL1",
+        (2, true) => "$AL2",
+        (3, true) => "$AL3",
+        (6, true) => "$AL6",
+        (7, true) => "$AL7",
+        (10, true) => "$AL10",
+        (11, true) => "$AL11",
+        (12, true) => "$AL12",
+        (13, true) => "$AL13",
+        _ => unreachable!("invalid aligned load code {code}"),
+    }
+}
+
+fn store_code_alignment(code: u8) -> Option<u8> {
+    match code {
+        5 | 7 => Some(1),
+        0 | 1 | 2 | 8 => Some(2),
+        3 => Some(3),
+        4 | 6 => None,
+        _ => unreachable!("invalid store code {code}"),
+    }
+}
+
+fn direct_store_helper_name(code: u8, aligned: bool) -> &'static str {
+    match (code, aligned) {
+        (0, false) => "$S0",
+        (1, false) => "$S1",
+        (2, false) => "$D2",
+        (3, false) => "$D3",
+        (4, false) => "$S4",
+        (5, false) => "$S5",
+        (6, false) => "$S6",
+        (7, false) => "$S7",
+        (8, false) => "$S8",
+        (0, true) => "$AS0",
+        (1, true) => "$AS1",
+        (2, true) => "$AS2",
+        (3, true) => "$AS3",
+        (5, true) => "$AS5",
+        (7, true) => "$AS7",
+        (8, true) => "$AS8",
+        _ => unreachable!("invalid aligned store code {code}"),
+    }
 }
 
 fn load_code(op: LoadOp) -> u8 {

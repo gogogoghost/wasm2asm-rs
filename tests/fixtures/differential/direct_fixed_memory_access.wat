@@ -1,8 +1,65 @@
 (module
   (memory 512 1024)
+  (func $aligned_integer_accesses (param $address i32) (result i32)
+    (local $ok i32)
+    i32.const 1
+    local.set $ok
+
+    local.get $address
+    i32.const 305419896
+    i32.store
+    local.get $ok
+    local.get $address
+    i32.load
+    i32.const 305419896
+    i32.eq
+    i32.and
+    local.set $ok
+
+    local.get $address
+    i32.const 48879
+    i32.store16 offset=4
+    local.get $ok
+    local.get $address
+    i32.load16_u offset=4
+    i32.const 48879
+    i32.eq
+    i32.and
+    local.set $ok
+    local.get $ok
+    local.get $address
+    i32.load16_s offset=4
+    i32.const -16657
+    i32.eq
+    i32.and
+    local.set $ok
+
+    local.get $address
+    i64.const -1
+    i64.store32 offset=8
+    local.get $ok
+    local.get $address
+    i64.load32_u offset=8
+    i64.const 4294967295
+    i64.eq
+    i32.and
+    local.set $ok
+    local.get $ok
+    local.get $address
+    i64.load32_s offset=8
+    i64.const -1
+    i64.eq
+    i32.and)
+
   (func (export "run") (result i32)
     (local $ok i32)
     i32.const 1
+    local.set $ok
+
+    local.get $ok
+    i32.const 320
+    call $aligned_integer_accesses
+    i32.and
     local.set $ok
 
     i32.const 16

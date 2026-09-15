@@ -56,6 +56,9 @@ impl Default for ResourceLimits {
 pub struct CompileOptions {
     pub lowerings: Lowerings,
     pub preserve_traps: bool,
+    /// Assume every effective memory address satisfies its Wasm alignment hint.
+    /// This is faster for trusted code but changes unaligned-access semantics.
+    pub assume_memory_alignment: bool,
     pub output_format: OutputFormat,
     pub global_name: String,
     pub limits: ResourceLimits,
@@ -66,6 +69,7 @@ impl Default for CompileOptions {
         Self {
             lowerings: Lowerings::empty(),
             preserve_traps: true,
+            assume_memory_alignment: false,
             output_format: OutputFormat::EsModule,
             global_name: "Wasm2AsmModule".into(),
             limits: ResourceLimits::default(),

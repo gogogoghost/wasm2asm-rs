@@ -102,6 +102,25 @@ fn fast_direct_fixed_memory_matches_native_wasm_for_valid_inputs() {
 }
 
 #[test]
+fn assumed_memory_alignment_respects_declared_hints() {
+    let wat = include_str!("../fixtures/differential/direct_fixed_memory_access.wat");
+    let options = CompileOptions {
+        preserve_traps: false,
+        assume_memory_alignment: true,
+        ..CompileOptions::default()
+    };
+    assert_differential(DifferentialCase {
+        name: "assumed memory alignment",
+        wat,
+        native_expression: "m.run()",
+        asm_expression: "m.run()",
+        native_imports: "{}",
+        asm_imports: "{}",
+        options,
+    });
+}
+
+#[test]
 fn memory64_access_and_growth_match_native_wasm() {
     let wat = include_str!("../fixtures/differential/memory64_access_and_growth.wat");
     assert_differential(DifferentialCase {

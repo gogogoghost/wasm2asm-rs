@@ -29,6 +29,7 @@ fn run() -> Result<(), String> {
     let options = CompileOptions {
         lowerings,
         preserve_traps: !cli.fast,
+        assume_memory_alignment: cli.assume_memory_alignment,
         output_format: cli.format.into(),
         global_name: cli.global_name,
         limits: ResourceLimits {
