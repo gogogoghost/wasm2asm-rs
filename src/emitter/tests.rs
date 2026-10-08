@@ -325,14 +325,14 @@ fn constants_and_return_abi_cover_every_value_kind() {
     }
     assert!(const_value(&ConstExpr::GlobalGet(1), &globals).is_err());
     assert_eq!(float32_literal(f32::NAN.to_bits()), "F(Na)");
-    assert_eq!(float32_literal(f32::INFINITY.to_bits()), "F(In)");
-    assert_eq!(float32_literal(f32::NEG_INFINITY.to_bits()), "F(-In)");
+    assert_eq!(float32_literal(f32::INFINITY.to_bits()), "F($inf)");
+    assert_eq!(float32_literal(f32::NEG_INFINITY.to_bits()), "F(-$inf)");
     assert_eq!(float32_literal((-0.0f32).to_bits()), "F(-0.0)");
     assert!(float32_literal(1.25f32.to_bits()).starts_with("F("));
     assert_eq!(float32_literal(1.0e20f32.to_bits()), "F(1.0e20)");
     assert_eq!(float64_literal(f64::NAN.to_bits()), "Na");
-    assert_eq!(float64_literal(f64::INFINITY.to_bits()), "In");
-    assert_eq!(float64_literal(f64::NEG_INFINITY.to_bits()), "-In");
+    assert_eq!(float64_literal(f64::INFINITY.to_bits()), "$inf");
+    assert_eq!(float64_literal(f64::NEG_INFINITY.to_bits()), "-$inf");
     assert_eq!(float64_literal((-0.0f64).to_bits()), "-0.0");
     assert_eq!(float64_literal(1.25f64.to_bits()), "1.25");
     assert_eq!(float64_literal(1.0e300f64.to_bits()), "1.0e300");

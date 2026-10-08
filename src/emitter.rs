@@ -990,7 +990,8 @@ impl<'a> ModuleCx<'a> {
         if self.direct_memory_size.is_some() {
             out.push_str(",heap");
         }
-        out.push_str("){\'use asm\';var F=stdlib.Math.fround,U=stdlib.Math.imul,C=stdlib.Math.clz32,Ma=stdlib.Math.abs,Mc=stdlib.Math.ceil,Mf=stdlib.Math.floor,Ms=stdlib.Math.sqrt,Na=stdlib.NaN,In=stdlib.Infinity,X=foreign.X,ct=foreign.ct,pc=foreign.pc,tr=foreign.tr,ne=foreign.ne,mn=foreign.mn,mx=foreign.mx,cs=foreign.cs,rf=foreign.rf,ri=foreign.ri,rd=foreign.rd,wr=foreign.wr,Y=foreign.Y,y=foreign.y,W=foreign.W,GH=foreign.GH,AA=foreign.AA,LI=foreign.LI,l=foreign.l,LF=foreign.LF,lf=foreign.lf,SI=foreign.SI,st=foreign.st,SF=foreign.SF,sf=foreign.sf,VL=foreign.VL,vl=foreign.vl,VS=foreign.VS,vs=foreign.vs,MS=foreign.MS,DD=foreign.DD,ED=foreign.ED,TS=foreign.TS,RS=foreign.RS,IG=foreign.IG,G=foreign.G,AB=foreign.AB,AC=foreign.AC,K=foreign.K,N=foreign.N,O=foreign.O,P=foreign.P,Q=foreign.Q,R=foreign.R,L=foreign.L,");
+        // The indirect-call helper for type 13 is In; keep Infinity in a separate namespace.
+        out.push_str("){\'use asm\';var F=stdlib.Math.fround,U=stdlib.Math.imul,C=stdlib.Math.clz32,Ma=stdlib.Math.abs,Mc=stdlib.Math.ceil,Mf=stdlib.Math.floor,Ms=stdlib.Math.sqrt,Na=stdlib.NaN,$inf=stdlib.Infinity,X=foreign.X,ct=foreign.ct,pc=foreign.pc,tr=foreign.tr,ne=foreign.ne,mn=foreign.mn,mx=foreign.mx,cs=foreign.cs,rf=foreign.rf,ri=foreign.ri,rd=foreign.rd,wr=foreign.wr,Y=foreign.Y,y=foreign.y,W=foreign.W,GH=foreign.GH,AA=foreign.AA,LI=foreign.LI,l=foreign.l,LF=foreign.LF,lf=foreign.lf,SI=foreign.SI,st=foreign.st,SF=foreign.SF,sf=foreign.sf,VL=foreign.VL,vl=foreign.vl,VS=foreign.VS,vs=foreign.vs,MS=foreign.MS,DD=foreign.DD,ED=foreign.ED,TS=foreign.TS,RS=foreign.RS,IG=foreign.IG,G=foreign.G,AB=foreign.AB,AC=foreign.AC,K=foreign.K,N=foreign.N,O=foreign.O,P=foreign.P,Q=foreign.Q,R=foreign.R,L=foreign.L,");
         if self.direct_memory_size.is_some() {
             out.push_str("$h8=new stdlib.Int8Array(heap),$u8=new stdlib.Uint8Array(heap),$h16=new stdlib.Int16Array(heap),$u16=new stdlib.Uint16Array(heap),$h32=new stdlib.Int32Array(heap),$u32=new stdlib.Uint32Array(heap),$f32=new stdlib.Float32Array(heap),$f64=new stdlib.Float64Array(heap),$ih=0,$rl=0,$rh=0,");
         } else if self.inline_i64_helpers {
@@ -6243,9 +6244,9 @@ fn float32_literal(bits: u32) -> String {
     if value.is_nan() {
         "F(Na)".into()
     } else if value == f32::INFINITY {
-        "F(In)".into()
+        "F($inf)".into()
     } else if value == f32::NEG_INFINITY {
-        "F(-In)".into()
+        "F(-$inf)".into()
     } else if bits == 0x80000000 {
         "F(-0.0)".into()
     } else {
@@ -6257,9 +6258,9 @@ fn float64_literal(bits: u64) -> String {
     if value.is_nan() {
         "Na".into()
     } else if value == f64::INFINITY {
-        "In".into()
+        "$inf".into()
     } else if value == f64::NEG_INFINITY {
-        "-In".into()
+        "-$inf".into()
     } else if bits == 0x8000000000000000 {
         "-0.0".into()
     } else {
@@ -7559,7 +7560,8 @@ function ng(l,h){l=l|0;h=h|0;l=(~l+1)|0;hi=(~h+(l==0))|0;return l}
 function ge(al,ah,bl,bh){al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;return ((ah>>>0)>(bh>>>0)||ah==bh&&(al>>>0)>=(bl>>>0))|0}
 function dv(al,ah,bl,bh,sg,rm){al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;sg=sg|0;rm=rm|0;var nq=0,nr=0,i=0,ql=0,qh=0,rl=0,rh=0,bit=0,t=0;if(!(bl|bh))X();if(sg&&ah==-2147483648&&!al&&bh==-1&&bl==-1&&!rm)X();if(sg){nq=(ah<0)^(bh<0);nr=ah<0;if(ah<0){al=ng(al,ah)|0;ah=hi|0}if(bh<0){bl=ng(bl,bh)|0;bh=hi|0}}for(i=63;i>=0;i--){bit=i<32?(al>>>i)&1:(ah>>>(i-32))&1;rh=(rh<<1)|(rl>>>31);rl=(rl<<1)|bit;if(ge(rl,rh,bl,bh)){t=rl-bl|0;rh=(rh-bh-((rl>>>0)<(bl>>>0)))|0;rl=t;if(i<32)ql=ql|(1<<i);else qh=qh|(1<<(i-32))}}if(rm){if(nr){rl=ng(rl,rh)|0;rh=hi|0}hi=rh;return rl}if(nq){ql=ng(ql,qh)|0;qh=hi|0}hi=qh;return ql}
 
-function W(o,al,ah,bl,bh){o=o|0;al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;var l=0,h=0,n=0,a0=0,a1=0,a2=0,a3=0,b0=0,b1=0,b2=0,b3=0,c0=0,c1=0,c2=0,c3=0;if(o==0){l=al+bl|0;hi=ah+bh+((l>>>0)<(al>>>0))|0;return l}if(o==1){l=al-bl|0;hi=ah-bh-((al>>>0)<(bl>>>0))|0;return l}if(o==2){a0=al&65535;a1=al>>>16;a2=ah&65535;a3=ah>>>16;b0=bl&65535;b1=bl>>>16;b2=bh&65535;b3=bh>>>16;c0=a0*b0;c1=a1*b0+a0*b1+M.floor(c0/65536);c2=a2*b0+a1*b1+a0*b2+M.floor(c1/65536);c3=a3*b0+a2*b1+a1*b2+a0*b3+M.floor(c2/65536);l=(c0&65535)|((c1&65535)<<16);hi=(c2&65535)|((c3&65535)<<16);return l}if(o==3){hi=ah&bh;return al&bl}if(o==4){hi=ah|bh;return al|bl}if(o==5){hi=ah^bh;return al^bl}if(o>=11)return dv(al,ah,bl,bh,(o==11||o==13)|0,(o==13||o==14)|0)|0;n=bl&63;if(!n){hi=ah;return al}if(o==6){if(n<32){hi=(ah<<n)|(al>>>(32-n));return al<<n}hi=al<<(n-32);return 0}if(o==7){if(n<32){hi=ah>>n;return (al>>>n)|(ah<<(32-n))}hi=ah>>31;return ah>>(n-32)}if(o==8){if(n<32){hi=ah>>>n;return (al>>>n)|(ah<<(32-n))}hi=0;return ah>>>(n-32)}if(o==9){if(n<32){hi=(ah<<n)|(al>>>(32-n));return (al<<n)|(ah>>>(32-n))}n=n-32;hi=(al<<n)|(ah>>>(32-n));return (ah<<n)|(al>>>(32-n))}if(n<32){hi=(ah>>>n)|(al<<(32-n));return (al>>>n)|(ah<<(32-n))}n=n-32;hi=(al>>>n)|(ah<<(32-n));return (ah>>>n)|(al<<(32-n))}
+// Rotations by 32 swap halves; JS shifts mask counts to 5 bits, so shifting by 32 is not zero.
+function W(o,al,ah,bl,bh){o=o|0;al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;var l=0,h=0,n=0,a0=0,a1=0,a2=0,a3=0,b0=0,b1=0,b2=0,b3=0,c0=0,c1=0,c2=0,c3=0;if(o==0){l=al+bl|0;hi=ah+bh+((l>>>0)<(al>>>0))|0;return l}if(o==1){l=al-bl|0;hi=ah-bh-((al>>>0)<(bl>>>0))|0;return l}if(o==2){a0=al&65535;a1=al>>>16;a2=ah&65535;a3=ah>>>16;b0=bl&65535;b1=bl>>>16;b2=bh&65535;b3=bh>>>16;c0=a0*b0;c1=a1*b0+a0*b1+M.floor(c0/65536);c2=a2*b0+a1*b1+a0*b2+M.floor(c1/65536);c3=a3*b0+a2*b1+a1*b2+a0*b3+M.floor(c2/65536);l=(c0&65535)|((c1&65535)<<16);hi=(c2&65535)|((c3&65535)<<16);return l}if(o==3){hi=ah&bh;return al&bl}if(o==4){hi=ah|bh;return al|bl}if(o==5){hi=ah^bh;return al^bl}if(o>=11)return dv(al,ah,bl,bh,(o==11||o==13)|0,(o==13||o==14)|0)|0;n=bl&63;if(!n){hi=ah;return al}if(o==6){if(n<32){hi=(ah<<n)|(al>>>(32-n));return al<<n}hi=al<<(n-32);return 0}if(o==7){if(n<32){hi=ah>>n;return (al>>>n)|(ah<<(32-n))}hi=ah>>31;return ah>>(n-32)}if(o==8){if(n<32){hi=ah>>>n;return (al>>>n)|(ah<<(32-n))}hi=0;return ah>>>(n-32)}if(n==32){hi=al;return ah}if(o==9){if(n<32){hi=(ah<<n)|(al>>>(32-n));return (al<<n)|(ah>>>(32-n))}n=n-32;hi=(al<<n)|(ah>>>(32-n));return (ah<<n)|(al>>>(32-n))}if(n<32){hi=(ah>>>n)|(al<<(32-n));return (al>>>n)|(ah<<(32-n))}n=n-32;hi=(al>>>n)|(ah<<(32-n));return (ah>>>n)|(al<<(32-n))}
 "#;
 
 const CHECKED_ADDRESS_HELPER: &str = r#"function AA(k,l,h,o,w){k=k|0;l=l|0;h=h|0;o=+o;w=w|0;var x=0;if(h||o>4294967295)X();x=(l>>>0)+o;if(x<0||x+w>s[k])X();return (a[k]+x)|0}"#;

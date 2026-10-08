@@ -72,3 +72,18 @@ fn table64_operations_match_native_wasm() {
         options: Default::default(),
     });
 }
+
+#[test]
+fn indirect_call_helper_does_not_shadow_infinity() {
+    // Type index 13 produces helper In, which must not alias the Infinity import.
+    let wat = include_str!("../fixtures/differential/indirect_call_infinity_name.wat");
+    for preserve_traps in [true, false] {
+        let mut case = DifferentialCase::same(
+            "indirect call helper and Infinity",
+            wat,
+            "[m.call(41), m.infinity(), m.negativeInfinity(), m.floatInfinity(), m.floatNegativeInfinity()]",
+        );
+        case.options.preserve_traps = preserve_traps;
+        assert_differential(case);
+    }
+}

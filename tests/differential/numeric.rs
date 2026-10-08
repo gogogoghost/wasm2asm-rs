@@ -81,3 +81,44 @@ fn numeric_conversions_match_native_wasm() {
         options: Default::default(),
     });
 }
+
+#[test]
+fn i64_rotation_boundaries_match_native_wasm() {
+    let wat = include_str!("../fixtures/differential/i64_rotation_boundaries.wat");
+    // Different halves expose the rotate-by-32 bug; include signed halves and
+    // counts outside 0..64 to check Wasm's masking of the shift count.
+    let expression = r#"(()=>{
+        var values = [0n, 1n, -1n, 0x0123456789abcdefn,
+            0x76543210fedcba98n, 0xffffffff00000000n,
+            0x00000000ffffffffn, 0x8000000000000001n];
+        var counts = Array.from({length:128}, (_, i) => BigInt(i))
+            .concat([-1n, -32n, -64n, -96n, 0x100000020n]);
+        return values.map(value => ({
+            constant: CONSTANT_CALL,
+            dynamic: counts.map(count => DYNAMIC_CALL)
+        }));
+    })()"#;
+    let native_expression = expression
+        .replace("CONSTANT_CALL", "m.constant_counts(value).map(i64Pair)")
+        .replace("DYNAMIC_CALL", "m.ops(value, count).map(i64Pair)");
+    let asm_expression = expression
+        .replace("CONSTANT_CALL", "m.constant_counts(...i64Pair(value))")
+        .replace(
+            "DYNAMIC_CALL",
+            "m.ops(...i64Pair(value), ...i64Pair(count))",
+        );
+    for preserve_traps in [true, false] {
+        assert_differential(DifferentialCase {
+            name: "i64 rotation boundaries",
+            wat,
+            native_expression: &native_expression,
+            asm_expression: &asm_expression,
+            native_imports: "{}",
+            asm_imports: "{}",
+            options: CompileOptions {
+                preserve_traps,
+                ..CompileOptions::default()
+            },
+        });
+    }
+}
