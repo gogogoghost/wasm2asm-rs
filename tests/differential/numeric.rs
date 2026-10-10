@@ -2,6 +2,54 @@ use crate::common::{DifferentialCase, assert_differential};
 use wasm2asm::CompileOptions;
 
 #[test]
+fn f64_local_control_flow_preserves_parameter_and_local_bits() {
+    let wat = include_str!("../fixtures/differential/f64_local_control_flow.wat");
+    let expression = r#"(()=>{
+        var values=[0,-0,1,-1,900,8000,900.25,Infinity,-Infinity];
+        var bits=[0n,0x8000000000000000n,0x7ff0000000000000n,
+            0xfff0000000000000n,0x7ff0000000000001n,0x7ff8123456789abcn,
+            0xfff123456789abcdn,0x0123456789abcdefn];
+        var result=[];
+        for (var a of values) for (var b of values) {
+            for (var take of [0,1]) for (var name of ['choose','store_choice','merge'])
+                result.push(PAIR(m[name](a,b,take)));
+            for (var n of [1,2,3,4]) result.push(PAIR(m.loop_param(a,b,n)));
+        }
+        for (var value of bits) {
+            for (var n of [1,2,3,4]) result.push(PAIR(m.loop_local(BITS,n)));
+            for (var take of [0,1]) result.push(PAIR(m.branch_local(BITS,take)));
+        }
+        return result;
+    })()"#;
+    let native_expression = expression
+        .replace("PAIR(", "i64Pair(")
+        .replace("BITS", "value");
+    let asm_expression = expression
+        .replace("PAIR(", "pair(")
+        .replace("BITS", "...i64Pair(value)")
+        .replace(
+            "var result=[];",
+            "function pair(low){return [low,m.getTempRet0()]} var result=[];",
+        );
+    for (preserve_traps, assume_memory_alignment) in [(true, false), (false, false), (false, true)]
+    {
+        assert_differential(DifferentialCase {
+            name: "f64 local control flow",
+            wat,
+            native_expression: &native_expression,
+            asm_expression: &asm_expression,
+            native_imports: "{}",
+            asm_imports: "{}",
+            options: CompileOptions {
+                preserve_traps,
+                assume_memory_alignment,
+                ..Default::default()
+            },
+        });
+    }
+}
+
+#[test]
 fn i32_numeric_operations_match_native_wasm() {
     let wat = include_str!("../fixtures/differential/i32_numeric_operations.wat");
     assert_differential(DifferentialCase::same(

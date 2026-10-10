@@ -2015,6 +2015,20 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     }
 
     fn compile(mut self) -> Result<(String, Vec<String>), CompileError> {
+        // A bit shadow is runtime state, not a fact about the last assignment
+        // visited by the emitter. Allocate local shadows before emitting any
+        // branch or loop: an earlier read can execute after a later write over
+        // a back edge, and a conditional write need not execute at all.
+        for instruction in &self.function.body {
+            if let Op::LocalSet(index) | Op::LocalTee(index) = instruction.op {
+                if let Value::F64(expression) = self.local(index)? {
+                    if !self.f64_bits.contains_key(expression) {
+                        let expression = expression.clone();
+                        self.ensure_f64_bits(&expression);
+                    }
+                }
+            }
+        }
         for (instruction_index, instruction) in self.function.body.iter().enumerate() {
             self.emit_instruction(instruction_index, instruction)?;
         }
@@ -2059,6 +2073,16 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         }
         if has_declarations {
             out.push(';');
+        }
+        // Wasm locals start at +0, matching their zero-initialized shadows.
+        // Parameters instead start with the caller's value, even on paths that
+        // skip every local.set/local.tee in the function.
+        for param in params {
+            if let Value::F64(expression) = param {
+                if let Some((low, high)) = self.f64_bits.get(expression) {
+                    write!(out, "{low}=rd(+({expression}))|0;{high}=GH()|0;").unwrap();
+                }
+            }
         }
         out.push_str(&self.body);
         if self.ty.results.is_empty() {
