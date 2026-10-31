@@ -170,3 +170,53 @@ fn i64_rotation_boundaries_match_native_wasm() {
         });
     }
 }
+
+#[test]
+fn low_word_left_shifts_keep_count_masking_effects_and_load_traps() {
+    let wat = include_str!("../fixtures/differential/i64_low_word_shifts.wat");
+    let expression = r#"(()=>{
+        var values = [0n,1n,-1n,0x7fffffffn,0x80000000n,0xffffffffn,
+            0x100000000n,0x8123456789abcdefn];
+        var counts = [0n,1n,31n,32n,33n,63n,64n,65n,127n,-1n,-32n,
+            0x100000001n,0x8000000000000020n];
+        var result = values.map(value => ({
+            constant: CONSTANT,
+            dynamic: counts.map(count => DYNAMIC)
+        }));
+        result.push(counts.map(count => EFFECTFUL));
+        result.push(counts.map(count => LOAD));
+        if (STRICT) {
+            var trapped = false;
+            try { INVALID_LOAD; } catch (error) { trapped = true; }
+            result.push(trapped);
+        }
+        return result;
+    })()"#;
+    let native_expression = expression
+        .replace("CONSTANT", "m.constant(value)")
+        .replace("DYNAMIC", "m.dynamic(value,count)")
+        .replace("EFFECTFUL", "m.effectful(count)")
+        .replace("INVALID_LOAD", "m.load_shift(65530,32n)")
+        .replace("LOAD", "m.load_shift(65528,count)");
+    let asm_expression = expression
+        .replace("CONSTANT", "m.constant(...i64Pair(value))")
+        .replace("DYNAMIC", "m.dynamic(...i64Pair(value),...i64Pair(count))")
+        .replace("EFFECTFUL", "m.effectful(...i64Pair(count))")
+        .replace("INVALID_LOAD", "m.load_shift(65530,...i64Pair(32n))")
+        .replace("LOAD", "m.load_shift(65528,...i64Pair(count))");
+    for preserve_traps in [true, false] {
+        let strict = if preserve_traps { "true" } else { "false" };
+        assert_differential(DifferentialCase {
+            name: "low-word left shifts",
+            wat,
+            native_expression: &native_expression.replace("STRICT", strict),
+            asm_expression: &asm_expression.replace("STRICT", strict),
+            native_imports: "{}",
+            asm_imports: "{}",
+            options: CompileOptions {
+                preserve_traps,
+                ..CompileOptions::default()
+            },
+        });
+    }
+}

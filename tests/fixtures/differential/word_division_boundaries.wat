@@ -1,0 +1,9 @@
+(module
+  (func (export "div_u") (param i64 i64) (result i64)
+    local.get 0 local.get 1 i64.div_u)
+  (func (export "rem_u") (param i64 i64) (result i64)
+    local.get 0 local.get 1 i64.rem_u)
+  (func (export "div_s") (param i64 i64) (result i64)
+    local.get 0 local.get 1 i64.div_s)
+  (func (export "rem_s") (param i64 i64) (result i64)
+    local.get 0 local.get 1 i64.rem_s))

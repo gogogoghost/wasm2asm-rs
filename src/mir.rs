@@ -41,6 +41,8 @@ pub(crate) struct FunctionPlan {
     i64_low_only: Vec<bool>,
     i32_unsigned_max: Vec<Option<u32>>,
     i64_unsigned_max: Vec<Option<u64>>,
+    f64_bits_required: Vec<bool>,
+    f64_local_bits_required: Vec<bool>,
 }
 
 impl FunctionPlan {
@@ -73,6 +75,14 @@ impl FunctionPlan {
 
     pub(crate) fn i64_unsigned_max(&self, instruction: usize) -> Option<u64> {
         self.i64_unsigned_max.get(instruction).copied().flatten()
+    }
+
+    pub(crate) fn f64_bits_required(&self, instruction: usize) -> bool {
+        self.f64_bits_required.get(instruction).copied().unwrap_or(true)
+    }
+
+    pub(crate) fn f64_local_bits_required(&self, local: usize) -> bool {
+        self.f64_local_bits_required.get(local).copied().unwrap_or(true)
     }
 }
 
@@ -154,6 +164,9 @@ struct FunctionMir {
     values: Vec<ValueData>,
     control_values: Vec<Option<ValueId>>,
     i64_roots: Vec<(ValueId, I64Demand)>,
+    f64_roots: Vec<ValueId>,
+    f64_local_values: Vec<Vec<ValueId>>,
+    f64_uncertain_locals: Vec<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -191,12 +204,13 @@ enum Pass {
     ConstantPropagation,
     PlanIntegerRanges,
     PlanI64Demands,
+    PlanF64Demands,
     CanonicalizeSwitches,
     PlanReciprocalDivisions,
 }
 
 struct PassManager {
-    passes: [Pass; 6],
+    passes: [Pass; 7],
 }
 
 impl Default for PassManager {
@@ -207,6 +221,7 @@ impl Default for PassManager {
                 Pass::ConstantPropagation,
                 Pass::PlanIntegerRanges,
                 Pass::PlanI64Demands,
+                Pass::PlanF64Demands,
                 Pass::CanonicalizeSwitches,
                 Pass::PlanReciprocalDivisions,
             ],
@@ -224,6 +239,8 @@ impl PassManager {
             i64_low_only: vec![false; function.body.len()],
             i32_unsigned_max: vec![None; function.body.len()],
             i64_unsigned_max: vec![None; function.body.len()],
+            f64_bits_required: vec![false; function.body.len()],
+            f64_local_bits_required: vec![false; mir.f64_local_values.len()],
         };
         let mut constants = Vec::new();
         for pass in self.passes {
@@ -240,6 +257,7 @@ impl PassManager {
                 }
                 Pass::PlanIntegerRanges => plan_integer_ranges(mir, &mut plan),
                 Pass::PlanI64Demands => plan_i64_demands(mir, &mut plan),
+                Pass::PlanF64Demands => plan_f64_demands(mir, &mut plan),
                 Pass::CanonicalizeSwitches => {
                     plan_switch_canonicalization(mir, function, &constants, &mut plan)
                 }
@@ -276,6 +294,9 @@ impl FunctionMir {
             values: Vec::new(),
             control_values: vec![None; function.body.len()],
             i64_roots: Vec::new(),
+            f64_roots: Vec::new(),
+            f64_local_values: Vec::new(),
+            f64_uncertain_locals: Vec::new(),
         };
         mir.build_values(module, function_index, function)?;
         Ok(mir)
@@ -291,11 +312,13 @@ impl FunctionMir {
         self.push_value(ty, ValueDef::Opaque, source)
     }
 
-    fn demand_i64(&mut self, value: Option<ValueId>, demand: I64Demand) {
-        if let Some(value) = value
-            && self.values[value.0].ty == ValType::I64
-        {
-            self.i64_roots.push((value, demand));
+    fn demand_bits(&mut self, value: Option<ValueId>, demand: I64Demand) {
+        if let Some(value) = value {
+            match self.values[value.0].ty {
+                ValType::I64 => self.i64_roots.push((value, demand)),
+                ValType::F64 => self.f64_roots.push(value),
+                _ => {}
+            }
         }
     }
 
@@ -308,6 +331,8 @@ impl FunctionMir {
         let function_type = module_function_type(module, function_index)?;
         let mut local_types = function_type.params.clone();
         local_types.extend_from_slice(&function.locals);
+        self.f64_local_values = vec![Vec::new(); local_types.len()];
+        self.f64_uncertain_locals = vec![false; local_types.len()];
         let mut local_versions = vec![0u32; local_types.len()];
         for block_index in 0..self.blocks.len() {
             let instructions = self.blocks[block_index].instructions.clone();
@@ -378,7 +403,10 @@ impl FunctionMir {
                             } else {
                                 I64Demand::Full
                             };
-                            self.demand_i64(Some(operand), demand);
+                            self.demand_bits(Some(operand), demand);
+                        }
+                        if matches!(op, UnaryOp::I64ReinterpretF64) {
+                            self.demand_bits(Some(operand), I64Demand::Full);
                         }
                         let value = self.push_value(
                             result_ty,
@@ -392,8 +420,13 @@ impl FunctionMir {
                         let right = pop_or_opaque(self, &mut stack, operand_ty, instruction_index);
                         let left = pop_or_opaque(self, &mut stack, operand_ty, instruction_index);
                         if operand_ty == ValType::I64 && binary_result_type(*op) != ValType::I64 {
-                            self.demand_i64(Some(left), I64Demand::Full);
-                            self.demand_i64(Some(right), I64Demand::Full);
+                            self.demand_bits(Some(left), I64Demand::Full);
+                            self.demand_bits(Some(right), I64Demand::Full);
+                        }
+                        // The sign of even a NaN is observable through copysign,
+                        // regardless of whether its result has raw-bit users.
+                        if matches!(op, BinaryOp::F64Copysign) {
+                            self.demand_bits(Some(right), I64Demand::Full);
                         }
                         let value = self.push_value(
                             binary_result_type(*op),
@@ -411,10 +444,15 @@ impl FunctionMir {
                             .checked_add(1)
                             .ok_or_else(|| internal("MIR local version overflow"))?;
                         local_values[*index as usize] = value;
+                        if let Some(value) = value
+                            && self.values[value.0].ty == ValType::F64
+                        {
+                            self.f64_local_values[*index as usize].push(value);
+                        }
                     }
                     Op::GlobalSet(_) => {
                         let value = stack.pop();
-                        self.demand_i64(value, I64Demand::Full);
+                        self.demand_bits(value, I64Demand::Full);
                     }
                     Op::Drop => {
                         stack.pop();
@@ -431,6 +469,9 @@ impl FunctionMir {
                             .checked_add(1)
                             .ok_or_else(|| internal("MIR local version overflow"))?;
                         local_values[*index as usize] = Some(value);
+                        if ty == ValType::F64 {
+                            self.f64_local_values[*index as usize].push(value);
+                        }
                         let alias = self.push_value(
                             ty,
                             ValueDef::LocalGet {
@@ -451,8 +492,8 @@ impl FunctionMir {
                         stack.pop();
                         let right = stack.pop();
                         let left = stack.pop();
-                        self.demand_i64(left, I64Demand::Full);
-                        self.demand_i64(right, I64Demand::Full);
+                        self.demand_bits(left, I64Demand::Full);
+                        self.demand_bits(right, I64Demand::Full);
                         let result_ty = ty
                             .or_else(|| left.map(|value| self.values[value.0].ty))
                             .or_else(|| right.map(|value| self.values[value.0].ty))
@@ -482,9 +523,9 @@ impl FunctionMir {
                             } else {
                                 I64Demand::Full
                             };
-                        self.demand_i64(value, demand);
+                        self.demand_bits(value, demand);
                         let address = stack.pop();
-                        self.demand_i64(address, I64Demand::Full);
+                        self.demand_bits(address, I64Demand::Full);
                     }
                     Op::MemorySize(memory) => {
                         let ty = memory_index_type(module, *memory)?;
@@ -493,7 +534,7 @@ impl FunctionMir {
                     }
                     Op::MemoryGrow(memory) => {
                         let delta = stack.pop();
-                        self.demand_i64(delta, I64Demand::Full);
+                        self.demand_bits(delta, I64Demand::Full);
                         let ty = memory_index_type(module, *memory)?;
                         let value = self.opaque(ty, instruction_index);
                         stack.push(value);
@@ -576,7 +617,7 @@ impl FunctionMir {
                     Op::Simd(op) => apply_simd(self, op, &mut stack, instruction_index),
                     Op::Return => {
                         for value in &stack {
-                            self.demand_i64(Some(*value), I64Demand::Full);
+                            self.demand_bits(Some(*value), I64Demand::Full);
                         }
                     }
                     Op::Block(_)
@@ -594,7 +635,7 @@ impl FunctionMir {
             // Block-local dataflow cannot follow stack values past CFG edges.
             // This also covers implicit function returns without an Op::Return.
             for value in stack {
-                self.demand_i64(Some(value), I64Demand::Full);
+                self.demand_bits(Some(value), I64Demand::Full);
             }
             if self.blocks[block_index]
                 .terminator
@@ -602,8 +643,13 @@ impl FunctionMir {
                 .next()
                 .is_some()
             {
-                for value in local_values.into_iter().flatten() {
-                    self.demand_i64(Some(value), I64Demand::Full);
+                for (local, value) in local_values.into_iter().enumerate() {
+                    if let Some(value) = value {
+                        if self.values[value.0].ty == ValType::F64 {
+                            self.f64_uncertain_locals[local] = true;
+                        }
+                        self.demand_bits(Some(value), I64Demand::Full);
+                    }
                 }
             }
         }
@@ -1275,6 +1321,45 @@ fn plan_i64_demands(mir: &FunctionMir, plan: &mut FunctionPlan) {
     }
 }
 
+fn plan_f64_demands(mir: &FunctionMir, plan: &mut FunctionPlan) {
+    let mut demanded = vec![false; mir.values.len()];
+    let mut queue = VecDeque::from_iter(mir.f64_roots.iter().copied());
+    // Local shadows are runtime state across assignments and back edges. Once
+    // a local needs bits, retain every assignment, not only a nearby alias.
+    for (local, uncertain) in mir.f64_uncertain_locals.iter().copied().enumerate() {
+        if uncertain {
+            plan.f64_local_bits_required[local] = true;
+            queue.extend(mir.f64_local_values[local].iter().copied());
+        }
+    }
+    while let Some(value) = queue.pop_front() {
+        if demanded[value.0] {
+            continue;
+        }
+        demanded[value.0] = true;
+        plan.f64_bits_required[mir.values[value.0].source] = true;
+        match mir.values[value.0].def {
+            ValueDef::LocalGet { local, alias, .. } => {
+                let local = local as usize;
+                if !plan.f64_local_bits_required[local] {
+                    plan.f64_local_bits_required[local] = true;
+                    queue.extend(mir.f64_local_values[local].iter().copied());
+                }
+                queue.extend(alias);
+            }
+            ValueDef::Unary(UnaryOp::F64Abs | UnaryOp::F64Neg, operand) => {
+                queue.push_back(operand);
+            }
+            ValueDef::Binary(BinaryOp::F64Copysign, left, right) => {
+                queue.extend([left, right]);
+            }
+            // Other arithmetic computes a new number rather than preserving
+            // input payload bits. Sign-only operations above are bitwise.
+            _ => {}
+        }
+    }
+}
+
 fn plan_constant_branches(
     mir: &FunctionMir,
     function: &Function,
@@ -1499,7 +1584,7 @@ fn pop_many(stack: &mut Vec<ValueId>, count: usize) {
 fn pop_many_full(mir: &mut FunctionMir, stack: &mut Vec<ValueId>, count: usize) {
     for _ in 0..count {
         let value = stack.pop();
-        mir.demand_i64(value, I64Demand::Full);
+        mir.demand_bits(value, I64Demand::Full);
     }
 }
 
@@ -1511,8 +1596,8 @@ fn apply_call(
 ) {
     for param in ty.params.iter().rev() {
         let value = stack.pop();
-        if *param == ValType::I64 {
-            mir.demand_i64(value, I64Demand::Full);
+        if matches!(param, ValType::I64 | ValType::F64) {
+            mir.demand_bits(value, I64Demand::Full);
         }
     }
     for &result in &ty.results {
@@ -1538,6 +1623,9 @@ fn apply_simd(mir: &mut FunctionMir, op: &SimdOp, stack: &mut Vec<ValueId>, sour
         V128Load(_) => (1, Some(ValType::V128)),
         V128Store(_) => (2, None),
         Other(_) => {
+            for value in stack.iter().copied() {
+                mir.demand_bits(Some(value), I64Demand::Full);
+            }
             stack.clear();
             return;
         }

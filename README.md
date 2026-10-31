@@ -203,6 +203,23 @@ SIMD and typed function references are high-cost lowerings and are disabled by d
   backward overlap retain memmove semantics without temporary subarray views;
   strict-mode invalid ranges fail before modifying the destination.
 
+### Numeric lowering invariants
+
+- f64 raw-word shadows are demand-driven. Numeric-only loads, locals and call
+  results omit unused captures; raw observers and mixed control-flow assignments
+  conservatively retain the required words.
+- Demanded f64 abs/neg/copysign transform existing raw words without changing
+  signaling/quiet NaN payloads or signed zero. Inputs without raw shadows keep
+  the original numeric-operation-before-host-boxing order. Host-created NaN
+  payloads/signs remain subject to JavaScript/asm boundary canonicalization;
+  exact payload regressions seed their bits inside WebAssembly.
+- i64 division by a normalized 32-bit divisor uses two radix-65536 quotient
+  digits, with exact integer intermediates below 2^48. Wider divisors retain the
+  full-width path; zero-divisor and signed MIN/-1 checks remain intact.
+- Low-word-only i64 left shifts retain modulo-64 count semantics. The high-word
+  computation is omitted only for discardable operands; strict load bounds and
+  operand side effects remain observable.
+
 
 ## Compatibility
 

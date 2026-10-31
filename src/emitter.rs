@@ -1966,6 +1966,7 @@ struct FunctionCompiler<'a, 'm> {
     instruction_temps: Vec<usize>,
     declarations: Vec<(String, ValType)>,
     f64_bits: BTreeMap<String, (String, String)>,
+    numeric_f64_locals: BTreeSet<String>,
     i32_unsigned_max: BTreeMap<String, u32>,
     plan: FunctionPlan,
     division_caches: BTreeMap<usize, DivisionCache>,
@@ -2003,6 +2004,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             temp_slots: Vec::new(),
             instruction_temps: Vec::new(),
             f64_bits: BTreeMap::new(),
+            numeric_f64_locals: BTreeSet::new(),
             i32_unsigned_max: BTreeMap::new(),
             division_caches: BTreeMap::new(),
             condition_inversions: BTreeMap::new(),
@@ -2015,6 +2017,13 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
     }
 
     fn compile(mut self) -> Result<(String, Vec<String>), CompileError> {
+        for (local, value) in self.locals.iter().enumerate() {
+            if let Value::F64(expression) = value
+                && !self.plan.f64_local_bits_required(local)
+            {
+                self.numeric_f64_locals.insert(expression.clone());
+            }
+        }
         // A bit shadow is runtime state, not a fact about the last assignment
         // visited by the emitter. Allocate local shadows before emitting any
         // branch or loop: an earlier read can execute after a later write over
@@ -2022,7 +2031,9 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         for instruction in &self.function.body {
             if let Op::LocalSet(index) | Op::LocalTee(index) = instruction.op {
                 if let Value::F64(expression) = self.local(index)? {
-                    if !self.f64_bits.contains_key(expression) {
+                    if self.plan.f64_local_bits_required(index as usize)
+                        && !self.f64_bits.contains_key(expression)
+                    {
                         let expression = expression.clone();
                         self.ensure_f64_bits(&expression);
                     }
@@ -2182,17 +2193,17 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 self.emit_br_table(targets, *default, self.plan.switch(instruction_index))?
             }
             Return => self.emit_function_return(true)?,
-            Call(index) => self.emit_call(*index, false)?,
-            ReturnCall(index) => self.emit_call(*index, true)?,
+            Call(index) => self.emit_call(instruction_index, *index, false)?,
+            ReturnCall(index) => self.emit_call(instruction_index, *index, true)?,
             CallIndirect {
                 type_index,
                 table_index,
-            } => self.emit_indirect(*type_index, *table_index, false, false)?,
+            } => self.emit_indirect(instruction_index, *type_index, *table_index, false, false)?,
             ReturnCallIndirect {
                 type_index,
                 table_index,
-            } => self.emit_indirect(*type_index, *table_index, true, false)?,
-            CallRef(type_index) => self.emit_indirect(*type_index, 0, false, true)?,
+            } => self.emit_indirect(instruction_index, *type_index, *table_index, true, false)?,
+            CallRef(type_index) => self.emit_indirect(instruction_index, *type_index, 0, false, true)?,
             GlobalGet(index) => {
                 let value = self
                     .module
@@ -2708,7 +2719,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         Ok(())
     }
 
-    fn emit_call(&mut self, index: u32, tail: bool) -> Result<(), CompileError> {
+    fn emit_call(&mut self, instruction_index: usize, index: u32, tail: bool) -> Result<(), CompileError> {
         let ty = self.module.function_type(index as usize)?.clone();
         let args = self.pop_types(&ty.params)?;
         if tail
@@ -2733,6 +2744,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         );
         let result_maximum = self.module.i32_result_maxima[index as usize];
         self.finish_call(
+            instruction_index,
             &ty.results,
             call,
             tail,
@@ -2749,6 +2761,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
 
     fn emit_indirect(
         &mut self,
+        instruction_index: usize,
         type_index: u32,
         table_index: u32,
         tail: bool,
@@ -2800,7 +2813,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                         flat.join(",")
                     )
                 };
-                self.finish_call(&ty.results, call, true, false)?;
+                self.finish_call(instruction_index, &ty.results, call, true, false)?;
                 self.body.push('}');
                 self.reachable = true;
             }
@@ -2823,11 +2836,12 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         } else {
             format!("{function}({callee},{})", flat.join(","))
         };
-        self.finish_call(&ty.results, call, tail, false)
+        self.finish_call(instruction_index, &ty.results, call, tail, false)
     }
 
     fn finish_call(
         &mut self,
+        instruction_index: usize,
         results: &[ValType],
         call: String,
         tail: bool,
@@ -2848,7 +2862,9 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let slots = self.module.return_slots_for(results);
         let values = call_result_values(results, &call, &slots, &mut self.body, primary, imported)?;
         for value in &values {
-            if let Value::F64(expression) = value {
+            if let Value::F64(expression) = value
+                && (tail || self.plan.f64_bits_required(instruction_index))
+            {
                 let (low, high) = self.ensure_f64_bits(expression);
                 write!(self.body, "{low}=rd(+({expression}))|0;{high}=GH()|0;").unwrap();
             }
@@ -2995,7 +3011,19 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 Value::F32(format!("F(+ne({}))", compact_float_argument(&x)))
             }
             F32Sqrt => Value::F32(format!("F(Ms({}))", expect_f32(value)?)),
+            F64Abs if self.plan.f64_bits_required(instruction_index)
+                && self.f64_bits_for(&value).is_some() =>
+            {
+                let (low, high) = self.f64_bits_for(&value).unwrap();
+                self.f64_from_words(low, format!("({high})&2147483647"))
+            }
             F64Abs => Value::F64(format!("+Ma({})", expect_f64(value)?)),
+            F64Neg if self.plan.f64_bits_required(instruction_index)
+                && self.f64_bits_for(&value).is_some() =>
+            {
+                let (low, high) = self.f64_bits_for(&value).unwrap();
+                self.f64_from_words(low, format!("({high})^-2147483648"))
+            }
             F64Neg => {
                 let x = expect_f64(value)?;
                 Value::F64(format!("-{}", compact_operand(&x)))
@@ -3094,11 +3122,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             }
             F64ReinterpretI64 => {
                 let (low, high) = expect_i64(value)?;
-                let low = compact_i32(&low);
-                let high = compact_i32(&high);
-                let expression = format!("+wr({low},{high})");
-                self.f64_bits.insert(expression.clone(), (low, high));
-                Value::F64(expression)
+                self.f64_from_words(low, high)
             }
             I32Extend8S => Value::I32(format!("(({})<<24)>>24", value.i32_expr()?)),
             I32Extend16S => Value::I32(format!("(({})<<16)>>16", value.i32_expr()?)),
@@ -3230,7 +3254,27 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 F32Copysign => float_helper(left, right, "cs", true)?,
                 F64Min => float_helper(left, right, "mn", false)?,
                 F64Max => float_helper(left, right, "mx", false)?,
-                F64Copysign => float_helper(left, right, "cs", false)?,
+                F64Copysign if self.plan.f64_bits_required(instruction_index)
+                    && self.f64_bits_for(&left).is_some()
+                    && self.f64_bits_for(&right).is_some() =>
+                {
+                    let (low, high) = self.f64_bits_for(&left).unwrap();
+                    let (_, sign) = self.f64_bits_for(&right).unwrap();
+                    self.f64_from_words(
+                        low,
+                        format!("(({high})&2147483647)|(({sign})&-2147483648)"),
+                    )
+                }
+                F64Copysign => {
+                    let sign = if let Some((_, high)) = self.f64_bits_for(&right) {
+                        // Pass a finite sign representative so even a raw
+                        // negative NaN's sign survives numeric-only lowering.
+                        Value::F64(format!("+((({high})>>31)|1)"))
+                    } else {
+                        right
+                    };
+                    float_helper(left, sign, "cs", false)?
+                }
             }
         };
         if let Some((comparison, inverted)) = inverted_comparison
@@ -3527,6 +3571,16 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                 return Ok(Value::I64(al, ah));
             }
             _ => {}
+        }
+        if low_only && op == BinaryOp::I64Shl && a_discardable && b_discardable {
+            // A left shift cannot move high-word bits into the observed low word.
+            // Keep effectful operands on the ordinary path even when the result is zero.
+            let low = match bl_literal {
+                Some(count) if count & 32 != 0 => "0".into(),
+                Some(count) => format!("({al})<<{}", count & 31),
+                None => format!("((({bl})&32)?0:(({al})<<({bl})))"),
+            };
+            return Ok(Value::I64(low, "0".into()));
         }
         let al_low_zero = is_i32_zero(&al);
         let bl_low_zero = is_i32_zero(&bl);
@@ -3888,7 +3942,8 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             LoadOp::F64 => {
                 let value = self.temp(ValType::F64);
                 let value_name = value.components()[0].to_string();
-                let (raw_low, raw_high) = self.ensure_f64_bits(&value_name);
+                let raw_bits = self.plan.f64_bits_required(instruction_index)
+                    .then(|| self.ensure_f64_bits(&value_name));
                 if let Some(call) = &float_call {
                     write!(self.body, "{value_name}=+{call};").unwrap();
                 } else {
@@ -3899,19 +3954,21 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     )
                     .unwrap();
                 }
-                if direct {
-                    write!(self.body, "{raw_low}=$rl|0;{raw_high}=$rh|0;").unwrap();
-                } else {
-                    let raw_call = if let Some(address) = &compact_address {
-                        if arg.offset == 0 {
-                            format!("l({address},1)")
-                        } else {
-                            format!("l2({address},{},1)", arg.offset)
-                        }
+                if let Some((raw_low, raw_high)) = raw_bits {
+                    if direct {
+                        write!(self.body, "{raw_low}=$rl|0;{raw_high}=$rh|0;").unwrap();
                     } else {
-                        format!("LI({}|0,{lo_i32},{hi_i32},+{},1|0)", arg.memory, arg.offset)
-                    };
-                    write!(self.body, "{raw_low}={raw_call}|0;{raw_high}=GH()|0;").unwrap();
+                        let raw_call = if let Some(address) = &compact_address {
+                            if arg.offset == 0 {
+                                format!("l({address},1)")
+                            } else {
+                                format!("l2({address},{},1)", arg.offset)
+                            }
+                        } else {
+                            format!("LI({}|0,{lo_i32},{hi_i32},+{},1|0)", arg.memory, arg.offset)
+                        };
+                        write!(self.body, "{raw_low}={raw_call}|0;{raw_high}=GH()|0;").unwrap();
+                    }
                 }
                 self.stack.push(value);
             }
@@ -4525,6 +4582,14 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         self.f64_bits.get(expression).cloned()
     }
 
+    fn f64_from_words(&mut self, low: String, high: String) -> Value {
+        let low = compact_i32(&low);
+        let high = compact_i32(&high);
+        let expression = format!("+wr({low},{high})");
+        self.f64_bits.insert(expression.clone(), (low, high));
+        Value::F64(expression)
+    }
+
     fn ensure_f64_bits(&mut self, expression: &str) -> (String, String) {
         if let Some(bits) = self.f64_bits.get(expression) {
             return bits.clone();
@@ -4674,7 +4739,9 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             )
             .unwrap();
         }
-        if let Value::F64(target_expression) = target {
+        if let Value::F64(target_expression) = target
+            && !self.numeric_f64_locals.contains(target_expression)
+        {
             let (target_low, target_high) = self.ensure_f64_bits(target_expression);
             if let Some((source_low, source_high)) = source_bits {
                 write!(
@@ -7590,7 +7657,7 @@ function Y(x,u,z){x=+x;u=u|0;z=z|0;if(x!=x)return z?0:X();if(u){if(x<=-1)return 
 function y(x,u,z){x=+x;u=u|0;z=z|0;var n=0,h=0,l=0;if(x!=x){if(!z)X();hi=0;return 0}if(u){if(x<=-1){if(!z)X();hi=0;return 0}if(x>=18446744073709551616){if(!z)X();hi=-1;return -1}x=tr(x);h=M.floor(x/4294967296);l=x-h*4294967296;hi=h|0;return l|0}else{if(x<-9223372036854775808){if(!z)X();hi=-2147483648;return 0}if(x>=9223372036854775808){if(!z)X();hi=2147483647;return -1}n=x<0;if(n)x=-x;x=tr(x);h=M.floor(x/4294967296);l=x-h*4294967296;l=l|0;h=h|0;if(n){l=(~l+1)|0;h=(~h+(l==0))|0}hi=h;return l}}
 function ng(l,h){l=l|0;h=h|0;l=(~l+1)|0;hi=(~h+(l==0))|0;return l}
 function ge(al,ah,bl,bh){al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;return ((ah>>>0)>(bh>>>0)||ah==bh&&(al>>>0)>=(bl>>>0))|0}
-function dv(al,ah,bl,bh,sg,rm){al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;sg=sg|0;rm=rm|0;var nq=0,nr=0,i=0,ql=0,qh=0,rl=0,rh=0,bit=0,t=0;if(!(bl|bh))X();if(sg&&ah==-2147483648&&!al&&bh==-1&&bl==-1&&!rm)X();if(sg){nq=(ah<0)^(bh<0);nr=ah<0;if(ah<0){al=ng(al,ah)|0;ah=hi|0}if(bh<0){bl=ng(bl,bh)|0;bh=hi|0}}for(i=63;i>=0;i--){bit=i<32?(al>>>i)&1:(ah>>>(i-32))&1;rh=(rh<<1)|(rl>>>31);rl=(rl<<1)|bit;if(ge(rl,rh,bl,bh)){t=rl-bl|0;rh=(rh-bh-((rl>>>0)<(bl>>>0)))|0;rl=t;if(i<32)ql=ql|(1<<i);else qh=qh|(1<<(i-32))}}if(rm){if(nr){rl=ng(rl,rh)|0;rh=hi|0}hi=rh;return rl}if(nq){ql=ng(ql,qh)|0;qh=hi|0}hi=qh;return ql}
+function dv(al,ah,bl,bh,sg,rm){al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;sg=sg|0;rm=rm|0;var nq=0,nr=0,i=0,ql=0,qh=0,rl=0,rh=0,bit=0,t=0,d=0,r=0,v=0,digit=0;if(!(bl|bh))X();if(sg&&ah==-2147483648&&!al&&bh==-1&&bl==-1&&!rm)X();if(sg){nq=(ah<0)^(bh<0);nr=ah<0;if(ah<0){al=ng(al,ah)|0;ah=hi|0}if(bh<0){bl=ng(bl,bh)|0;bh=hi|0}}if(!bh){d=bl>>>0;qh=M.floor((ah>>>0)/d);r=(ah>>>0)-qh*d;v=r*65536+(al>>>16);digit=M.floor(v/d);r=v-digit*d;ql=digit<<16;v=r*65536+(al&65535);digit=M.floor(v/d);rl=(v-digit*d)|0;ql=ql|digit;qh=qh|0}else{for(i=63;i>=0;i--){bit=i<32?(al>>>i)&1:(ah>>>(i-32))&1;rh=(rh<<1)|(rl>>>31);rl=(rl<<1)|bit;if(ge(rl,rh,bl,bh)){t=rl-bl|0;rh=(rh-bh-((rl>>>0)<(bl>>>0)))|0;rl=t;if(i<32)ql=ql|(1<<i);else qh=qh|(1<<(i-32))}}}if(rm){if(nr){rl=ng(rl,rh)|0;rh=hi|0}hi=rh;return rl}if(nq){ql=ng(ql,qh)|0;qh=hi|0}hi=qh;return ql}
 
 // Rotations by 32 swap halves; JS shifts mask counts to 5 bits, so shifting by 32 is not zero.
 function W(o,al,ah,bl,bh){o=o|0;al=al|0;ah=ah|0;bl=bl|0;bh=bh|0;var l=0,h=0,n=0,a0=0,a1=0,a2=0,a3=0,b0=0,b1=0,b2=0,b3=0,c0=0,c1=0,c2=0,c3=0;if(o==0){l=al+bl|0;hi=ah+bh+((l>>>0)<(al>>>0))|0;return l}if(o==1){l=al-bl|0;hi=ah-bh-((al>>>0)<(bl>>>0))|0;return l}if(o==2){a0=al&65535;a1=al>>>16;a2=ah&65535;a3=ah>>>16;b0=bl&65535;b1=bl>>>16;b2=bh&65535;b3=bh>>>16;c0=a0*b0;c1=a1*b0+a0*b1+M.floor(c0/65536);c2=a2*b0+a1*b1+a0*b2+M.floor(c1/65536);c3=a3*b0+a2*b1+a1*b2+a0*b3+M.floor(c2/65536);l=(c0&65535)|((c1&65535)<<16);hi=(c2&65535)|((c3&65535)<<16);return l}if(o==3){hi=ah&bh;return al&bl}if(o==4){hi=ah|bh;return al|bl}if(o==5){hi=ah^bh;return al^bl}if(o>=11)return dv(al,ah,bl,bh,(o==11||o==13)|0,(o==13||o==14)|0)|0;n=bl&63;if(!n){hi=ah;return al}if(o==6){if(n<32){hi=(ah<<n)|(al>>>(32-n));return al<<n}hi=al<<(n-32);return 0}if(o==7){if(n<32){hi=ah>>n;return (al>>>n)|(ah<<(32-n))}hi=ah>>31;return ah>>(n-32)}if(o==8){if(n<32){hi=ah>>>n;return (al>>>n)|(ah<<(32-n))}hi=0;return ah>>>(n-32)}if(n==32){hi=al;return ah}if(o==9){if(n<32){hi=(ah<<n)|(al>>>(32-n));return (al<<n)|(ah>>>(32-n))}n=n-32;hi=(al<<n)|(ah>>>(32-n));return (ah<<n)|(al>>>(32-n))}if(n<32){hi=(ah>>>n)|(al<<(32-n));return (al>>>n)|(ah<<(32-n))}n=n-32;hi=(al>>>n)|(ah<<(32-n));return (ah>>>n)|(al<<(32-n))}
