@@ -777,7 +777,7 @@ impl<'a> ModuleCx<'a> {
         if self.module.imported_memory_count == 1 && self.module.memories.len() == 1 {
             out.push_str("b=r.i0&&r.i0.buffer?r.i0.buffer:null;");
             write!(out, "if(!b||b.byteLength<{})throw RangeError('wasm2asm: imported memory is too small');", base).unwrap();
-            out.push_str("r.b=b;");
+            out.push_str("r.b=b;r.s[0]=b.byteLength;");
         } else if !self.module.memories.is_empty() {
             write!(out, "b=new ArrayBuffer({base});r.b=b;").unwrap();
             for index in 0..self.module.imported_memory_count as usize {
@@ -1125,8 +1125,8 @@ impl<'a> ModuleCx<'a> {
         ] {
             self.emit_direct_memory_load_helper(out, name, None, code, false);
         }
-        write!(out, "function $S0(a,v){{a=a|0;v=v|0;{word_check}if(a&3){{st(a|0,0|0,v|0,0|0);return}}$h32[a>>2]=v}}").unwrap();
-        write!(out, "function $S1(a,v,w){{a=a|0;v=v|0;w=w|0;{double_check}if(a&3){{st(a|0,1|0,v|0,w|0);return}}$h32[a>>2]=v;$h32[(a+4)>>2]=w}}").unwrap();
+        write!(out, "function $S0(a,v){{a=a|0;v=v|0;{word_check}if(a&3){{$h8[a>>0]=v;$h8[(a+1)>>0]=v>>8;$h8[(a+2)>>0]=v>>16;$h8[(a+3)>>0]=v>>24;return}}$h32[a>>2]=v}}").unwrap();
+        write!(out, "function $S1(a,v,w){{a=a|0;v=v|0;w=w|0;{double_check}if(a&3){{$h8[a>>0]=v;$h8[(a+1)>>0]=v>>8;$h8[(a+2)>>0]=v>>16;$h8[(a+3)>>0]=v>>24;$h8[(a+4)>>0]=w;$h8[(a+5)>>0]=w>>8;$h8[(a+6)>>0]=w>>16;$h8[(a+7)>>0]=w>>24;return}}$h32[a>>2]=v;$h32[(a+4)>>2]=w}}").unwrap();
         write!(out, "function $D2(a,v){{a=a|0;v=+v;{word_check}if(a&3){{sf(a|0,2|0,+v);return}}$f32[a>>2]=F(v)}}").unwrap();
         write!(out, "function $D3(a,v){{a=a|0;v=+v;{double_check}if(a&7){{sf(a|0,3|0,+v);return}}$f64[a>>3]=v}}").unwrap();
         for code in [4, 6] {
@@ -1137,9 +1137,9 @@ impl<'a> ModuleCx<'a> {
             .unwrap();
         }
         for code in [5, 7] {
-            write!(out, "function $S{code}(a,v){{a=a|0;v=v|0;{half_check}if(a&1){{st(a|0,{code}|0,v|0,0|0);return}}$h16[a>>1]=v}}").unwrap();
+            write!(out, "function $S{code}(a,v){{a=a|0;v=v|0;{half_check}if(a&1){{$h8[a>>0]=v;$h8[(a+1)>>0]=v>>8;return}}$h16[a>>1]=v}}").unwrap();
         }
-        write!(out, "function $S8(a,v){{a=a|0;v=v|0;{word_check}if(a&3){{st(a|0,8|0,v|0,0|0);return}}$h32[a>>2]=v}}").unwrap();
+        write!(out, "function $S8(a,v){{a=a|0;v=v|0;{word_check}if(a&3){{$h8[a>>0]=v;$h8[(a+1)>>0]=v>>8;$h8[(a+2)>>0]=v>>16;$h8[(a+3)>>0]=v>>24;return}}$h32[a>>2]=v}}").unwrap();
 
         if !self.options.assume_memory_alignment {
             return;
@@ -1228,15 +1228,15 @@ impl<'a> ModuleCx<'a> {
             }
         };
         match code {
-            0 | 12 => write!(out, "function {name}(a){{a=a|0;{setup}{check}{}return $h32[a>>2]|0}}", fallback(3, &format!("return l(a|0,{code}|0)|0"))),
-            1 => write!(out, "function {name}(a){{a=a|0;var v=0;{setup}{check}{}$ih=$h32[(a+4)>>2]|0;return $h32[a>>2]|0}}", fallback(3, "v=l(a|0,1|0)|0;$ih=GH()|0;return v|0")),
+            0 | 12 => write!(out, "function {name}(a){{a=a|0;{setup}{check}{}return $h32[a>>2]|0}}", fallback(3, "return ($u8[a>>0]|($u8[(a+1)>>0]<<8)|($u8[(a+2)>>0]<<16)|($u8[(a+3)>>0]<<24))|0")),
+            1 => write!(out, "function {name}(a){{a=a|0;{setup}{check}{}$ih=$h32[(a+4)>>2]|0;return $h32[a>>2]|0}}", fallback(3, "$ih=($u8[(a+4)>>0]|($u8[(a+5)>>0]<<8)|($u8[(a+6)>>0]<<16)|($u8[(a+7)>>0]<<24))|0;return ($u8[a>>0]|($u8[(a+1)>>0]<<8)|($u8[(a+2)>>0]<<16)|($u8[(a+3)>>0]<<24))|0")),
             2 => write!(out, "function {name}(a){{a=a|0;{setup}{check}{}return +F($f32[a>>2])}}", fallback(3, "return +lf(a|0,2|0)")),
             3 => write!(out, "function {name}(a){{a=a|0;var v=0.0;{setup}{check}{}$rl=$h32[a>>2]|0;$rh=$h32[(a+4)>>2]|0;return +$f64[a>>3]}}", fallback(7, "v=+lf(a|0,3|0);$rl=l(a|0,1|0)|0;$rh=GH()|0;return +v")),
             4 | 8 => write!(out, "function {name}(a){{a=a|0;{setup}{check}return $h8[a>>0]|0}}"),
             5 | 9 => write!(out, "function {name}(a){{a=a|0;{setup}{check}return $u8[a>>0]|0}}"),
-            6 | 10 => write!(out, "function {name}(a){{a=a|0;{setup}{check}{}return $h16[a>>1]|0}}", fallback(1, &format!("return l(a|0,{code}|0)|0"))),
-            7 | 11 => write!(out, "function {name}(a){{a=a|0;{setup}{check}{}return $u16[a>>1]|0}}", fallback(1, &format!("return l(a|0,{code}|0)|0"))),
-            13 => write!(out, "function {name}(a){{a=a|0;{setup}{check}{}return $u32[a>>2]|0}}", fallback(3, "return l(a|0,13|0)|0")),
+            6 | 10 => write!(out, "function {name}(a){{a=a|0;{setup}{check}{}return $h16[a>>1]|0}}", fallback(1, "return ($u8[a>>0]|($h8[(a+1)>>0]<<8))|0")),
+            7 | 11 => write!(out, "function {name}(a){{a=a|0;{setup}{check}{}return $u16[a>>1]|0}}", fallback(1, "return ($u8[a>>0]|($u8[(a+1)>>0]<<8))|0")),
+            13 => write!(out, "function {name}(a){{a=a|0;{setup}{check}{}return $u32[a>>2]|0}}", fallback(3, "return ($u8[a>>0]|($u8[(a+1)>>0]<<8)|($u8[(a+2)>>0]<<16)|($u8[(a+3)>>0]<<24))|0")),
             _ => unreachable!("invalid direct load helper code {code}"),
         }
         .unwrap();
@@ -2293,7 +2293,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
                     self.emit_binary(instruction_index, *op)?;
                 }
             }
-            Load(op, memarg) => self.emit_load(*op, *memarg)?,
+            Load(op, memarg) => self.emit_load(instruction_index, *op, *memarg)?,
             Store(op, memarg) => self.emit_store(*op, *memarg)?,
             MemorySize(memory) => {
                 let temp = self.temp(ValType::I32);
@@ -3719,7 +3719,7 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         Ok(Value::I64(low.i32_expr()?.into(), high.i32_expr()?.into()))
     }
 
-    fn emit_load(&mut self, op: LoadOp, arg: MemArg) -> Result<(), CompileError> {
+    fn emit_load(&mut self, instruction_index: usize, op: LoadOp, arg: MemArg) -> Result<(), CompileError> {
         let memory = self
             .module
             .module
@@ -3738,9 +3738,12 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         let direct = self.module.direct_memory_size.is_some() && compact;
         let aligned = self.module.options.assume_memory_alignment
             && load_code_alignment(code).is_some_and(|required| arg.align >= required);
+        let low_only = matches!(op, LoadOp::I64)
+            && self.plan.i64_low_only(instruction_index)
+            && direct && aligned && !self.module.options.preserve_traps;
         let direct_helper = direct_load_helper_name(code, aligned);
         let fast_direct_call = if let Some(address) = &compact_address {
-            self.fast_direct_integer_load(address, arg.offset, code, aligned)?
+            self.fast_direct_integer_load(address, arg.offset, if low_only { 0 } else { code }, aligned)?
         } else {
             None
         };
@@ -3821,6 +3824,11 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             }
         });
         match op {
+            LoadOp::I64 if low_only => {
+                let low = self.temp(ValType::I32);
+                write!(self.body, "{}={call}|0;", low.i32_expr()?).unwrap();
+                self.stack.push(Value::I64(low.i32_expr()?.into(), "0".into()));
+            }
             LoadOp::I64 => {
                 let low = self.temp(ValType::I32);
                 let high = self.temp(ValType::I32);
@@ -7601,7 +7609,7 @@ function vl(a,i){a=a|0;i=i|0;var x=AA(0,a,0,0,16);return V.getInt32(x+i*4,true)|
 function vs(a,v0,v1,v2,v3){a=a|0;v0=v0|0;v1=v1|0;v2=v2|0;v3=v3|0;var x=AA(0,a,0,0,16);V.setInt32(x,v0,true);V.setInt32(x+4,v1,true);V.setInt32(x+8,v2,true);V.setInt32(x+12,v3,true)}
 function G(k,d){k=k|0;d=d|0;var old=0,add=0,ns=0,total=0,x=0,y=0,nb=null,nh=null;if(d<0)return -1;old=s[k]/p[k]|0;add=(d>>>0)*p[k];ns=s[k]+add;if(ns>4294967295||m[k]>=0&&ns>m[k])return -1;for(x=0;x<s.length;x++)total+=x==k?ns:s[x];if(total>4294967295)return -1;nb=new ArrayBuffer(total);nh=new Uint8Array(nb);for(x=0,y=0;x<s.length;x++){nh.set(new Uint8Array(B,a[x],s[x]),y);a[x]=y;y+=x==k?ns:s[x]}s[k]=ns;B=r.b=nb;V=new DataView(B);H=new Uint8Array(B);return old}
 
-function AB(dm,sm,d,sr,n){dm=dm|0;sm=sm|0;d=d>>>0;sr=sr>>>0;n=n>>>0;var da=AA(dm,d,0,0,n),sa=AA(sm,sr,0,0,n);H.set(H.subarray(sa,sa+n),da)}
+function AB(dm,sm,d,sr,n){dm=dm|0;sm=sm|0;d=d>>>0;sr=sr>>>0;n=n>>>0;var da=AA(dm,d,0,0,n),sa=AA(sm,sr,0,0,n);H.copyWithin(da,sa,sa+n)}
 function AC(k,d,v,n){k=k|0;d=d>>>0;v=v|0;n=n>>>0;var x=AA(k,d,0,0,n);H.fill(v,x,x+n)}
 function K(di,k,d,sr,n){di=di|0;k=k|0;d=d>>>0;sr=sr>>>0;n=n>>>0;var x=0,i=0,j=0,v='';v=D[di].b;if(D[di].x||sr+n>D[di].n)X();x=AA(k,d,0,0,n);for(i=0;i<n;i++){j=sr+i;H[x+i]=(j&1)?v.charCodeAt(j>>>1)&255:v.charCodeAt(j>>>1)>>>8}}
 function N(x){x=x>>>0;if(x>=T.length)X();return T[x]|0}

@@ -591,6 +591,11 @@ impl FunctionMir {
                     | Op::Unsupported { .. } => {}
                 }
             }
+            // Block-local dataflow cannot follow stack values past CFG edges.
+            // This also covers implicit function returns without an Op::Return.
+            for value in stack {
+                self.demand_i64(Some(value), I64Demand::Full);
+            }
             if self.blocks[block_index]
                 .terminator
                 .successors()

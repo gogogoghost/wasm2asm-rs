@@ -188,6 +188,22 @@ SIMD and typed function references are high-cost lowerings and are disabled by d
 
 `--assume-memory-alignment` requires `--fast` and trusts each Wasm memory instruction's alignment hint. Accesses whose hints are too weak still use the unaligned-safe path; naturally aligned accesses use branch-free typed-array operations, inlined for integer loads and stores. Enable it only for trusted producers that guarantee effective addresses satisfy their declared alignment. Violating a hint can read or write the wrong bytes.
 
+### Memory lowering invariants
+
+- A single imported memory reports the actual supplied buffer size, not its
+  declared minimum. An imported 32/48/64 MiB arena remains fully addressable.
+- Low-word-only i64 loads omit the high-word read only when MIR demand permits
+  it. Residual block-stack values, including implicit function results, remain
+  conservative full-width roots. Mixed low/full consumers retain both words;
+  strict-mode bounds checks still cover all eight bytes.
+- Fast integer accesses with weak alignment hints use bytewise internal
+  helpers. They preserve valid unaligned values and do not cross DataView's
+  host-call boundary for each scalar access.
+- Bulk copies use `copyWithin` after the required bounds checks. Forward and
+  backward overlap retain memmove semantics without temporary subarray views;
+  strict-mode invalid ranges fail before modifying the destination.
+
+
 ## Compatibility
 
 The supported profile includes:
