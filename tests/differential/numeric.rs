@@ -220,3 +220,54 @@ fn low_word_left_shifts_keep_count_masking_effects_and_load_traps() {
         });
     }
 }
+
+#[test]
+fn constant_right_shifts_preserve_words_effects_and_load_traps() {
+    let wat = include_str!("../fixtures/differential/i64_constant_right_shifts.wat");
+    let expression = r#"(()=>{
+        var values=[0n,1n,-1n,0x7fffffffffffffffn,0x8000000000000000n,
+            0x0123456789abcdefn,0xfedcba9876543210n,0xffffffffn,
+            0xffffffff00000000n];
+        var result=[];
+        new Uint8Array(m.memory.buffer).set([239,205,171,137,103,69,35,129],65528);
+        for (var op of ['s','u']) for (var i=0;i<11;i++) {
+            for (var value of values) {
+                result.push(FULL);
+                for (var kind of ['low','high','effect']) result.push(WORD);
+            }
+            result.push(m[op+'_load_'+i](65528));
+            if (STRICT) {
+                var trapped=false;
+                try { m[op+'_load_'+i](65530); } catch (error) { trapped=true; }
+                result.push(trapped);
+            }
+        }
+        result.push(m.calls());
+        var callTrapped=false;
+        try { m.call_trap(); } catch (error) { callTrapped=true; }
+        result.push(callTrapped);
+        return result;
+    })()"#;
+    let native_expression = expression
+        .replace("FULL", "i64Pair(m[op+'_full_'+i](value))")
+        .replace("WORD", "m[op+'_'+kind+'_'+i](value)");
+    let asm_expression = expression
+        .replace("FULL", "pair(m[op+'_full_'+i](...i64Pair(value)))")
+        .replace("WORD", "m[op+'_'+kind+'_'+i](...i64Pair(value))")
+        .replace("var result=[];", "function pair(low){return [low,m.getTempRet0()]} var result=[];");
+    for preserve_traps in [true, false] {
+        let strict = if preserve_traps { "true" } else { "false" };
+        assert_differential(DifferentialCase {
+            name: "constant right shifts",
+            wat,
+            native_expression: &native_expression.replace("STRICT", strict),
+            asm_expression: &asm_expression.replace("STRICT", strict),
+            native_imports: "{}",
+            asm_imports: "{}",
+            options: CompileOptions {
+                preserve_traps,
+                ..CompileOptions::default()
+            },
+        });
+    }
+}

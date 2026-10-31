@@ -219,6 +219,12 @@ SIMD and typed function references are high-cost lowerings and are disabled by d
 - Low-word-only i64 left shifts retain modulo-64 count semantics. The high-word
   computation is omitted only for discardable operands; strict load bounds and
   operand side effects remain observable.
+- Constant-count i64 right shifts use direct word expressions when operands are
+  reusable. Counts remain modulo 64; low/full/high consumers, operand effects
+  and strict load/call traps retain their WebAssembly semantics.
+- i32 return values remain signed asm.js expressions after temporary-return
+  inlining. Unsigned `>>>` is not classified as signed `>>` when preserving
+  the required return coercion.
 
 
 ## Compatibility

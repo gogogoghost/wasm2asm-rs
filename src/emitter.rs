@@ -1055,7 +1055,6 @@ impl<'a> ModuleCx<'a> {
             return;
         }
         out.push_str("function $m(a,b,c,d){a=a|0;b=b|0;c=c|0;d=d|0;var w0=0,t=0,w1=0,w2=0,h=0;w0=U(a&65535,c&65535)|0;t=U(a>>>16,c&65535)+(w0>>>16)|0;w0=w0&65535;w1=t&65535;w2=t>>>16;w1=U(a&65535,c>>>16)+w1|0;h=U(a>>>16,c>>>16)+w2|0;h=h+(w1>>>16)|0;h=h+U(b,c)|0;h=h+U(a,d)|0;return h|0}");
-
         out.push_str("function $g(a,b,c,d){a=a|0;b=b|0;c=c|0;d=d|0;var n=0;n=c&63;if(!n){$ih=b;return a|0}if((n|0)<32){$ih=(b<<n)|(a>>>(32-n));return a<<n}$ih=a<<(n-32);return 0}");
         out.push_str("function $h(a,b,c,d){a=a|0;b=b|0;c=c|0;d=d|0;var n=0;n=c&63;if(!n){$ih=b;return a|0}if((n|0)<32){$ih=b>>n;return (a>>>n)|(b<<(32-n))}$ih=b>>31;return b>>(n-32)}");
         out.push_str("function $i(a,b,c,d){a=a|0;b=b|0;c=c|0;d=d|0;var n=0;n=c&63;if(!n){$ih=b;return a|0}if((n|0)<32){$ih=b>>>n;return (a>>>n)|(b<<(32-n))}$ih=0;return (b>>>(n-32))|0}");
@@ -3572,6 +3571,35 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
             }
             _ => {}
         }
+        if matches!(op, BinaryOp::I64ShrS | BinaryOp::I64ShrU)
+            && a_discardable
+            && b_discardable
+        {
+            if let Some(count) = bl_literal {
+                let count = (count as u32) & 63;
+                // The zero-count identity was handled above. Only reusable operands
+                // may be omitted or used in both result words here.
+                let signed = op == BinaryOp::I64ShrS;
+                let operator = if signed { ">>" } else { ">>>" };
+                let low = if count < 32 {
+                    format!("(({al})>>>{count})|(({ah})<<{})", 32 - count)
+                } else if count == 32 {
+                    ah.clone()
+                } else {
+                    format!("({ah}){operator}{}", count - 32)
+                };
+                let high = if low_only || high_is_zero {
+                    "0".into()
+                } else if count < 32 {
+                    format!("({ah}){operator}{count}")
+                } else if signed {
+                    format!("({ah})>>31")
+                } else {
+                    "0".into()
+                };
+                return Ok(Value::I64(low, high));
+            }
+        }
         if low_only && op == BinaryOp::I64Shl && a_discardable && b_discardable {
             // A left shift cannot move high-word bits into the observed low word.
             // Keep effectful operands on the ordinary path even when the result is zero.
@@ -4709,7 +4737,11 @@ impl<'a, 'm> FunctionCompiler<'a, 'm> {
         {
             return false;
         }
-        let expression = self.body[expression_start..statement_end].to_string();
+        // Assignments may omit coercions that asm.js still requires at a return.
+        let expression = coerce(
+            value_component_type(value, source),
+            &self.body[expression_start..statement_end],
+        );
         self.body.truncate(statement_start);
         write!(self.body, "return {expression};").unwrap();
         true
@@ -6817,6 +6849,7 @@ fn is_signed_i32_expression(value: &str) -> bool {
             }
             b'<' if depth == 0 && bytes.get(index + 1) == Some(&b'<') => return true,
             b'>' if depth == 0
+                && bytes.get(index.wrapping_sub(1)) != Some(&b'>')
                 && bytes.get(index + 1) == Some(&b'>')
                 && bytes.get(index + 2) != Some(&b'>') =>
             {
